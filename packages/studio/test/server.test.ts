@@ -6,6 +6,7 @@ import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import type { StudioAuthBridge, StudioAuthLoginCallbacks } from "../src/core/auth-bridge";
 import {
 	STUDIO_API_VERSION,
+	type StudioAuthCancelResponse,
 	type StudioAuthProgress,
 	type StudioBootstrap,
 	type StudioEventEnvelope,
@@ -327,6 +328,57 @@ describe("Studio local access boundary", () => {
 });
 
 describe("Studio provider onboarding", () => {
+	it("cancels an unfinished provider sign-in and lets the user retry immediately", async () => {
+		const bridge = new FakeStudioAuthBridge();
+		const { studio } = await startTestStudio(undefined, bridge);
+		const cookie = await exchangeLocalAccess(studio);
+		const events = await subscribeStudioEvents(studio, cookie);
+		try {
+			const started = await fetch(`${studio.origin}/api/v1/providers/example/login`, {
+				method: "POST",
+				headers: { Cookie: cookie, Origin: studio.origin },
+			});
+			expect(started.status).toBe(202);
+			const login = (await started.json()) as StudioProviderLoginResponse;
+			await events.waitFor<StudioAuthProgress>(
+				event =>
+					event.type === "auth.progress" &&
+					(event.data as StudioAuthProgress).flowId === login.flowId &&
+					(event.data as StudioAuthProgress).phase === "prompt",
+			);
+
+			const cancelled = await fetch(`${studio.origin}/api/v1/auth/cancel`, {
+				method: "POST",
+				headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+				body: JSON.stringify({ flowId: login.flowId }),
+			});
+			expect(cancelled.status).toBe(202);
+			expect((await cancelled.json()) as StudioAuthCancelResponse).toEqual({
+				flowId: login.flowId,
+				cancelled: true,
+			});
+			const cancellation = await events.waitFor<StudioAuthProgress>(
+				event =>
+					event.type === "auth.progress" &&
+					(event.data as StudioAuthProgress).flowId === login.flowId &&
+					(event.data as StudioAuthProgress).phase === "cancelled",
+			);
+			expect(cancellation.data).toMatchObject({
+				flowId: login.flowId,
+				phase: "cancelled",
+			});
+			expect(bridge.callbacks?.signal.aborted).toBe(true);
+
+			const retry = await fetch(`${studio.origin}/api/v1/providers/example/login`, {
+				method: "POST",
+				headers: { Cookie: cookie, Origin: studio.origin },
+			});
+			expect(retry.status).toBe(202);
+		} finally {
+			events.close();
+		}
+	});
+
 	it("relays native auth steps while keeping a submitted credential out of API and event output", async () => {
 		const bridge = new FakeStudioAuthBridge();
 		const { studio } = await startTestStudio(undefined, bridge);

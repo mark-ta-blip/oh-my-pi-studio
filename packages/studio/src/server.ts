@@ -22,6 +22,7 @@ import {
 	type StudioApprovalResolutionRequest,
 	type StudioApprovalResponse,
 	type StudioAuditListResponse,
+	type StudioAuthCancelResponse,
 	type StudioAuthContinueResponse,
 	type StudioAuthProgress,
 	type StudioBootstrap,
@@ -42,6 +43,7 @@ import {
 	type StudioSessionListResponse,
 	type StudioSessionResponse,
 	type StudioSubagentListResponse,
+	type StudioTranscriptResponse,
 	type StudioWorkspaceListResponse,
 	type StudioWorkspaceResponse,
 } from "./protocol";
@@ -64,7 +66,10 @@ const IS_BUN_COMPILED =
 	import.meta.url.includes("~BUN") ||
 	import.meta.url.includes("%7EBUN");
 const IS_PREBUILT = IS_BUN_COMPILED || Boolean(process.env.PI_BUNDLED || Bun.env.PI_BUNDLED);
-const USE_EMBEDDED_CLIENT = EMBEDDED_CLIENT_ARCHIVE !== null || IS_PREBUILT;
+// Source checkouts must serve the freshly built dist/client tree. The generated
+// archive is reserved for compiled binaries and prepacked bundles, where the
+// source tree is not shipped alongside the server.
+const USE_EMBEDDED_CLIENT = IS_PREBUILT;
 const EMBEDDED_CLIENT_DIR_ROOT = path.join(os.tmpdir(), "omp-studio-client");
 
 let embeddedClientDirPromise: Promise<string> | null = null;
@@ -334,7 +339,7 @@ function parseStudioSessionId(pathname: string): string | null {
 
 function parseStudioSessionActionId(
 	pathname: string,
-	action: "lease" | "prompts" | "approvals" | "subagents",
+	action: "lease" | "prompts" | "approvals" | "subagents" | "transcript",
 ): string | null {
 	return decodePathId(pathname, new RegExp(`^/api/v1/sessions/([^/]+)/${action}$`), /^sts_[a-f0-9]{32}$/);
 }
@@ -425,6 +430,25 @@ async function readAuthContinuationRequest(request: Request): Promise<{ flowId: 
 	return { flowId: body.flowId, value: body.value };
 }
 
+async function readAuthCancellationRequest(request: Request): Promise<{ flowId: string }> {
+	let body: unknown;
+	try {
+		body = await request.json();
+	} catch {
+		throw new StudioAuthBridgeError(
+			"invalid_auth_cancellation",
+			"Authentication cancellation requires a JSON request body.",
+		);
+	}
+	if (!isRecord(body) || typeof body.flowId !== "string") {
+		throw new StudioAuthBridgeError(
+			"invalid_auth_cancellation",
+			"Authentication cancellation requires a string flowId field.",
+		);
+	}
+	return { flowId: body.flowId };
+}
+
 function authErrorResponse(error: StudioAuthBridgeError): Response {
 	const status =
 		error.code === "auth_bridge_unavailable"
@@ -477,6 +501,24 @@ async function handleAuthContinue(request: Request, runtime: StudioRuntime): Pro
 		const continuation = await readAuthContinuationRequest(request);
 		runtime.auth.continue(continuation.flowId, continuation.value);
 		const body: StudioAuthContinueResponse = { flowId: continuation.flowId, accepted: true };
+		return jsonResponse(body, 202);
+	} catch (error) {
+		if (error instanceof StudioAuthBridgeError) return authErrorResponse(error);
+		throw error;
+	}
+}
+
+async function handleAuthCancel(request: Request, runtime: StudioRuntime): Promise<Response> {
+	if (request.method !== "POST") {
+		return errorResponse(405, "method_not_allowed", "Studio authentication cancellation requires a POST request.");
+	}
+	if (!hasAllowedOrigin(request, runtime.origin)) {
+		return errorResponse(403, "origin_not_allowed", "The Studio request origin is not allowed.");
+	}
+	try {
+		const cancellation = await readAuthCancellationRequest(request);
+		runtime.auth.cancel(cancellation.flowId);
+		const body: StudioAuthCancelResponse = { flowId: cancellation.flowId, cancelled: true };
 		return jsonResponse(body, 202);
 	} catch (error) {
 		if (error instanceof StudioAuthBridgeError) return authErrorResponse(error);
@@ -661,6 +703,19 @@ function handleSessionSubagents(request: Request, studioSessionId: string, runti
 		return errorResponse(404, "studio_session_not_found", "The requested Studio session was not found.");
 	}
 	const body: StudioSubagentListResponse = { subagents: runtime.supervisor.getSubagents(studioSessionId) };
+	return jsonResponse(body);
+}
+
+function handleSessionTranscript(request: Request, studioSessionId: string, runtime: StudioRuntime): Response {
+	if (request.method !== "GET") {
+		return errorResponse(405, "method_not_allowed", "Studio session transcripts support GET requests.");
+	}
+	if (!runtime.store.getStudioSession(studioSessionId)) {
+		return errorResponse(404, "studio_session_not_found", "The requested Studio session was not found.");
+	}
+	const body: StudioTranscriptResponse = {
+		messages: runtime.store.listStudioTranscriptMessages(studioSessionId),
+	};
 	return jsonResponse(body);
 }
 
@@ -1068,6 +1123,9 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 		onSubagentState: (studioSessionId, subagent) => {
 			broadcastEvent(runtime, "subagent.state", subagent, { studioSessionId });
 		},
+		onTranscriptUpdated: (studioSessionId, message) => {
+			broadcastEvent(runtime, "transcript.updated", message, { studioSessionId, runId: message.runId });
+		},
 		onUsageUpdated: (session, usage) => {
 			broadcastEvent(runtime, "usage.updated", usage, { studioSessionId: session.id });
 		},
@@ -1111,6 +1169,7 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 					const providerId = parseProviderLoginId(url.pathname);
 					if (providerId !== null) return await handleProviderLogin(request, providerId, runtime);
 					if (url.pathname === "/api/v1/auth/continue") return await handleAuthContinue(request, runtime);
+					if (url.pathname === "/api/v1/auth/cancel") return await handleAuthCancel(request, runtime);
 
 					if (url.pathname === "/api/v1/workspaces") return await handleWorkspaceCollection(request, runtime);
 					const workspaceId = parseWorkspaceId(url.pathname);
@@ -1125,6 +1184,8 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 					if (sessionApprovalId !== null) return await handleSessionApprovals(request, sessionApprovalId, runtime);
 					const sessionSubagentId = parseStudioSessionActionId(url.pathname, "subagents");
 					if (sessionSubagentId !== null) return handleSessionSubagents(request, sessionSubagentId, runtime);
+					const sessionTranscriptId = parseStudioSessionActionId(url.pathname, "transcript");
+					if (sessionTranscriptId !== null) return handleSessionTranscript(request, sessionTranscriptId, runtime);
 					const studioSessionId = parseStudioSessionId(url.pathname);
 					if (studioSessionId !== null) return handleSessionItem(request, studioSessionId, runtime);
 					const runCancelId = parseStudioRunCancelId(url.pathname);

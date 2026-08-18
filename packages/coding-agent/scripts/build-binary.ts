@@ -70,6 +70,28 @@ async function runCommand(
 	}
 }
 
+/**
+ * Build fresh host addons before embedding them in a local binary.
+ *
+ * Cross-target builds receive their artifacts from the release/native build
+ * pipeline and must not try to compile a host addon for the wrong platform.
+ * For a local x64 build, keep both ISA variants current so an old ignored
+ * `.node` file can never be silently embedded alongside a newly-built one.
+ */
+async function buildHostNativeAddons(crossBuild: CrossBuild | null): Promise<void> {
+	if (crossBuild) return;
+
+	const nativeEnv: NodeJS.ProcessEnv = {
+		...Bun.env,
+		OMP_NATIVE_CARGO_PROFILE: Bun.env.OMP_NATIVE_CARGO_PROFILE ?? "ci",
+	};
+	const variants = process.arch === "x64" ? (["baseline", "modern"] as const) : ([undefined] as const);
+	for (const variant of variants) {
+		const env = variant ? { ...nativeEnv, OMP_NATIVE_VARIANT: variant } : nativeEnv;
+		await runCommand(["bun", "--cwd=../natives", "run", "build:bindings"], env);
+	}
+}
+
 async function main(): Promise<void> {
 	const crossBuild = resolveCrossBuild(Bun.env.CROSS_TARGET);
 	const shouldAdhocSign = process.platform === "darwin" && !crossBuild && Bun.env.BUN_NO_CODESIGN_MACHO_BINARY !== "1";
@@ -85,6 +107,7 @@ async function main(): Promise<void> {
 		// Rebuild it before compilation so clean checkouts that skipped install
 		// hooks still contain that generated bundle.
 		await runCommand(["bun", "--cwd=../collab-web", "run", "gen:tool-views"]);
+		await buildHostNativeAddons(crossBuild);
 		await runCommand(
 			["bun", "--cwd=../natives", "run", "gen:native"],
 			crossBuild ? { ...Bun.env, TARGET_PLATFORM: crossBuild.platform, TARGET_ARCH: crossBuild.arch } : Bun.env,

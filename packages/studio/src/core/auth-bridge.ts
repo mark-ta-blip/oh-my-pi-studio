@@ -11,7 +11,8 @@ export type StudioAuthBridgeErrorCode =
 	| "auth_flow_active"
 	| "auth_flow_not_found"
 	| "auth_flow_not_waiting"
-	| "invalid_auth_continuation";
+	| "invalid_auth_continuation"
+	| "invalid_auth_cancellation";
 
 /** A known-safe failure that can be returned as a Studio REST error. */
 export class StudioAuthBridgeError extends Error {
@@ -154,6 +155,25 @@ export class StudioAuthFlowCoordinator {
 		flow.pendingPrompt = undefined;
 		if (value.length > 0) flow.sensitiveValues.push(value);
 		prompt.resolve(value);
+	}
+
+	cancel(flowId: string): void {
+		if (!AUTH_FLOW_ID_PATTERN.test(flowId)) {
+			throw new StudioAuthBridgeError("invalid_auth_cancellation", "The authentication flow identifier is invalid.");
+		}
+		const flow = this.#activeFlow;
+		if (!flow || flow.id !== flowId) {
+			throw new StudioAuthBridgeError("auth_flow_not_found", "The authentication flow is no longer active.");
+		}
+		this.#activeFlow = undefined;
+		flow.abort.abort();
+		flow.sensitiveValues.splice(0);
+		this.#publish({
+			flowId: flow.id,
+			providerId: flow.providerId,
+			phase: "cancelled",
+			message: "Provider sign-in was cancelled.",
+		});
 	}
 
 	close(): void {

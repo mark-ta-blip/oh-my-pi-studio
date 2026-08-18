@@ -1,0 +1,26 @@
+appId: sh.omp.studio
+productName: OMP Studio
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+asar: true
+compression: maximum
+directories:
+  output: release
+files:
+  - dist/**/*
+  - package.json
+extraResources:
+  - from: resources
+    to: omp-server
+    filter:
+      - omp*
+win:
+  target:
+    - nsis
+mac:
+  target:
+    - dmg
+    - zip
+linux:
+  target:
+    - AppImage
+    - deb

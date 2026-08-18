@@ -7,7 +7,9 @@ import type {
 	StudioRpcAgentEvent,
 	StudioRpcApprovalRequest,
 	StudioRpcLaunch,
+	StudioRpcPromptResult,
 	StudioRpcSessionState,
+	StudioRpcTranscriptUpdate,
 	StudioRpcTransport,
 	StudioRpcTransportExit,
 	StudioRpcTransportFactory,
@@ -24,6 +26,8 @@ import type {
 	StudioSessionResponse,
 	StudioSubagent,
 	StudioSubagentListResponse,
+	StudioTranscriptMessage,
+	StudioTranscriptResponse,
 	StudioUsage,
 	StudioWorkspaceResponse,
 } from "../src/protocol";
@@ -43,10 +47,15 @@ class FakeStudioRpcTransport implements StudioRpcTransport {
 	#approvalListeners = new Set<(request: StudioRpcApprovalRequest) => void>();
 	#eventListeners = new Set<(event: StudioRpcAgentEvent) => void>();
 	#exitListeners = new Set<(exit: StudioRpcTransportExit) => void>();
+	#promptFailureListeners = new Set<() => void>();
+	#promptResultListeners = new Set<(result: StudioRpcPromptResult) => void>();
 	#subagentListeners = new Set<(subagent: StudioSubagent) => void>();
+	#transcriptListeners = new Set<(update: StudioRpcTranscriptUpdate) => void>();
 
 	abortCalls = 0;
 	approvalDecisions: Array<{ approved: boolean; requestId: string }> = [];
+	promptError: Error | undefined;
+	promptGate: Promise<void> | undefined;
 	prompts: string[] = [];
 	protocolVersion = 2;
 	stopped = false;
@@ -91,13 +100,30 @@ class FakeStudioRpcTransport implements StudioRpcTransport {
 		return () => this.#exitListeners.delete(listener);
 	}
 
+	onPromptFailure(listener: () => void): () => void {
+		this.#promptFailureListeners.add(listener);
+		return () => this.#promptFailureListeners.delete(listener);
+	}
+
+	onPromptResult(listener: (result: StudioRpcPromptResult) => void): () => void {
+		this.#promptResultListeners.add(listener);
+		return () => this.#promptResultListeners.delete(listener);
+	}
+
 	onSubagentState(listener: (subagent: StudioSubagent) => void): () => void {
 		this.#subagentListeners.add(listener);
 		return () => this.#subagentListeners.delete(listener);
 	}
 
+	onTranscriptUpdate(listener: (update: StudioRpcTranscriptUpdate) => void): () => void {
+		this.#transcriptListeners.add(listener);
+		return () => this.#transcriptListeners.delete(listener);
+	}
+
 	async prompt(message: string): Promise<void> {
 		this.prompts.push(message);
+		await this.promptGate;
+		if (this.promptError) throw this.promptError;
 	}
 
 	async resolveApproval(requestId: string, approved: boolean): Promise<void> {
@@ -120,8 +146,20 @@ class FakeStudioRpcTransport implements StudioRpcTransport {
 		for (const listener of this.#exitListeners) listener({ expected });
 	}
 
+	emitPromptFailure(): void {
+		for (const listener of this.#promptFailureListeners) listener();
+	}
+
+	emitPromptResult(agentInvoked: boolean): void {
+		for (const listener of this.#promptResultListeners) listener({ agentInvoked });
+	}
+
 	emitSubagent(subagent: StudioSubagent): void {
 		for (const listener of this.#subagentListeners) listener(subagent);
+	}
+
+	emitTranscript(update: StudioRpcTranscriptUpdate): void {
+		for (const listener of this.#transcriptListeners) listener(update);
 	}
 }
 
@@ -134,6 +172,14 @@ class FakeStudioRpcTransportFactory implements StudioRpcTransportFactory {
 		const transport = new FakeStudioRpcTransport();
 		this.transports.push(transport);
 		return transport;
+	}
+}
+
+async function waitForCondition(predicate: () => boolean): Promise<void> {
+	const deadline = Date.now() + EVENT_TIMEOUT_MS;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("Studio test condition was not reached.");
+		await Bun.sleep(5);
 	}
 }
 
@@ -387,6 +433,306 @@ describe("Studio RPC session supervision", () => {
 					(event.data as StudioRun).status === "cancelled",
 			);
 			expect(cancelled.data).toMatchObject({ id: second.run.id, status: "cancelled" });
+		} finally {
+			events.close();
+		}
+	});
+
+	it("persists text-only assistant snapshots and replays the durable transcript", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-transcript");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const events = await subscribeStudioEvents(studio, cookie);
+		try {
+			const created = await createSession(studio, cookie, workspace.workspace.id);
+			const promptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+				method: "POST",
+				headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+				body: JSON.stringify({ holderId: HOLDER_A, message: "Explain the implementation." }),
+			});
+			expect(promptResponse.status).toBe(202);
+			const prompt = (await promptResponse.json()) as StudioPromptResponse;
+
+			const user = await events.waitFor<StudioTranscriptMessage>(
+				event =>
+					event.type === "transcript.updated" &&
+					event.runId === prompt.run.id &&
+					(event.data as StudioTranscriptMessage).role === "user",
+			);
+			expect(user.data).toMatchObject({ role: "user", status: "completed", text: "Explain the implementation." });
+			const placeholder = await events.waitFor<StudioTranscriptMessage>(
+				event =>
+					event.type === "transcript.updated" &&
+					event.runId === prompt.run.id &&
+					(event.data as StudioTranscriptMessage).role === "assistant" &&
+					(event.data as StudioTranscriptMessage).status === "streaming" &&
+					(event.data as StudioTranscriptMessage).text === "",
+			);
+			expect(placeholder.data).toMatchObject({ role: "assistant", status: "streaming", text: "" });
+
+			const transport = factory.transports[0];
+			transport.emitTranscript({ sourceId: "assistant_one", status: "streaming", text: "First draft" });
+			const streaming = await events.waitFor<StudioTranscriptMessage>(
+				event =>
+					event.type === "transcript.updated" &&
+					event.runId === prompt.run.id &&
+					(event.data as StudioTranscriptMessage).text === "First draft",
+			);
+			expect(streaming.data).toMatchObject({ role: "assistant", status: "streaming", text: "First draft" });
+
+			transport.emitTranscript({ sourceId: "assistant_one", status: "completed", text: "Final answer." });
+			transport.emitTranscript({ sourceId: "assistant_two", status: "streaming", text: "A second response." });
+			transport.emitTranscript({ sourceId: "assistant_two", status: "completed", text: "A second final response." });
+			transport.emit({ type: "agent_end" });
+			await events.waitFor<StudioRun>(
+				event =>
+					event.type === "run.state" &&
+					event.runId === prompt.run.id &&
+					(event.data as StudioRun).status === "completed",
+			);
+
+			const transcriptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/transcript`, {
+				headers: { Cookie: cookie },
+			});
+			expect(transcriptResponse.status).toBe(200);
+			const transcript = (await transcriptResponse.json()) as StudioTranscriptResponse;
+			expect(
+				transcript.messages.map(message => ({ role: message.role, status: message.status, text: message.text })),
+			).toEqual([
+				{ role: "user", status: "completed", text: "Explain the implementation." },
+				{ role: "assistant", status: "completed", text: "Final answer." },
+				{ role: "assistant", status: "completed", text: "A second final response." },
+			]);
+			expect(transcript.messages[0].createdAtMs).toBeLessThan(transcript.messages[1].createdAtMs);
+			expect(transcript.messages[1].createdAtMs).toBeLessThan(transcript.messages[2].createdAtMs);
+			expect(JSON.stringify(transcript)).not.toContain("assistant_one");
+			expect(JSON.stringify(transcript)).not.toContain("assistant_two");
+		} finally {
+			events.close();
+		}
+	});
+
+	it("marks the assistant placeholder failed after a delayed OMP prompt failure", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-transcript-failure");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const events = await subscribeStudioEvents(studio, cookie);
+		try {
+			const created = await createSession(studio, cookie, workspace.workspace.id);
+			const promptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+				method: "POST",
+				headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+				body: JSON.stringify({ holderId: HOLDER_A, message: "This should fail later." }),
+			});
+			const prompt = (await promptResponse.json()) as StudioPromptResponse;
+			factory.transports[0].emitPromptFailure();
+			const failed = await events.waitFor<StudioRun>(
+				event =>
+					event.type === "run.state" &&
+					event.runId === prompt.run.id &&
+					(event.data as StudioRun).status === "failed",
+			);
+			expect(failed.data).toMatchObject({ id: prompt.run.id, status: "failed" });
+
+			const transcriptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/transcript`, {
+				headers: { Cookie: cookie },
+			});
+			const transcript = (await transcriptResponse.json()) as StudioTranscriptResponse;
+			expect(
+				transcript.messages.map(message => ({ role: message.role, status: message.status, text: message.text })),
+			).toEqual([
+				{ role: "user", status: "completed", text: "This should fail later." },
+				{ role: "assistant", status: "failed", text: "" },
+			]);
+		} finally {
+			events.close();
+		}
+	});
+
+	it("does not persist a ghost transcript when OMP rejects the prompt before acceptance", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-rejected-prompt");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const created = await createSession(studio, cookie, workspace.workspace.id);
+		factory.transports[0].promptError = new Error("native prompt rejection");
+
+		const rejected = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, message: "This must not be retained." }),
+		});
+		expect(rejected.status).toBe(502);
+		expect(await rejected.json()).toEqual({
+			error: { code: "rpc_prompt_failed", message: "OMP could not accept the prompt." },
+		});
+
+		const transcriptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/transcript`, {
+			headers: { Cookie: cookie },
+		});
+		const transcript = (await transcriptResponse.json()) as StudioTranscriptResponse;
+		expect(transcript.messages).toEqual([]);
+		const sessionResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}`, {
+			headers: { Cookie: cookie },
+		});
+		expect(((await sessionResponse.json()) as StudioSessionResponse).session).toMatchObject({ status: "ready" });
+	});
+
+	it("returns a terminal session when OMP ends before prompt acceptance completes", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-terminal-before-acceptance");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const created = await createSession(studio, cookie, workspace.workspace.id);
+		const transport = factory.transports[0];
+		const promptGate = Promise.withResolvers<void>();
+		transport.promptGate = promptGate.promise;
+
+		const request = fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, message: "Finish immediately." }),
+		});
+		await waitForCondition(() => transport.prompts.length === 1);
+		transport.emit({ type: "agent_end" });
+		promptGate.resolve();
+
+		const accepted = await request;
+		expect(accepted.status).toBe(202);
+		const prompt = (await accepted.json()) as StudioPromptResponse;
+		expect(prompt.run).toMatchObject({ status: "completed", studioSessionId: created.session.id });
+		expect(prompt.session).toMatchObject({ id: created.session.id, status: "ready" });
+		expect(prompt.session.activeRun).toBeUndefined();
+
+		const sessionResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}`, {
+			headers: { Cookie: cookie },
+		});
+		expect(((await sessionResponse.json()) as StudioSessionResponse).session.activeRun).toBeUndefined();
+	});
+
+	it("buffers early assistant snapshots and local-only results until OMP accepts the prompt", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-prompt-acceptance");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const created = await createSession(studio, cookie, workspace.workspace.id);
+		const transport = factory.transports[0];
+		const promptGate = Promise.withResolvers<void>();
+		transport.promptGate = promptGate.promise;
+
+		const request = fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, message: "Answer before acknowledgement." }),
+		});
+		await waitForCondition(() => transport.prompts.length === 1);
+		transport.emitTranscript({ sourceId: "assistant_early", status: "streaming", text: "Early answer." });
+		transport.emitPromptResult(false);
+
+		const beforeAcceptance = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/transcript`, {
+			headers: { Cookie: cookie },
+		});
+		expect(((await beforeAcceptance.json()) as StudioTranscriptResponse).messages).toEqual([]);
+
+		promptGate.resolve();
+		const accepted = await request;
+		expect(accepted.status).toBe(202);
+		const prompt = (await accepted.json()) as StudioPromptResponse;
+		expect(prompt.run).toMatchObject({ status: "completed" });
+
+		const transcriptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/transcript`, {
+			headers: { Cookie: cookie },
+		});
+		const transcript = (await transcriptResponse.json()) as StudioTranscriptResponse;
+		expect(
+			transcript.messages.map(message => ({ role: message.role, status: message.status, text: message.text })),
+		).toEqual([
+			{ role: "user", status: "completed", text: "Answer before acknowledgement." },
+			{ role: "assistant", status: "completed", text: "Early answer." },
+		]);
+	});
+
+	it("settles local-only accepted prompts without leaving their run active", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-local-only");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const events = await subscribeStudioEvents(studio, cookie);
+		try {
+			const created = await createSession(studio, cookie, workspace.workspace.id);
+			const promptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+				method: "POST",
+				headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+				body: JSON.stringify({ holderId: HOLDER_A, message: "/local-command" }),
+			});
+			const prompt = (await promptResponse.json()) as StudioPromptResponse;
+			factory.transports[0].emitPromptResult(false);
+			const completed = await events.waitFor<StudioRun>(
+				event =>
+					event.type === "run.state" &&
+					event.runId === prompt.run.id &&
+					(event.data as StudioRun).status === "completed",
+			);
+			expect(completed.data).toMatchObject({ id: prompt.run.id, status: "completed" });
+
+			const transcriptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/transcript`, {
+				headers: { Cookie: cookie },
+			});
+			const transcript = (await transcriptResponse.json()) as StudioTranscriptResponse;
+			expect(
+				transcript.messages.map(message => ({ role: message.role, status: message.status, text: message.text })),
+			).toEqual([
+				{ role: "user", status: "completed", text: "/local-command" },
+				{ role: "assistant", status: "completed", text: "" },
+			]);
+		} finally {
+			events.close();
+		}
+	});
+
+	it("marks an assistant provider error failed without forwarding its error details", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-agent-error");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const events = await subscribeStudioEvents(studio, cookie);
+		try {
+			const created = await createSession(studio, cookie, workspace.workspace.id);
+			const promptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+				method: "POST",
+				headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+				body: JSON.stringify({ holderId: HOLDER_A, message: "Request an answer." }),
+			});
+			const prompt = (await promptResponse.json()) as StudioPromptResponse;
+			factory.transports[0].emitTranscript({ sourceId: "assistant_error", status: "failed", text: "" });
+			factory.transports[0].emit({ isError: true, type: "agent_end" });
+			const failed = await events.waitFor<StudioRun>(
+				event =>
+					event.type === "run.state" &&
+					event.runId === prompt.run.id &&
+					(event.data as StudioRun).status === "failed",
+			);
+			expect(failed.data).toMatchObject({ id: prompt.run.id, status: "failed" });
+
+			const transcriptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/transcript`, {
+				headers: { Cookie: cookie },
+			});
+			const transcript = (await transcriptResponse.json()) as StudioTranscriptResponse;
+			expect(
+				transcript.messages.map(message => ({ role: message.role, status: message.status, text: message.text })),
+			).toEqual([
+				{ role: "user", status: "completed", text: "Request an answer." },
+				{ role: "assistant", status: "failed", text: "" },
+			]);
 		} finally {
 			events.close();
 		}

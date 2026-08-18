@@ -3,8 +3,7 @@ import type {
 	StudioApproval,
 	StudioApprovalListResponse,
 	StudioApprovalResponse,
-	StudioAuditEntry,
-	StudioAuditListResponse,
+	StudioAuthCancelResponse,
 	StudioAuthContinueResponse,
 	StudioAuthProgress,
 	StudioBootstrap,
@@ -22,11 +21,15 @@ import type {
 	StudioSessionResponse,
 	StudioSubagent,
 	StudioSubagentListResponse,
+	StudioTranscriptMessage,
+	StudioTranscriptResponse,
 	StudioUsage,
 	StudioWorkspace,
 	StudioWorkspaceListResponse,
 	StudioWorkspaceResponse,
 } from "../protocol";
+import { mergeStudioAuthProgress } from "./auth-flow";
+import { isTerminalRunStatus, reconcileStudioSession } from "./session-state";
 
 type ConnectionState = "connecting" | "ready" | "offline";
 
@@ -171,7 +174,7 @@ function parseUsageUpdated(
 function websocketUrl(afterSequence: number): string {
 	const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 	const url = new URL(`${protocol}//${window.location.host}/api/v1/events`);
-	if (afterSequence > 0) url.searchParams.set("after", String(afterSequence));
+	url.searchParams.set("after", String(afterSequence));
 	return url.toString();
 }
 
@@ -243,10 +246,6 @@ function createHolderId(): string {
 	}
 }
 
-function isTerminalRunStatus(status: StudioRun["status"]): boolean {
-	return ["completed", "cancelled", "interrupted", "failed"].includes(status);
-}
-
 function summarizeAgentEvent(event: Record<string, unknown>): string {
 	const type = typeof event.type === "string" ? event.type : "agent event";
 	const toolName = typeof event.toolName === "string" ? event.toolName : "a tool";
@@ -268,6 +267,10 @@ function promptNeedsSecretInput(progress: StudioAuthProgress): boolean {
 	return /api[ _-]?key|token|secret|password/i.test(message);
 }
 
+function isActiveAuthFlow(progress: StudioAuthProgress): boolean {
+	return progress.phase === "authorization" || progress.phase === "progress" || progress.phase === "prompt";
+}
+
 function formatWorkspaceDate(timestamp: number): string {
 	return new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", year: "numeric" }).format(timestamp);
 }
@@ -283,14 +286,119 @@ function formatCost(value: number): string {
 	}).format(value);
 }
 
-function formatAuditAction(action: string): string {
-	return action.replaceAll("_", " ");
+const selectedSessionStorageKey = "omp-studio-selected-session";
+
+function loadStoredSessionId(): string | null {
+	try {
+		const value = localStorage.getItem(selectedSessionStorageKey);
+		return value && value.length <= 256 ? value : null;
+	} catch {
+		return null;
+	}
 }
 
-function formatAuditDetail(entry: StudioAuditEntry): string | null {
-	const values = Object.entries(entry.detail);
-	if (values.length === 0) return null;
-	return values.map(([key, value]) => `${key.replace(/([A-Z])/g, " $1").toLowerCase()}: ${value}`).join(" / ");
+function persistSelectedSessionId(sessionId: string | null): void {
+	try {
+		if (sessionId) localStorage.setItem(selectedSessionStorageKey, sessionId);
+		else localStorage.removeItem(selectedSessionStorageKey);
+	} catch {
+		// The desktop shell continues normally when browser storage is unavailable.
+	}
+}
+
+function isStudioTranscriptMessage(value: unknown): value is StudioTranscriptMessage {
+	if (!isRecord(value)) return false;
+	return (
+		typeof value.id === "string" &&
+		typeof value.studioSessionId === "string" &&
+		typeof value.text === "string" &&
+		typeof value.createdAtMs === "number" &&
+		typeof value.updatedAtMs === "number" &&
+		typeof value.role === "string" &&
+		["user", "assistant"].includes(value.role) &&
+		typeof value.status === "string" &&
+		["streaming", "completed", "failed", "interrupted"].includes(value.status) &&
+		typeof value.runId === "string"
+	);
+}
+
+function parseTranscriptUpdated(
+	message: unknown,
+): message is StudioEventEnvelope<StudioTranscriptMessage> & { studioSessionId: string } {
+	if (!isRecord(message)) return false;
+	return (
+		message.type === "transcript.updated" &&
+		typeof message.studioSessionId === "string" &&
+		isStudioTranscriptMessage(message.data)
+	);
+}
+
+function sortTranscript(messages: StudioTranscriptMessage[]): StudioTranscriptMessage[] {
+	return [...messages].sort(
+		(left, right) =>
+			left.createdAtMs - right.createdAtMs ||
+			left.updatedAtMs - right.updatedAtMs ||
+			left.id.localeCompare(right.id),
+	);
+}
+
+function upsertTranscriptMessage(
+	messages: StudioTranscriptMessage[],
+	message: StudioTranscriptMessage,
+): StudioTranscriptMessage[] {
+	const existingIndex = messages.findIndex(current => current.id === message.id);
+	if (existingIndex >= 0) {
+		const existing = messages[existingIndex];
+		if (
+			existing.updatedAtMs > message.updatedAtMs ||
+			(existing.updatedAtMs === message.updatedAtMs &&
+				((existing.status !== "streaming" && message.status === "streaming") ||
+					existing.text.length > message.text.length))
+		) {
+			return sortTranscript(messages);
+		}
+		const next = [...messages];
+		next[existingIndex] = { ...next[existingIndex], ...message };
+		return sortTranscript(next);
+	}
+
+	const optimisticIndex = messages.findIndex(
+		current =>
+			(current.id.startsWith("local_") || message.id.startsWith("local_")) &&
+			current.role === message.role &&
+			current.text === message.text &&
+			Math.abs(current.createdAtMs - message.createdAtMs) < 30_000,
+	);
+	if (optimisticIndex >= 0) {
+		if (message.id.startsWith("local_")) return sortTranscript(messages);
+		const next = [...messages];
+		next[optimisticIndex] = message;
+		return sortTranscript(next);
+	}
+	return sortTranscript([...messages, message]);
+}
+
+function mergeTranscriptSnapshot(
+	messages: StudioTranscriptMessage[],
+	snapshot: StudioTranscriptMessage[],
+): StudioTranscriptMessage[] {
+	return snapshot.reduce(upsertTranscriptMessage, messages);
+}
+
+function sessionTitle(session: StudioSession): string {
+	return session.name ?? `Session ${session.id.slice(4, 12)}`;
+}
+
+function formatShortTime(timestamp: number): string {
+	return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(timestamp);
+}
+
+function transcriptDisplayText(message: StudioTranscriptMessage): string {
+	if (message.text) return message.text;
+	if (message.role !== "assistant") return "";
+	if (message.status === "failed") return "OMP could not complete this response.";
+	if (message.status === "interrupted") return "OMP stopped this response.";
+	return "";
 }
 
 export function App(): ReactNode {
@@ -302,12 +410,15 @@ export function App(): ReactNode {
 	const [workspaceLabel, setWorkspaceLabel] = useState("");
 	const [workspacePath, setWorkspacePath] = useState("");
 	const [workspacePending, setWorkspacePending] = useState(false);
+	const [workspacePickerPending, setWorkspacePickerPending] = useState(false);
 	const [providers, setProviders] = useState<StudioProvider[]>([]);
 	const [providerError, setProviderError] = useState<string | null>(null);
 	const [providerPending, setProviderPending] = useState<string | null>(null);
 	const [authFlow, setAuthFlow] = useState<StudioAuthProgress | null>(null);
 	const [authResponse, setAuthResponse] = useState("");
 	const [authPending, setAuthPending] = useState(false);
+	const [authBrowserPending, setAuthBrowserPending] = useState(false);
+	const [authCancelPending, setAuthCancelPending] = useState(false);
 	const [holderId] = useState(createHolderId);
 	const [sessions, setSessions] = useState<StudioSession[]>([]);
 	const [sessionError, setSessionError] = useState<string | null>(null);
@@ -316,21 +427,30 @@ export function App(): ReactNode {
 	const [sessionProviderId, setSessionProviderId] = useState("");
 	const [sessionModelId, setSessionModelId] = useState("");
 	const [sessionPending, setSessionPending] = useState(false);
-	const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-	const [promptText, setPromptText] = useState("");
+	const [selectedSessionId, setSelectedSessionId] = useState<string | null>(loadStoredSessionId);
+	const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>({});
 	const [promptPending, setPromptPending] = useState(false);
+	const [transcriptBySession, setTranscriptBySession] = useState<Record<string, StudioTranscriptMessage[]>>({});
+	const [transcriptErrorsBySession, setTranscriptErrorsBySession] = useState<Record<string, string>>({});
+	const [transcriptLoadingBySession, setTranscriptLoadingBySession] = useState<Record<string, boolean>>({});
+	const [setupOpen, setSetupOpen] = useState(() => loadStoredSessionId() === null);
 	const [controlPendingId, setControlPendingId] = useState<string | null>(null);
 	const [leaseExpiresAtMs, setLeaseExpiresAtMs] = useState<Record<string, number>>({});
-	const [agentEvents, setAgentEvents] = useState<StudioAgentEventItem[]>([]);
+	const [agentEventsBySession, setAgentEventsBySession] = useState<Record<string, StudioAgentEventItem[]>>({});
 	const [approvalPendingId, setApprovalPendingId] = useState<string | null>(null);
 	const [approvalsBySession, setApprovalsBySession] = useState<Record<string, StudioApproval[]>>({});
 	const [subagentsBySession, setSubagentsBySession] = useState<Record<string, StudioSubagent[]>>({});
-	const [auditEntries, setAuditEntries] = useState<StudioAuditEntry[]>([]);
-	const [auditNextBeforeId, setAuditNextBeforeId] = useState<number | null>(null);
-	const [auditPending, setAuditPending] = useState(false);
-	const [auditError, setAuditError] = useState<string | null>(null);
 	const [resyncRevision, setResyncRevision] = useState(0);
 	const lastEventSequenceRef = useRef(0);
+	const autoOpenedAuthFlowIdsRef = useRef(new Set<string>());
+	const conversationEndRef = useRef<HTMLDivElement>(null);
+	const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
+	const workspacePathRef = useRef<HTMLInputElement>(null);
+	const sessionNameRef = useRef<HTMLInputElement>(null);
+	const notifiedRunIdsRef = useRef(new Set<string>());
+	const runStateBySessionRef = useRef(new Map<string, StudioRun>());
+	const sessionSnapshotVersionRef = useRef(0);
+	const transcriptRequestIdsRef = useRef(new Map<string, number>());
 
 	const loadProviders = useCallback(async (): Promise<void> => {
 		setProviderError(null);
@@ -345,27 +465,67 @@ export function App(): ReactNode {
 	}, []);
 
 	const loadSessions = useCallback(async (): Promise<void> => {
+		const snapshotVersion = sessionSnapshotVersionRef.current;
 		setSessionError(null);
 		try {
 			const response = await fetch("/api/v1/sessions");
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioSessionListResponse;
-			setSessions(sortSessions(body.sessions));
+			const snapshot = body.sessions.map(session => {
+				const reconciled = reconcileStudioSession(
+					session,
+					undefined,
+					runStateBySessionRef.current.get(session.id),
+				);
+				if (reconciled.run) runStateBySessionRef.current.set(session.id, reconciled.run);
+				return reconciled.session;
+			});
+			setSessions(current => {
+				if (sessionSnapshotVersionRef.current === snapshotVersion) return sortSessions(snapshot);
+				const currentIds = new Set(current.map(session => session.id));
+				return sortSessions([...current, ...snapshot.filter(session => !currentIds.has(session.id))]);
+			});
 		} catch (reason) {
 			setSessionError(reason instanceof Error ? reason.message : "Studio could not load local sessions.");
 		}
 	}, []);
 
-	const requestAuditEntries = useCallback(
-		async (studioSessionId: string, beforeId?: number): Promise<StudioAuditListResponse> => {
-			const query = new URLSearchParams({ limit: "40", sessionId: studioSessionId });
-			if (beforeId !== undefined) query.set("before", String(beforeId));
-			const response = await fetch(`/api/v1/audit?${query.toString()}`);
+	const loadTranscript = useCallback(async (studioSessionId: string): Promise<void> => {
+		const requestId = (transcriptRequestIdsRef.current.get(studioSessionId) ?? 0) + 1;
+		transcriptRequestIdsRef.current.set(studioSessionId, requestId);
+		setTranscriptErrorsBySession(current => {
+			const next = { ...current };
+			delete next[studioSessionId];
+			return next;
+		});
+		setTranscriptLoadingBySession(current => ({ ...current, [studioSessionId]: true }));
+		try {
+			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/transcript`);
+			if (transcriptRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			if (response.status === 404) {
+				setTranscriptBySession(current => ({ ...current, [studioSessionId]: current[studioSessionId] ?? [] }));
+				return;
+			}
 			if (!response.ok) throw new Error(await responseError(response));
-			return (await response.json()) as StudioAuditListResponse;
-		},
-		[],
-	);
+			const body = (await response.json()) as StudioTranscriptResponse;
+			if (transcriptRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			setTranscriptBySession(current => ({
+				...current,
+				[studioSessionId]: mergeTranscriptSnapshot(current[studioSessionId] ?? [], body.messages),
+			}));
+		} catch (reason) {
+			if (transcriptRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setTranscriptErrorsBySession(current => ({
+					...current,
+					[studioSessionId]: reason instanceof Error ? reason.message : "Studio could not load this conversation.",
+				}));
+			}
+		} finally {
+			if (transcriptRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setTranscriptLoadingBySession(current => ({ ...current, [studioSessionId]: false }));
+			}
+		}
+	}, []);
 
 	useEffect(() => {
 		let active = true;
@@ -439,6 +599,17 @@ export function App(): ReactNode {
 	}, [selectedSessionId, sessions]);
 
 	useEffect(() => {
+		persistSelectedSessionId(selectedSessionId);
+	}, [selectedSessionId]);
+
+	useEffect(() => {
+		if (!selectedSessionId) {
+			return;
+		}
+		void loadTranscript(selectedSessionId);
+	}, [loadTranscript, resyncRevision, selectedSessionId]);
+
+	useEffect(() => {
 		if (!selectedSessionId || !bootstrap?.features.approvalControls) return;
 		let active = true;
 		fetch(`/api/v1/sessions/${encodeURIComponent(selectedSessionId)}/approvals`)
@@ -459,6 +630,18 @@ export function App(): ReactNode {
 	}, [bootstrap?.features.approvalControls, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
+		if (!authFlow || providerPending === null || !isActiveAuthFlow(authFlow) || !window.ompStudio) return;
+		const authorizationUrl = authFlow.launchUrl ?? authFlow.authorizationUrl;
+		if (!authorizationUrl || autoOpenedAuthFlowIdsRef.current.has(authFlow.flowId)) return;
+		autoOpenedAuthFlowIdsRef.current.add(authFlow.flowId);
+		void window.ompStudio.openExternal(authorizationUrl).catch(reason => {
+			setProviderError(
+				reason instanceof Error ? reason.message : "Studio could not open the provider sign-in page.",
+			);
+		});
+	}, [authFlow, providerPending]);
+
+	useEffect(() => {
 		if (!selectedSessionId || !bootstrap?.features.subagentVisibility) return;
 		let active = true;
 		fetch(`/api/v1/sessions/${encodeURIComponent(selectedSessionId)}/subagents`)
@@ -477,34 +660,6 @@ export function App(): ReactNode {
 			active = false;
 		};
 	}, [bootstrap?.features.subagentVisibility, resyncRevision, selectedSessionId]);
-
-	useEffect(() => {
-		if (!selectedSessionId || !bootstrap?.features.auditReview) {
-			setAuditEntries([]);
-			setAuditNextBeforeId(null);
-			setAuditError(null);
-			return;
-		}
-		let active = true;
-		setAuditPending(true);
-		setAuditError(null);
-		void requestAuditEntries(selectedSessionId)
-			.then(body => {
-				if (!active) return;
-				setAuditEntries(body.entries);
-				setAuditNextBeforeId(body.nextBeforeId ?? null);
-			})
-			.catch(reason => {
-				if (active)
-					setAuditError(reason instanceof Error ? reason.message : "Studio could not load the audit ledger.");
-			})
-			.finally(() => {
-				if (active) setAuditPending(false);
-			});
-		return () => {
-			active = false;
-		};
-	}, [bootstrap?.features.auditReview, requestAuditEntries, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
 		let disposed = false;
@@ -547,9 +702,13 @@ export function App(): ReactNode {
 							sequence,
 							message.data.latestSequence,
 						);
-						setAgentEvents([]);
+						setAgentEventsBySession({});
 						setApprovalsBySession({});
 						setSubagentsBySession({});
+						setTranscriptBySession({});
+						setTranscriptErrorsBySession({});
+						setTranscriptLoadingBySession({});
+						runStateBySessionRef.current.clear();
 						setResyncRevision(current => current + 1);
 						return;
 					}
@@ -557,10 +716,12 @@ export function App(): ReactNode {
 					lastEventSequenceRef.current = sequence;
 					if (parseAuthProgress(message)) {
 						const progress = message.data;
-						setAuthFlow(progress);
+						setAuthFlow(current => mergeStudioAuthProgress(current, progress));
 						if (progress.phase === "completed" || progress.phase === "failed" || progress.phase === "cancelled") {
 							setProviderPending(null);
 							setAuthPending(false);
+							setAuthBrowserPending(false);
+							setAuthCancelPending(false);
 							setAuthResponse("");
 							if (progress.phase === "completed") {
 								void loadProviders();
@@ -572,19 +733,24 @@ export function App(): ReactNode {
 					}
 					if (parseRunState(message)) {
 						const run = message.data;
+						runStateBySessionRef.current.set(message.studioSessionId, run);
+						sessionSnapshotVersionRef.current += 1;
+						if (isTerminalRunStatus(run.status) && !notifiedRunIdsRef.current.has(run.id)) {
+							notifiedRunIdsRef.current.add(run.id);
+							const title = run.status === "failed" ? "OMP run needs attention" : "OMP run finished";
+							const body =
+								run.status === "failed"
+									? "Open Studio to review the run state."
+									: "Your session is ready for the next prompt.";
+							void window.ompStudio?.notify(title, body).catch(() => undefined);
+						}
 						setSessions(current =>
 							sortSessions(
-								current.map(session => {
-									if (session.id !== message.studioSessionId) return session;
-									if (isTerminalRunStatus(run.status)) {
-										return {
-											...session,
-											activeRun: undefined,
-											status: run.status === "failed" ? "failed" : "ready",
-										};
-									}
-									return { ...session, activeRun: run, status: "running" };
-								}),
+								current.map(session =>
+									session.id === message.studioSessionId
+										? reconcileStudioSession(session, run, run).session
+										: session,
+								),
 							),
 						);
 						return;
@@ -604,6 +770,7 @@ export function App(): ReactNode {
 						return;
 					}
 					if (parseUsageUpdated(message)) {
+						sessionSnapshotVersionRef.current += 1;
 						setSessions(current =>
 							sortSessions(
 								current.map(session =>
@@ -615,10 +782,21 @@ export function App(): ReactNode {
 						);
 						return;
 					}
+					if (parseTranscriptUpdated(message)) {
+						setTranscriptBySession(current => ({
+							...current,
+							[message.studioSessionId]: upsertTranscriptMessage(
+								current[message.studioSessionId] ?? [],
+								message.data,
+							),
+						}));
+						return;
+					}
 					if (parseAgentEvent(message)) {
 						const payload = message.data;
-						setAgentEvents(current =>
-							[
+						setAgentEventsBySession(current => ({
+							...current,
+							[message.studioSessionId]: [
 								{
 									emittedAtMs: message.emittedAtMs,
 									runId: message.runId,
@@ -628,9 +806,9 @@ export function App(): ReactNode {
 									...(typeof payload.toolName === "string" ? { toolName: payload.toolName } : {}),
 									type: payload.type,
 								},
-								...current,
+								...(current[message.studioSessionId] ?? []),
 							].slice(0, 40),
-						);
+						}));
 					}
 				} catch {
 					setConnection("offline");
@@ -656,13 +834,11 @@ export function App(): ReactNode {
 	}, [loadProviders]);
 
 	const profile = bootstrap?.profile ?? "loading";
-	const profileReady = bootstrap !== null && error === null;
 	const providerOnboarding = bootstrap?.features.providerOnboarding === true;
 	const rpcSupervisor = bootstrap?.features.rpcSupervisor === true;
 	const approvalControls = bootstrap?.features.approvalControls === true;
 	const subagentVisibility = bootstrap?.features.subagentVisibility === true;
 	const usageSummary = bootstrap?.features.usageSummary === true;
-	const auditReview = bootstrap?.features.auditReview === true;
 	const selectedSession = useMemo(
 		() => sessions.find(session => session.id === selectedSessionId) ?? null,
 		[sessions, selectedSessionId],
@@ -672,16 +848,45 @@ export function App(): ReactNode {
 		[providers, sessionProviderId],
 	);
 	const selectedProviderModels = selectedProvider?.models ?? [];
+	const sessionStartBlockedReason =
+		connection === "offline"
+			? "Studio is reconnecting."
+			: !sessionWorkspaceId
+				? "Register a workspace to start a session."
+				: !sessionProviderId || !sessionModelId
+					? "Connect a provider with an available model to start a session."
+					: null;
+	const sessionStartLabel = sessionPending
+		? "starting"
+		: !sessionWorkspaceId
+			? "choose project"
+			: !sessionProviderId || !sessionModelId
+				? "connect model"
+				: "start session";
 	const selectedSessionEvents = useMemo(
-		() => agentEvents.filter(event => event.studioSessionId === selectedSessionId),
-		[agentEvents, selectedSessionId],
+		() => (selectedSessionId ? (agentEventsBySession[selectedSessionId] ?? []) : []),
+		[agentEventsBySession, selectedSessionId],
+	);
+	const selectedTranscript = selectedSessionId ? (transcriptBySession[selectedSessionId] ?? []) : [];
+	const promptText = selectedSessionId ? (promptDrafts[selectedSessionId] ?? "") : "";
+	const transcriptError = selectedSessionId ? (transcriptErrorsBySession[selectedSessionId] ?? null) : null;
+	const transcriptLoading = selectedSessionId ? transcriptLoadingBySession[selectedSessionId] === true : false;
+	const displayedTranscript = selectedTranscript.filter(
+		message => message.role === "user" || message.text.length > 0 || message.status !== "streaming",
+	);
+	const hasStreamingAssistant = selectedTranscript.some(
+		message => message.role === "assistant" && message.status === "streaming",
 	);
 	const selectedApprovals = selectedSessionId ? (approvalsBySession[selectedSessionId] ?? []) : [];
 	const selectedSubagents = selectedSessionId ? (subagentsBySession[selectedSessionId] ?? []) : [];
+	const selectedWorkspace = useMemo(
+		() => workspaces.find(workspace => workspace.id === selectedSession?.workspaceId) ?? null,
+		[selectedSession?.workspaceId, workspaces],
+	);
+	const pendingApprovalCount = selectedApprovals.filter(approval => approval.status === "pending").length;
+	const composerBlocked = promptPending || controlPendingId !== null || selectedSession?.activeRun !== undefined;
 
-	const registerWorkspace = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
-		event.preventDefault();
-		const path = workspacePath.trim();
+	const registerWorkspacePath = async (path: string): Promise<void> => {
 		if (!path || workspacePending) return;
 		setWorkspaceError(null);
 		setWorkspacePending(true);
@@ -697,12 +902,37 @@ export function App(): ReactNode {
 			setWorkspaces(current =>
 				sortWorkspaces([...current.filter(workspace => workspace.id !== body.workspace.id), body.workspace]),
 			);
+			setSessionWorkspaceId(body.workspace.id);
 			setWorkspaceLabel("");
 			setWorkspacePath("");
 		} catch (reason) {
 			setWorkspaceError(reason instanceof Error ? reason.message : "Studio could not register the workspace.");
 		} finally {
 			setWorkspacePending(false);
+		}
+	};
+
+	const registerWorkspace = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+		event.preventDefault();
+		await registerWorkspacePath(workspacePath.trim());
+	};
+
+	const selectWorkspace = async (): Promise<void> => {
+		const desktopApi = window.ompStudio;
+		if (!desktopApi) {
+			setWorkspaceError("The desktop folder picker is unavailable. Restart OMP Studio and try again.");
+			return;
+		}
+		if (workspacePending || workspacePickerPending) return;
+		setWorkspaceError(null);
+		setWorkspacePickerPending(true);
+		try {
+			const selectedPath = await desktopApi.selectWorkspace();
+			if (selectedPath) await registerWorkspacePath(selectedPath);
+		} catch (reason) {
+			setWorkspaceError(reason instanceof Error ? reason.message : "Studio could not open the directory picker.");
+		} finally {
+			setWorkspacePickerPending(false);
 		}
 	};
 
@@ -724,21 +954,71 @@ export function App(): ReactNode {
 	const startProviderLogin = async (provider: StudioProvider): Promise<void> => {
 		if (!provider.canLogin || providerPending !== null) return;
 		setProviderError(null);
+		setAuthBrowserPending(false);
+		setAuthCancelPending(false);
 		setProviderPending(provider.id);
 		try {
 			const response = await fetch(`/api/v1/providers/${encodeURIComponent(provider.id)}/login`, { method: "POST" });
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioProviderLoginResponse;
 			setAuthResponse("");
-			setAuthFlow({
-				flowId: body.flowId,
-				providerId: body.providerId,
-				phase: "progress",
-				message: "Preparing provider sign-in...",
-			});
+			setAuthFlow(current =>
+				current?.flowId === body.flowId
+					? current
+					: {
+							flowId: body.flowId,
+							providerId: body.providerId,
+							phase: "progress",
+							message: "Preparing provider sign-in...",
+						},
+			);
 		} catch (reason) {
 			setProviderPending(null);
 			setProviderError(reason instanceof Error ? reason.message : "Studio could not start provider sign-in.");
+		}
+	};
+
+	const cancelProviderLogin = async (): Promise<void> => {
+		if (!authFlow || !isActiveAuthFlow(authFlow) || authCancelPending) return;
+		setProviderError(null);
+		setAuthCancelPending(true);
+		try {
+			const response = await fetch("/api/v1/auth/cancel", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ flowId: authFlow.flowId }),
+			});
+			if (!response.ok) throw new Error(await responseError(response));
+			const body = (await response.json()) as StudioAuthCancelResponse;
+			if (body.flowId !== authFlow.flowId || !body.cancelled) {
+				throw new Error("Studio did not cancel the provider sign-in.");
+			}
+		} catch (reason) {
+			setProviderError(reason instanceof Error ? reason.message : "Studio could not cancel the provider sign-in.");
+		} finally {
+			setAuthCancelPending(false);
+		}
+	};
+
+	const openProviderAuthorization = async (): Promise<void> => {
+		const authorizationUrl = authFlow?.launchUrl ?? authFlow?.authorizationUrl;
+		if (!authorizationUrl || authBrowserPending) return;
+		setProviderError(null);
+		setAuthBrowserPending(true);
+		try {
+			if (window.ompStudio) {
+				await window.ompStudio.openExternal(authorizationUrl);
+				return;
+			}
+			if (!window.open(authorizationUrl, "_blank", "noopener,noreferrer")) {
+				throw new Error("Studio could not open the provider sign-in page.");
+			}
+		} catch (reason) {
+			setProviderError(
+				reason instanceof Error ? reason.message : "Studio could not open the provider sign-in page.",
+			);
+		} finally {
+			setAuthBrowserPending(false);
 		}
 	};
 
@@ -768,7 +1048,7 @@ export function App(): ReactNode {
 		}
 	};
 
-	const acquireControl = async (studioSessionId: string): Promise<boolean> => {
+	const acquireControl = async (studioSessionId: string, selectSession = true): Promise<boolean> => {
 		if (controlPendingId !== null) return false;
 		setSessionError(null);
 		setControlPendingId(studioSessionId);
@@ -781,7 +1061,7 @@ export function App(): ReactNode {
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioControlLeaseResponse;
 			setLeaseExpiresAtMs(current => ({ ...current, [studioSessionId]: body.lease.expiresAtMs }));
-			setSelectedSessionId(studioSessionId);
+			if (selectSession) setSelectedSessionId(studioSessionId);
 			return true;
 		} catch (reason) {
 			setSessionError(
@@ -795,7 +1075,17 @@ export function App(): ReactNode {
 
 	const createSession = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
 		event.preventDefault();
-		if (sessionPending || !sessionWorkspaceId || !sessionProviderId || !sessionModelId) return;
+		if (sessionPending) return;
+		if (!sessionWorkspaceId) {
+			setSessionError("Choose a project before starting a session.");
+			setSetupOpen(true);
+			return;
+		}
+		if (!sessionProviderId || !sessionModelId) {
+			setSessionError("Connect a provider and choose a model before starting a session.");
+			setSetupOpen(true);
+			return;
+		}
 		setSessionError(null);
 		setSessionPending(true);
 		try {
@@ -813,11 +1103,13 @@ export function App(): ReactNode {
 			});
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioSessionResponse;
+			sessionSnapshotVersionRef.current += 1;
 			setSessions(current =>
 				sortSessions([body.session, ...current.filter(session => session.id !== body.session.id)]),
 			);
 			setSelectedSessionId(body.session.id);
 			setSessionName("");
+			setSetupOpen(false);
 		} catch (reason) {
 			setSessionError(reason instanceof Error ? reason.message : "Studio could not start the local OMP session.");
 		} finally {
@@ -829,22 +1121,55 @@ export function App(): ReactNode {
 		event.preventDefault();
 		const message = promptText.trim();
 		if (!selectedSession || !message || promptPending) return;
-		if (!(await acquireControl(selectedSession.id))) return;
+		const studioSessionId = selectedSession.id;
+		if (!(await acquireControl(studioSessionId, false))) return;
 		setSessionError(null);
 		setPromptPending(true);
+		const optimisticMessageId = `local_${crypto.randomUUID().replaceAll("-", "")}`;
+		const promptedAtMs = Date.now();
 		try {
-			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(selectedSession.id)}/prompts`, {
+			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/prompts`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ holderId, message }),
 			});
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioPromptResponse;
-			setSessions(current =>
-				sortSessions([body.session, ...current.filter(session => session.id !== body.session.id)]),
+			const reconciled = reconcileStudioSession(
+				body.session,
+				body.run,
+				runStateBySessionRef.current.get(studioSessionId),
 			);
-			setPromptText("");
+			if (reconciled.run) runStateBySessionRef.current.set(studioSessionId, reconciled.run);
+			sessionSnapshotVersionRef.current += 1;
+			setSessions(current =>
+				sortSessions([reconciled.session, ...current.filter(session => session.id !== reconciled.session.id)]),
+			);
+			setTranscriptBySession(current => ({
+				...current,
+				[studioSessionId]: upsertTranscriptMessage(current[studioSessionId] ?? [], {
+					id: optimisticMessageId,
+					studioSessionId,
+					runId: body.run.id,
+					role: "user",
+					text: message,
+					status: "completed",
+					createdAtMs: promptedAtMs,
+					updatedAtMs: Date.now(),
+				}),
+			}));
+			setPromptDrafts(current => {
+				const next = { ...current };
+				delete next[studioSessionId];
+				return next;
+			});
 		} catch (reason) {
+			setTranscriptBySession(current => ({
+				...current,
+				[studioSessionId]: (current[studioSessionId] ?? []).filter(
+					transcriptMessage => transcriptMessage.id !== optimisticMessageId,
+				),
+			}));
 			setSessionError(reason instanceof Error ? reason.message : "Studio could not send the prompt to OMP.");
 		} finally {
 			setPromptPending(false);
@@ -854,7 +1179,8 @@ export function App(): ReactNode {
 	const cancelActiveRun = async (): Promise<void> => {
 		const run = selectedSession?.activeRun;
 		if (!selectedSession || !run || promptPending) return;
-		if (!(await acquireControl(selectedSession.id))) return;
+		const studioSessionId = selectedSession.id;
+		if (!(await acquireControl(studioSessionId, false))) return;
 		setSessionError(null);
 		setPromptPending(true);
 		try {
@@ -865,11 +1191,16 @@ export function App(): ReactNode {
 			});
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioRunResponse;
+			const observedRun = runStateBySessionRef.current.get(studioSessionId);
+			sessionSnapshotVersionRef.current += 1;
 			setSessions(current =>
 				sortSessions(
-					current.map(session =>
-						session.id === selectedSession.id ? { ...session, activeRun: body.run, status: "running" } : session,
-					),
+					current.map(session => {
+						if (session.id !== studioSessionId) return session;
+						const reconciled = reconcileStudioSession(session, body.run, observedRun);
+						if (reconciled.run) runStateBySessionRef.current.set(studioSessionId, reconciled.run);
+						return reconciled.session;
+					}),
 				),
 			);
 		} catch (reason) {
@@ -904,343 +1235,124 @@ export function App(): ReactNode {
 		}
 	};
 
-	const loadOlderAuditEntries = async (): Promise<void> => {
-		if (!selectedSessionId || auditNextBeforeId === null || auditPending) return;
-		setAuditPending(true);
-		setAuditError(null);
-		try {
-			const body = await requestAuditEntries(selectedSessionId, auditNextBeforeId);
-			setAuditEntries(current => {
-				const existingIds = new Set(current.map(entry => entry.id));
-				return [...current, ...body.entries.filter(entry => !existingIds.has(entry.id))];
-			});
-			setAuditNextBeforeId(body.nextBeforeId ?? null);
-		} catch (reason) {
-			setAuditError(reason instanceof Error ? reason.message : "Studio could not load older audit records.");
-		} finally {
-			setAuditPending(false);
-		}
-	};
+	useEffect(() => {
+		if (!selectedSessionId) return;
+		conversationEndRef.current?.scrollIntoView({
+			behavior: hasStreamingAssistant ? "auto" : "smooth",
+			block: "end",
+		});
+	}, [hasStreamingAssistant, selectedSessionId, selectedTranscript]);
+
+	useEffect(() => {
+		const onKeyDown = (event: KeyboardEvent): void => {
+			if (!event.ctrlKey && !event.metaKey) return;
+			const key = event.key.toLowerCase();
+			if (key === "n") {
+				event.preventDefault();
+				setSetupOpen(true);
+				window.requestAnimationFrame(() => sessionNameRef.current?.focus());
+				return;
+			}
+			if (key === "o") {
+				event.preventDefault();
+				setSetupOpen(true);
+				if (window.ompStudio) void selectWorkspace();
+				else window.requestAnimationFrame(() => workspacePathRef.current?.focus());
+				return;
+			}
+			if (key === ",") {
+				event.preventDefault();
+				setSetupOpen(true);
+			}
+		};
+		window.addEventListener("keydown", onKeyDown);
+		return () => window.removeEventListener("keydown", onKeyDown);
+	}, [selectWorkspace]);
 
 	return (
-		<div className="studio-shell">
-			<div className="studio-orbit studio-orbit-one" />
-			<div className="studio-orbit studio-orbit-two" />
-			<header className="studio-header">
+		<div className="studio-shell studio-desktop-shell">
+			<header className="studio-titlebar">
 				<a className="studio-mark" href="/" aria-label="OMP Studio home">
 					<span className="studio-mark-kicker">OMP</span>
 					<span>Studio</span>
 				</a>
-				<div className={`studio-connection studio-connection-${connection}`}>
-					<span className="studio-connection-dot" />
-					{connection === "ready" ? "local link live" : connection === "offline" ? "reconnecting" : "connecting"}
+				<div className="studio-titlebar-context">
+					<span>{selectedSession ? sessionTitle(selectedSession) : "Local workspace"}</span>
+					<span className="studio-titlebar-profile">{profile}</span>
+				</div>
+				<div className="studio-titlebar-actions">
+					<div className={`studio-connection studio-connection-${connection}`}>
+						<span className="studio-connection-dot" />
+						{connection === "ready" ? "connected" : connection === "offline" ? "reconnecting" : "connecting"}
+					</div>
+					<button className="studio-titlebar-button" onClick={() => setSetupOpen(true)} type="button">
+						Setup
+					</button>
 				</div>
 			</header>
 
-			<main className="studio-main">
-				<section className="studio-hero">
-					<p className="studio-eyebrow">LOCAL COMMAND CENTER</p>
-					<h1>One focused place for your OMP sessions.</h1>
-					<p className="studio-lede">
-						The Studio shell is running on this machine. It will keep OMP credentials, models, and session history
-						in their native home while adding a deliberate browser control plane.
-					</p>
-					<div className="studio-profile-card">
-						<div>
-							<span className="studio-label">ACTIVE PROFILE</span>
-							<strong>{profile}</strong>
-						</div>
-						<span className={profileReady ? "studio-state studio-state-ready" : "studio-state"}>
-							{profileReady ? "ready" : "checking"}
-						</span>
-					</div>
-				</section>
-
-				<section className="studio-grid" aria-label="Studio roadmap status">
-					<article className="studio-card studio-card-primary">
-						<span className="studio-card-index">01</span>
-						<h2>Local access</h2>
-						<p>Loopback-only server, one-time handoff URL, and a process-scoped browser session are active.</p>
-						<span className="studio-card-status">ONLINE</span>
-					</article>
-					<article className="studio-card">
-						<span className="studio-card-index">02</span>
-						<h2>Workspace ledger</h2>
-						<p>Register one local directory once, then use its opaque Studio ID for every future session.</p>
-						<span className="studio-card-status">ONLINE</span>
-					</article>
-					<article className="studio-card">
-						<span className="studio-card-index">03</span>
-						<h2>Provider bridge</h2>
-						<p>OAuth, API-key, and local-engine setup reuse OMP AuthStorage rather than build a second vault.</p>
-						<span
-							className={
-								providerOnboarding ? "studio-card-status" : "studio-card-status studio-card-status-next"
-							}
-						>
-							{providerOnboarding ? "ONLINE" : "UNAVAILABLE"}
-						</span>
-					</article>
-				</section>
-
-				<section className="studio-workspace-panel" aria-labelledby="studio-workspaces-heading">
-					<div className="studio-workspace-heading">
-						<div>
-							<p className="studio-eyebrow">WORKSPACE LEDGER</p>
-							<h2 id="studio-workspaces-heading">Choose the directories Studio may use later.</h2>
-						</div>
-						<span>{workspaces.length} registered</span>
-					</div>
-					<form className="studio-workspace-form" onSubmit={registerWorkspace}>
-						<label>
-							<span>DIRECTORY</span>
-							<input
-								autoComplete="off"
-								disabled={workspacePending}
-								name="workspace-path"
-								onChange={event => setWorkspacePath(event.target.value)}
-								placeholder="C:\\Projects\\my-app"
-								required
-								value={workspacePath}
-							/>
-						</label>
-						<label>
-							<span>LABEL (OPTIONAL)</span>
-							<input
-								autoComplete="off"
-								disabled={workspacePending}
-								name="workspace-label"
-								onChange={event => setWorkspaceLabel(event.target.value)}
-								placeholder="My app"
-								value={workspaceLabel}
-							/>
-						</label>
-						<button type="submit" disabled={workspacePending}>
-							{workspacePending ? "saving" : "register directory"}
+			<div className="studio-workspace-layout">
+				<aside className="studio-sidebar" aria-label="Projects and sessions">
+					<div className="studio-sidebar-actions">
+						<button className="studio-new-session" onClick={() => setSetupOpen(true)} type="button">
+							+ New session
 						</button>
-					</form>
-					<p className="studio-workspace-caption">
-						Studio canonicalizes this directory locally and keeps its full path off the API surface.
-					</p>
-					{workspaceError && <p className="studio-error studio-workspace-error">{workspaceError}</p>}
-					<div className="studio-workspace-list">
-						{workspaces.length === 0 ? (
-							<p className="studio-workspace-empty">No directories registered yet.</p>
-						) : (
-							workspaces.map(workspace => (
-								<article className="studio-workspace-row" key={workspace.id}>
-									<div>
-										<strong>{workspace.label}</strong>
-										<span>
-											{workspace.id.slice(0, 12)} / registered {formatWorkspaceDate(workspace.createdAtMs)}
-										</span>
-									</div>
+						<button className="studio-sidebar-button" onClick={() => setSetupOpen(true)} type="button">
+							Settings
+						</button>
+					</div>
+
+					<section className="studio-sidebar-section" aria-labelledby="studio-projects-heading">
+						<div className="studio-sidebar-heading">
+							<h2 id="studio-projects-heading">Projects</h2>
+							<button
+								aria-label="Add project"
+								onClick={() => {
+									setSetupOpen(true);
+									window.requestAnimationFrame(() => workspacePathRef.current?.focus());
+								}}
+								type="button"
+							>
+								+
+							</button>
+						</div>
+						<div className="studio-project-list">
+							{workspaces.length === 0 ? (
+								<p className="studio-sidebar-empty">No project folder yet.</p>
+							) : (
+								workspaces.map(workspace => (
 									<button
-										aria-label={`Remove ${workspace.label}`}
-										disabled={workspacePending}
-										onClick={() => void removeWorkspace(workspace.id)}
+										className={
+											workspace.id === sessionWorkspaceId
+												? "studio-project-row studio-project-row-selected"
+												: "studio-project-row"
+										}
+										key={workspace.id}
+										onClick={() => {
+											setSessionWorkspaceId(workspace.id);
+											setSetupOpen(true);
+										}}
 										type="button"
 									>
-										remove
+										<span>{workspace.label}</span>
+										<small>{formatWorkspaceDate(workspace.updatedAtMs)}</small>
 									</button>
-								</article>
-							))
-						)}
-					</div>
-				</section>
-
-				{providerOnboarding && (
-					<section className="studio-provider-panel" aria-labelledby="studio-providers-heading">
-						<div className="studio-provider-heading">
-							<div>
-								<p className="studio-eyebrow">OMP PROVIDER BRIDGE</p>
-								<h2 id="studio-providers-heading">Connect once. OMP keeps the credential.</h2>
-							</div>
-							<span>{providers.length} providers</span>
-						</div>
-						<p className="studio-provider-caption">
-							Studio only relays the native OMP sign-in flow. API keys and OAuth tokens never enter the Studio
-							database.
-						</p>
-						{providerError && <p className="studio-error studio-provider-error">{providerError}</p>}
-						<div className="studio-provider-list">
-							{providers.length === 0 ? (
-								<p className="studio-workspace-empty">
-									No configured or connectable OMP providers are available yet.
-								</p>
-							) : (
-								providers.map(provider => (
-									<article className="studio-provider-row" key={provider.id}>
-										<div className="studio-provider-copy">
-											<div className="studio-provider-title">
-												<strong>{provider.name}</strong>
-												<span
-													className={`studio-provider-state studio-provider-state-${provider.authState}`}
-												>
-													{providerState(provider)}
-												</span>
-											</div>
-											<p>
-												{provider.models.length === 0
-													? "No model is available until OMP finishes provider discovery."
-													: `${provider.models.length} model${provider.models.length === 1 ? "" : "s"} currently available.`}
-											</p>
-											{provider.models.length > 0 && (
-												<div className="studio-model-list" aria-label={`${provider.name} available models`}>
-													{provider.models.slice(0, 4).map(model => (
-														<span key={`${model.providerId}/${model.id}`}>{model.name}</span>
-													))}
-													{provider.models.length > 4 && <span>+{provider.models.length - 4} more</span>}
-												</div>
-											)}
-										</div>
-										{provider.canLogin && (
-											<button
-												disabled={providerPending !== null}
-												onClick={() => void startProviderLogin(provider)}
-												type="button"
-											>
-												{providerPending === provider.id ? "connecting" : "connect"}
-											</button>
-										)}
-									</article>
 								))
 							)}
 						</div>
-						{authFlow && (
-							<section className="studio-auth-flow" aria-live="polite">
-								<div>
-									<span className="studio-label">{authFlow.providerId}</span>
-									<strong>
-										{authFlow.phase === "completed"
-											? "Provider connected"
-											: authFlow.phase === "failed"
-												? "Provider sign-in stopped"
-												: "Provider sign-in in progress"}
-									</strong>
-									{authFlow.message && <p>{authFlow.message}</p>}
-									{authFlow.instructions && <p>{authFlow.instructions}</p>}
-								</div>
-								{authFlow.authorizationUrl && (
-									<a href={authFlow.launchUrl ?? authFlow.authorizationUrl} rel="noreferrer" target="_blank">
-										open provider sign-in
-									</a>
-								)}
-								{authFlow.phase === "prompt" && authFlow.prompt && (
-									<form className="studio-auth-form" onSubmit={submitAuthResponse}>
-										<label>
-											<span>{authFlow.prompt.message}</span>
-											<input
-												autoComplete="off"
-												disabled={authPending}
-												onChange={event => setAuthResponse(event.target.value)}
-												placeholder={authFlow.prompt.placeholder}
-												required={!authFlow.prompt.allowEmpty}
-												type={promptNeedsSecretInput(authFlow) ? "password" : "text"}
-												value={authResponse}
-											/>
-										</label>
-										<button disabled={authPending} type="submit">
-											{authPending ? "sending" : "continue"}
-										</button>
-									</form>
-								)}
-							</section>
-						)}
 					</section>
-				)}
 
-				{rpcSupervisor && (
-					<section className="studio-session-panel" aria-labelledby="studio-sessions-heading">
-						<div className="studio-session-heading">
-							<div>
-								<p className="studio-eyebrow">OMP RPC SESSIONS</p>
-								<h2 id="studio-sessions-heading">Start a local session, then keep its control deliberate.</h2>
-							</div>
-							<span>{sessions.length} sessions</span>
+					<section
+						className="studio-sidebar-section studio-sidebar-sessions"
+						aria-labelledby="studio-sessions-heading"
+					>
+						<div className="studio-sidebar-heading">
+							<h2 id="studio-sessions-heading">Sessions</h2>
+							<span>{sessions.length}</span>
 						</div>
-						<p className="studio-session-caption">
-							Each browser tab has a short-lived control lease. Studio renews it before sending a prompt or
-							cancel request.
-						</p>
-						<form className="studio-session-form" onSubmit={createSession}>
-							<label>
-								<span>WORKSPACE</span>
-								<select
-									disabled={sessionPending || workspaces.length === 0}
-									onChange={event => setSessionWorkspaceId(event.target.value)}
-									value={sessionWorkspaceId}
-								>
-									<option value="">Choose a registered workspace</option>
-									{workspaces.map(workspace => (
-										<option key={workspace.id} value={workspace.id}>
-											{workspace.label}
-										</option>
-									))}
-								</select>
-							</label>
-							<label>
-								<span>PROVIDER</span>
-								<select
-									disabled={sessionPending || providers.every(provider => provider.models.length === 0)}
-									onChange={event => setSessionProviderId(event.target.value)}
-									value={sessionProviderId}
-								>
-									<option value="">Choose a provider</option>
-									{providers
-										.filter(provider => provider.models.length > 0)
-										.map(provider => (
-											<option key={provider.id} value={provider.id}>
-												{provider.name}
-											</option>
-										))}
-								</select>
-							</label>
-							<label>
-								<span>MODEL</span>
-								<select
-									disabled={sessionPending || selectedProviderModels.length === 0}
-									onChange={event => setSessionModelId(event.target.value)}
-									value={sessionModelId}
-								>
-									<option value="">Choose a model</option>
-									{selectedProviderModels.map(model => (
-										<option key={model.id} value={model.id}>
-											{model.name}
-										</option>
-									))}
-								</select>
-							</label>
-							<label>
-								<span>NAME (OPTIONAL)</span>
-								<input
-									autoComplete="off"
-									disabled={sessionPending}
-									onChange={event => setSessionName(event.target.value)}
-									placeholder="Release planning"
-									value={sessionName}
-								/>
-							</label>
-							<button
-								disabled={
-									sessionPending ||
-									!sessionWorkspaceId ||
-									!sessionProviderId ||
-									!sessionModelId ||
-									connection === "offline"
-								}
-								type="submit"
-							>
-								{sessionPending ? "starting" : "start session"}
-							</button>
-						</form>
-						{sessionError && <p className="studio-error studio-session-error">{sessionError}</p>}
-
 						<div className="studio-session-list">
 							{sessions.length === 0 ? (
-								<p className="studio-workspace-empty">
-									Choose a workspace and OMP model above to start the first supervised session.
-								</p>
+								<p className="studio-sidebar-empty">Start a session to begin a conversation.</p>
 							) : (
 								sessions.map(session => {
 									const hasLease = (leaseExpiresAtMs[session.id] ?? 0) > Date.now();
@@ -1258,17 +1370,17 @@ export function App(): ReactNode {
 												onClick={() => setSelectedSessionId(session.id)}
 												type="button"
 											>
-												<span className="studio-session-name">
-													{session.name ?? `Session ${session.id.slice(4, 12)}`}
-												</span>
+												<span className="studio-session-name">{sessionTitle(session)}</span>
 												<span className="studio-session-meta">
-													{session.model
-														? `${session.model.provider}/${session.model.id}`
-														: "model unavailable"}{" "}
-													/ {session.status}
+													{session.model ? session.model.id : "model unavailable"}
 												</span>
 											</button>
 											<button
+												aria-label={
+													hasLease
+														? `Renew control for ${sessionTitle(session)}`
+														: `Take control of ${sessionTitle(session)}`
+												}
 												className={
 													hasLease
 														? "studio-session-control studio-session-control-active"
@@ -1278,50 +1390,108 @@ export function App(): ReactNode {
 												onClick={() => void acquireControl(session.id)}
 												type="button"
 											>
-												{controlPendingId === session.id
-													? "claiming"
-													: hasLease
-														? "renew control"
-														: "take control"}
+												{controlPendingId === session.id ? "..." : hasLease ? "Control" : "Take"}
 											</button>
 										</article>
 									);
 								})
 							)}
 						</div>
+					</section>
 
-						{selectedSession && (
-							<section
-								className="studio-composer"
-								aria-label={`Prompt ${selectedSession.name ?? selectedSession.id}`}
-							>
-								<div className="studio-composer-heading">
-									<div>
-										<span className="studio-label">ACTIVE SESSION</span>
-										<strong>{selectedSession.name ?? `Session ${selectedSession.id.slice(4, 12)}`}</strong>
+					<div className="studio-sidebar-footer">
+						<span>OMP Studio</span>
+						<span>Local only</span>
+					</div>
+				</aside>
+
+				<main className="studio-conversation-pane" aria-label="Conversation">
+					{selectedSession ? (
+						<>
+							<header className="studio-conversation-header">
+								<div>
+									<div className="studio-conversation-breadcrumb">
+										<span>{selectedWorkspace?.label ?? "Project"}</span>
+										<span>/</span>
+										<span>{selectedSession.model?.provider ?? "OMP"}</span>
 									</div>
-									<span className={`studio-session-status studio-session-status-${selectedSession.status}`}>
-										{selectedSession.status}
-									</span>
+									<h1>{sessionTitle(selectedSession)}</h1>
 								</div>
-								<form className="studio-prompt-form" onSubmit={submitPrompt}>
-									<label>
-										<span>MESSAGE TO OMP</span>
-										<textarea
-											disabled={promptPending || controlPendingId !== null}
-											onChange={event => setPromptText(event.target.value)}
-											placeholder="Describe the next piece of work..."
-											rows={4}
-											value={promptText}
-										/>
-									</label>
-									<div className="studio-prompt-actions">
-										<button
-											disabled={promptPending || controlPendingId !== null || !promptText.trim()}
-											type="submit"
-										>
-											{promptPending ? "sending" : "send prompt"}
-										</button>
+								<div className="studio-conversation-header-actions">
+									<span className={`studio-session-status studio-session-status-${selectedSession.status}`}>
+										{selectedSession.activeRun ? "running" : selectedSession.status}
+									</span>
+									<button onClick={() => setSetupOpen(true)} type="button">
+										Configure
+									</button>
+								</div>
+							</header>
+
+							<section className="studio-conversation-scroll" aria-live="polite">
+								{transcriptLoading && displayedTranscript.length === 0 && (
+									<p className="studio-conversation-notice">Loading conversation...</p>
+								)}
+								{!transcriptLoading && displayedTranscript.length === 0 && !hasStreamingAssistant && (
+									<div className="studio-empty-conversation">
+										<span className="studio-empty-conversation-mark">OMP</span>
+										<h2>Start the conversation</h2>
+										<p>
+											Send a task to this session. Replies and live updates stay here as the work progresses.
+										</p>
+									</div>
+								)}
+								{displayedTranscript.map(message => (
+									<article className={`studio-message studio-message-${message.role}`} key={message.id}>
+										<div className="studio-message-meta">
+											<span>{message.role === "user" ? "You" : "OMP"}</span>
+											<time dateTime={new Date(message.createdAtMs).toISOString()}>
+												{formatShortTime(message.createdAtMs)}
+											</time>
+											{message.status === "streaming" && (
+												<span className="studio-message-streaming">Streaming</span>
+											)}
+											{message.status === "failed" && <span className="studio-message-failed">Stopped</span>}
+										</div>
+										<p>{transcriptDisplayText(message)}</p>
+									</article>
+								))}
+								{selectedSession.activeRun && hasStreamingAssistant && (
+									<div className="studio-run-indicator">
+										<span />
+										OMP is working
+									</div>
+								)}
+								<div ref={conversationEndRef} />
+							</section>
+
+							<form className="studio-composer" onSubmit={submitPrompt}>
+								<label className="studio-composer-input">
+									<span className="studio-sr-only">Message OMP</span>
+									<textarea
+										ref={composerTextareaRef}
+										disabled={composerBlocked}
+										onChange={event => {
+											if (!selectedSessionId) return;
+											setPromptDrafts(current => ({ ...current, [selectedSessionId]: event.target.value }));
+										}}
+										onKeyDown={event => {
+											if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+												event.preventDefault();
+												event.currentTarget.form?.requestSubmit();
+											}
+										}}
+										placeholder={
+											selectedSession.activeRun
+												? "OMP is working on the current task"
+												: "Message OMP about the next task"
+										}
+										rows={3}
+										value={promptText}
+									/>
+								</label>
+								<div className="studio-composer-footer">
+									<span>{selectedSession.activeRun ? "Run in progress" : "Ctrl+Enter to send"}</span>
+									<div>
 										{selectedSession.activeRun && (
 											<button
 												className="studio-cancel-button"
@@ -1329,248 +1499,504 @@ export function App(): ReactNode {
 												onClick={() => void cancelActiveRun()}
 												type="button"
 											>
-												cancel run
+												Stop
 											</button>
 										)}
+										<button disabled={composerBlocked || !promptText.trim()} type="submit">
+											{promptPending ? "Sending" : "Send"}
+										</button>
 									</div>
-								</form>
-								{usageSummary && (
-									<section className="studio-usage-panel" aria-label="Session usage summary">
-										<div className="studio-detail-heading">
-											<span className="studio-label">SESSION USAGE</span>
-											<span>{selectedSession.usage ? "latest OMP totals" : "waiting for OMP activity"}</span>
-										</div>
-										{selectedSession.usage ? (
-											<dl className="studio-usage-grid">
-												<div>
-													<dt>total tokens</dt>
-													<dd>{formatCount(selectedSession.usage.totalTokens)}</dd>
-												</div>
-												<div>
-													<dt>input / output</dt>
-													<dd>
-														{formatCount(selectedSession.usage.inputTokens)} /{" "}
-														{formatCount(selectedSession.usage.outputTokens)}
-													</dd>
-												</div>
-												<div>
-													<dt>tool calls</dt>
-													<dd>{formatCount(selectedSession.usage.toolCalls)}</dd>
-												</div>
-												<div>
-													<dt>cost</dt>
-													<dd>${formatCost(selectedSession.usage.cost)}</dd>
-												</div>
-												{selectedSession.usage.contextTokens !== undefined &&
-													selectedSession.usage.contextWindow !== undefined && (
-														<div>
-															<dt>context</dt>
-															<dd>
-																{formatCount(selectedSession.usage.contextTokens)} /{" "}
-																{formatCount(selectedSession.usage.contextWindow)}
-															</dd>
+								</div>
+							</form>
+							{transcriptError && <p className="studio-inline-error">{transcriptError}</p>}
+							{sessionError && <p className="studio-inline-error">{sessionError}</p>}
+						</>
+					) : (
+						<section className="studio-no-session">
+							<span className="studio-empty-conversation-mark">OMP</span>
+							<h1>Open a focused session</h1>
+							<p>Choose a local project and provider once, then work in a persistent conversation.</p>
+							<button onClick={() => setSetupOpen(true)} type="button">
+								New session
+							</button>
+							{sessionError && <p className="studio-inline-error">{sessionError}</p>}
+						</section>
+					)}
+				</main>
+
+				<aside className="studio-inspector" aria-label="Session inspector">
+					<div className="studio-inspector-topline">
+						<span>Inspector</span>
+						<button onClick={() => setSetupOpen(true)} type="button">
+							Setup
+						</button>
+					</div>
+
+					{selectedSession ? (
+						<>
+							<section className="studio-inspector-section">
+								<div className="studio-inspector-heading">
+									<h2>Session</h2>
+									<span className={`studio-session-status studio-session-status-${selectedSession.status}`}>
+										{selectedSession.activeRun ? "active" : selectedSession.status}
+									</span>
+								</div>
+								<dl className="studio-inspector-facts">
+									<div>
+										<dt>Project</dt>
+										<dd>{selectedWorkspace?.label ?? "Unavailable"}</dd>
+									</div>
+									<div>
+										<dt>Model</dt>
+										<dd>
+											{selectedSession.model
+												? `${selectedSession.model.provider}/${selectedSession.model.id}`
+												: "Unavailable"}
+										</dd>
+									</div>
+									<div>
+										<dt>Control</dt>
+										<dd>
+											{(leaseExpiresAtMs[selectedSession.id] ?? 0) > Date.now()
+												? "Held by this window"
+												: "Not held"}
+										</dd>
+									</div>
+								</dl>
+								<button
+									className="studio-inspector-control"
+									disabled={controlPendingId !== null}
+									onClick={() => void acquireControl(selectedSession.id)}
+									type="button"
+								>
+									{controlPendingId === selectedSession.id
+										? "Claiming control"
+										: (leaseExpiresAtMs[selectedSession.id] ?? 0) > Date.now()
+											? "Renew control"
+											: "Take control"}
+								</button>
+							</section>
+
+							{usageSummary && (
+								<section className="studio-inspector-section">
+									<div className="studio-inspector-heading">
+										<h2>Usage</h2>
+										<span>{selectedSession.usage ? "Latest" : "Waiting"}</span>
+									</div>
+									{selectedSession.usage ? (
+										<dl className="studio-usage-grid">
+											<div>
+												<dt>Tokens</dt>
+												<dd>{formatCount(selectedSession.usage.totalTokens)}</dd>
+											</div>
+											<div>
+												<dt>Tools</dt>
+												<dd>{formatCount(selectedSession.usage.toolCalls)}</dd>
+											</div>
+											<div>
+												<dt>Cost</dt>
+												<dd>${formatCost(selectedSession.usage.cost)}</dd>
+											</div>
+										</dl>
+									) : (
+										<p className="studio-inspector-empty">Usage appears after the first response.</p>
+									)}
+								</section>
+							)}
+
+							{approvalControls && (
+								<section className="studio-inspector-section" aria-live="polite">
+									<div className="studio-inspector-heading">
+										<h2>Approvals</h2>
+										<span>{pendingApprovalCount} waiting</span>
+									</div>
+									{selectedApprovals.length === 0 ? (
+										<p className="studio-inspector-empty">No tool decision is waiting.</p>
+									) : (
+										<div className="studio-approval-list">
+											{selectedApprovals.map(approval => (
+												<article
+													className={`studio-approval-card studio-approval-card-${approval.status}`}
+													key={approval.id}
+												>
+													<div>
+														<strong>{approval.toolName}</strong>
+														<span>{approval.status}</span>
+													</div>
+													{approval.reason && <p>{approval.reason}</p>}
+													{approval.status === "pending" && (
+														<div className="studio-approval-actions">
+															<button
+																disabled={approvalPendingId !== null || controlPendingId !== null}
+																onClick={() => void resolveToolApproval(approval, "approve")}
+																type="button"
+															>
+																Approve
+															</button>
+															<button
+																className="studio-approval-reject"
+																disabled={approvalPendingId !== null || controlPendingId !== null}
+																onClick={() => void resolveToolApproval(approval, "reject")}
+																type="button"
+															>
+																Reject
+															</button>
 														</div>
 													)}
-											</dl>
-										) : (
-											<p className="studio-detail-empty">
-												Usage appears after OMP completes a model response.
-											</p>
-										)}
-									</section>
-								)}
-								{approvalControls && (
-									<section className="studio-approval-panel" aria-live="polite">
-										<div className="studio-detail-heading">
-											<span className="studio-label">TOOL APPROVALS</span>
-											<span>
-												{selectedApprovals.filter(approval => approval.status === "pending").length} waiting
-											</span>
+												</article>
+											))}
 										</div>
-										{selectedApprovals.length === 0 ? (
-											<p className="studio-detail-empty">
-												Approvals appear only when OMP pauses an approval-required tool call.
-											</p>
-										) : (
-											<div className="studio-approval-list">
-												{selectedApprovals.map(approval => (
-													<article
-														className={`studio-approval-card studio-approval-card-${approval.status}`}
-														key={approval.id}
-													>
-														<div className="studio-approval-copy">
-															<div>
-																<strong>{approval.toolName}</strong>
-																<span
-																	className={`studio-approval-status studio-approval-status-${approval.status}`}
-																>
-																	{approval.status}
-																</span>
-															</div>
-															{approval.reason && <p>{approval.reason}</p>}
-															<code>{approval.argumentsDigest}</code>
-															<span>
-																requested {new Date(approval.requestedAtMs).toLocaleTimeString()}
-															</span>
-														</div>
-														{approval.status === "pending" && (
-															<div className="studio-approval-actions">
-																<button
-																	disabled={approvalPendingId !== null || controlPendingId !== null}
-																	onClick={() => void resolveToolApproval(approval, "approve")}
-																	type="button"
-																>
-																	{approvalPendingId === approval.id ? "deciding" : "approve"}
-																</button>
-																<button
-																	className="studio-approval-reject"
-																	disabled={approvalPendingId !== null || controlPendingId !== null}
-																	onClick={() => void resolveToolApproval(approval, "reject")}
-																	type="button"
-																>
-																	reject
-																</button>
-															</div>
-														)}
-													</article>
-												))}
+									)}
+								</section>
+							)}
+
+							<section className="studio-inspector-section studio-activity-section">
+								<div className="studio-inspector-heading">
+									<h2>Activity</h2>
+									<span>{selectedSessionEvents.length}</span>
+								</div>
+								{selectedSessionEvents.length === 0 ? (
+									<p className="studio-inspector-empty">Run activity will appear here.</p>
+								) : (
+									<ol className="studio-agent-stream">
+										{selectedSessionEvents.map(event => (
+											<li key={event.sequence}>
+												<time>{formatShortTime(event.emittedAtMs)}</time>
+												<span>
+													{event.toolName ? `${event.toolName}: ${event.summary}` : event.summary}
+												</span>
+											</li>
+										))}
+									</ol>
+								)}
+							</section>
+
+							{subagentVisibility && selectedSubagents.length > 0 && (
+								<section className="studio-inspector-section">
+									<div className="studio-inspector-heading">
+										<h2>Subagents</h2>
+										<span>{selectedSubagents.length}</span>
+									</div>
+									<div className="studio-subagent-list">
+										{selectedSubagents.map(subagent => (
+											<div className="studio-subagent-row" key={subagent.id}>
+												<strong>{subagent.agent}</strong>
+												<span>{subagent.status}</span>
 											</div>
-										)}
-									</section>
-								)}
-								{subagentVisibility && (
-									<section className="studio-subagent-panel" aria-label="Subagent status">
-										<div className="studio-detail-heading">
-											<span className="studio-label">SUBAGENTS</span>
-											<span>{selectedSubagents.length} observed</span>
-										</div>
-										{selectedSubagents.length === 0 ? (
-											<p className="studio-detail-empty">
-												OMP will list delegated work here while a task is active.
-											</p>
-										) : (
-											<div className="studio-subagent-list">
-												{selectedSubagents.map(subagent => (
-													<article className="studio-subagent-row" key={subagent.id}>
-														<div>
-															<strong>{subagent.agent}</strong>
-															<span>{subagent.agentSource}</span>
-														</div>
-														<span
-															className={`studio-subagent-status studio-subagent-status-${subagent.status}`}
-														>
-															{subagent.status}
-														</span>
-														<div className="studio-subagent-metrics">
-															{subagent.requestCount !== undefined && (
-																<span>{formatCount(subagent.requestCount)} requests</span>
-															)}
-															{subagent.tokenCount !== undefined && (
-																<span>{formatCount(subagent.tokenCount)} tokens</span>
-															)}
-															{subagent.toolCount !== undefined && (
-																<span>{formatCount(subagent.toolCount)} tools</span>
-															)}
-														</div>
-													</article>
-												))}
-											</div>
-										)}
-									</section>
-								)}
-								{auditReview && (
-									<section className="studio-audit-panel" aria-live="polite">
-										<div className="studio-detail-heading">
-											<span className="studio-label">LOCAL AUDIT</span>
-											<span>{auditEntries.length} recent records</span>
-										</div>
-										{auditError && <p className="studio-detail-error">{auditError}</p>}
-										{auditEntries.length === 0 ? (
-											<p className="studio-detail-empty">
-												{auditPending
-													? "Loading the local control-plane ledger."
-													: "No control-plane records for this session yet."}
-											</p>
-										) : (
-											<ol className="studio-audit-list">
-												{auditEntries.map(entry => {
-													const detail = formatAuditDetail(entry);
-													return (
-														<li key={entry.id}>
-															<div>
-																<strong>{formatAuditAction(entry.action)}</strong>
-																<span>{new Date(entry.occurredAtMs).toLocaleTimeString()}</span>
-															</div>
-															{detail && <p>{detail}</p>}
-														</li>
-													);
-												})}
-											</ol>
-										)}
-										{auditNextBeforeId !== null && (
+										))}
+									</div>
+								</section>
+							)}
+						</>
+					) : (
+						<p className="studio-inspector-empty studio-inspector-start">
+							Select or start a session to inspect its activity.
+						</p>
+					)}
+				</aside>
+			</div>
+
+			{setupOpen && (
+				<div
+					className="studio-drawer-backdrop"
+					onMouseDown={event => {
+						if (event.target === event.currentTarget) setSetupOpen(false);
+					}}
+				>
+					<aside
+						aria-labelledby="studio-setup-heading"
+						aria-modal="true"
+						className="studio-setup-drawer"
+						role="dialog"
+					>
+						<header className="studio-drawer-header">
+							<div>
+								<span className="studio-drawer-kicker">Local configuration</span>
+								<h2 id="studio-setup-heading">Setup</h2>
+							</div>
+							<button aria-label="Close setup" onClick={() => setSetupOpen(false)} type="button">
+								Close
+							</button>
+						</header>
+
+						<section className="studio-drawer-section" aria-labelledby="studio-workspaces-heading">
+							<div className="studio-drawer-section-heading">
+								<div>
+									<span>01</span>
+									<h3 id="studio-workspaces-heading">Project folders</h3>
+								</div>
+								<span>{workspaces.length}</span>
+							</div>
+							<form className="studio-workspace-form" onSubmit={registerWorkspace}>
+								<label>
+									<span>Folder</span>
+									<input
+										ref={workspacePathRef}
+										autoComplete="off"
+										disabled={workspacePending}
+										name="workspace-path"
+										onChange={event => setWorkspacePath(event.target.value)}
+										placeholder="C:\\Projects\\my-app"
+										required
+										value={workspacePath}
+									/>
+								</label>
+								<label>
+									<span>Label</span>
+									<input
+										autoComplete="off"
+										disabled={workspacePending}
+										name="workspace-label"
+										onChange={event => setWorkspaceLabel(event.target.value)}
+										placeholder="My app"
+										value={workspaceLabel}
+									/>
+								</label>
+								<div className="studio-drawer-form-actions">
+									{window.ompStudio && (
+										<button
+											disabled={workspacePending || workspacePickerPending}
+											onClick={() => void selectWorkspace()}
+											type="button"
+										>
+											{workspacePickerPending ? "Opening" : "Choose folder"}
+										</button>
+									)}
+									<button disabled={workspacePending || workspacePickerPending} type="submit">
+										{workspacePending ? "Saving" : "Add project"}
+									</button>
+								</div>
+							</form>
+							{workspaceError && <p className="studio-inline-error">{workspaceError}</p>}
+							{workspaces.length > 0 && (
+								<div className="studio-drawer-list">
+									{workspaces.map(workspace => (
+										<div className="studio-drawer-row" key={workspace.id}>
 											<button
-												className="studio-audit-more"
-												disabled={auditPending}
-												onClick={() => void loadOlderAuditEntries()}
+												className={
+													workspace.id === sessionWorkspaceId
+														? "studio-drawer-row-select studio-drawer-row-select-active"
+														: "studio-drawer-row-select"
+												}
+												onClick={() => setSessionWorkspaceId(workspace.id)}
 												type="button"
 											>
-												{auditPending ? "loading records" : "load older records"}
+												{workspace.label}
 											</button>
-										)}
-									</section>
-								)}
-								<div className="studio-agent-stream" aria-live="polite">
-									<div>
-										<span className="studio-label">LIVE EVENT STREAM</span>
-										<span>{selectedSessionEvents.length} recent events</span>
-									</div>
-									{selectedSessionEvents.length === 0 ? (
-										<p>OMP events will appear here while this session works.</p>
-									) : (
-										<ol>
-											{selectedSessionEvents.map(event => (
-												<li
-													className={
-														event.toolName
-															? "studio-agent-event studio-agent-event-tool"
-															: "studio-agent-event"
-													}
-													key={event.sequence}
-												>
-													<span>{new Date(event.emittedAtMs).toLocaleTimeString()}</span>
-													<p>
-														{event.toolName && <strong>{event.toolName}</strong>}
-														{event.summary}
-													</p>
-												</li>
-											))}
-										</ol>
-									)}
+											<button
+												aria-label={`Remove ${workspace.label}`}
+												disabled={workspacePending}
+												onClick={() => void removeWorkspace(workspace.id)}
+												type="button"
+											>
+												Remove
+											</button>
+										</div>
+									))}
 								</div>
-							</section>
-						)}
-					</section>
-				)}
+							)}
+						</section>
 
-				<section className="studio-note">
-					<div className="studio-note-rule" />
-					<div>
-						<span className="studio-label">{rpcSupervisor ? "MVP READY" : "NEXT PHASE"}</span>
-						<p>
-							{rpcSupervisor
-								? "Sessions, approvals, usage, reconnect recovery, and the local audit ledger are ready on this machine."
-								: "The provider bridge is live before chat controls appear. Start Studio through OMP to enable supervised local sessions."}
-						</p>
-					</div>
-				</section>
+						<section className="studio-drawer-section" aria-labelledby="studio-providers-heading">
+							<div className="studio-drawer-section-heading">
+								<div>
+									<span>02</span>
+									<h3 id="studio-providers-heading">Provider</h3>
+								</div>
+								<span>{providers.filter(provider => provider.authState !== "unconfigured").length} ready</span>
+							</div>
+							{providerOnboarding ? (
+								<>
+									{providerError && <p className="studio-inline-error">{providerError}</p>}
+									<div className="studio-provider-list">
+										{providers.length === 0 ? (
+											<p className="studio-drawer-empty">No OMP providers are available yet.</p>
+										) : (
+											providers.map(provider => (
+												<article className="studio-provider-row" key={provider.id}>
+													<div>
+														<strong>{provider.name}</strong>
+														<span
+															className={`studio-provider-state studio-provider-state-${provider.authState}`}
+														>
+															{providerState(provider)}
+														</span>
+														<small>
+															{provider.models.length === 0
+																? "No model discovered yet"
+																: `${provider.models.length} model${provider.models.length === 1 ? "" : "s"}`}
+														</small>
+													</div>
+													{provider.canLogin && (
+														<button
+															disabled={providerPending !== null}
+															onClick={() => void startProviderLogin(provider)}
+															type="button"
+														>
+															{providerPending === provider.id
+																? "Connecting"
+																: provider.authState === "authenticated"
+																	? "Reconnect"
+																	: "Connect"}
+														</button>
+													)}
+												</article>
+											))
+										)}
+									</div>
+									{authFlow && (
+										<section className="studio-auth-flow" aria-live="polite">
+											<div>
+												<strong>
+													{authFlow.phase === "completed"
+														? "Provider connected"
+														: authFlow.phase === "failed"
+															? "Provider sign-in stopped"
+															: "Provider sign-in in progress"}
+												</strong>
+												{authFlow.message && <p>{authFlow.message}</p>}
+												{authFlow.instructions && <p>{authFlow.instructions}</p>}
+											</div>
+											{isActiveAuthFlow(authFlow) && (
+												<div className="studio-auth-actions">
+													{(authFlow.launchUrl ?? authFlow.authorizationUrl) && (
+														<button
+															disabled={authBrowserPending}
+															onClick={() => void openProviderAuthorization()}
+															type="button"
+														>
+															{authBrowserPending ? "Opening sign-in" : "Open sign-in"}
+														</button>
+													)}
+													<button
+														disabled={authCancelPending}
+														onClick={() => void cancelProviderLogin()}
+														type="button"
+													>
+														{authCancelPending ? "Cancelling" : "Cancel"}
+													</button>
+												</div>
+											)}
+											{authFlow.phase === "prompt" && authFlow.prompt && (
+												<form className="studio-auth-form" onSubmit={submitAuthResponse}>
+													<label>
+														<span>{authFlow.prompt.message}</span>
+														<input
+															autoComplete="off"
+															disabled={authPending}
+															onChange={event => setAuthResponse(event.target.value)}
+															placeholder={authFlow.prompt.placeholder}
+															required={!authFlow.prompt.allowEmpty}
+															type={promptNeedsSecretInput(authFlow) ? "password" : "text"}
+															value={authResponse}
+														/>
+													</label>
+													<button disabled={authPending} type="submit">
+														{authPending ? "Sending" : "Continue"}
+													</button>
+												</form>
+											)}
+										</section>
+									)}
+								</>
+							) : (
+								<p className="studio-drawer-empty">Provider setup is unavailable in this Studio process.</p>
+							)}
+						</section>
 
-				{error && <p className="studio-error">{error}</p>}
-			</main>
+						<section className="studio-drawer-section" aria-labelledby="studio-new-session-heading">
+							<div className="studio-drawer-section-heading">
+								<div>
+									<span>03</span>
+									<h3 id="studio-new-session-heading">New session</h3>
+								</div>
+								<span>{rpcSupervisor ? "Ready" : "Unavailable"}</span>
+							</div>
+							{rpcSupervisor ? (
+								<form className="studio-session-form" onSubmit={createSession}>
+									<label>
+										<span>Project</span>
+										<select
+											disabled={sessionPending || workspaces.length === 0}
+											onChange={event => setSessionWorkspaceId(event.target.value)}
+											value={sessionWorkspaceId}
+										>
+											<option value="">Choose a project</option>
+											{workspaces.map(workspace => (
+												<option key={workspace.id} value={workspace.id}>
+													{workspace.label}
+												</option>
+											))}
+										</select>
+									</label>
+									<label>
+										<span>Provider</span>
+										<select
+											disabled={sessionPending || providers.every(provider => provider.models.length === 0)}
+											onChange={event => setSessionProviderId(event.target.value)}
+											value={sessionProviderId}
+										>
+											<option value="">Choose a provider</option>
+											{providers
+												.filter(provider => provider.models.length > 0)
+												.map(provider => (
+													<option key={provider.id} value={provider.id}>
+														{provider.name}
+													</option>
+												))}
+										</select>
+									</label>
+									<label>
+										<span>Model</span>
+										<select
+											disabled={sessionPending || selectedProviderModels.length === 0}
+											onChange={event => setSessionModelId(event.target.value)}
+											value={sessionModelId}
+										>
+											<option value="">Choose a model</option>
+											{selectedProviderModels.map(model => (
+												<option key={model.id} value={model.id}>
+													{model.name}
+												</option>
+											))}
+										</select>
+									</label>
+									<label>
+										<span>Name</span>
+										<input
+											ref={sessionNameRef}
+											autoComplete="off"
+											disabled={sessionPending}
+											onChange={event => setSessionName(event.target.value)}
+											placeholder="Release planning"
+											value={sessionName}
+										/>
+									</label>
+									<div className="studio-drawer-form-actions">
+										<button
+											aria-describedby={sessionStartBlockedReason ? "studio-session-requirement" : undefined}
+											disabled={sessionPending || connection === "offline"}
+											type="submit"
+										>
+											{sessionStartLabel}
+										</button>
+									</div>
+								</form>
+							) : (
+								<p className="studio-drawer-empty">Start Studio through OMP to enable local sessions.</p>
+							)}
+							{sessionStartBlockedReason && (
+								<p className="studio-session-requirement" id="studio-session-requirement">
+									{sessionStartBlockedReason}
+								</p>
+							)}
+							{sessionError && <p className="studio-inline-error">{sessionError}</p>}
+						</section>
+					</aside>
+				</div>
+			)}
 
-			<footer className="studio-footer">
-				<span>OMP STUDIO / LOCAL SINGLE-USER</span>
-				<span>REST v1 + WS v1</span>
-			</footer>
+			{error && <p className="studio-app-error">{error}</p>}
 		</div>
 	);
 }

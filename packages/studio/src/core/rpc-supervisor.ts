@@ -6,12 +6,14 @@ import type {
 	StudioRun,
 	StudioSession,
 	StudioSubagent,
+	StudioTranscriptMessage,
 	StudioUsage,
 } from "../protocol";
 import type { CreateStudioRunResult, StudioStore } from "./studio-store";
 
 const APPROVAL_EXPIRY_MS = 5 * 60_000;
 const STUDIO_APPROVAL_REASON = "OMP requires confirmation for this tool.";
+const INITIAL_ASSISTANT_TRANSCRIPT_SOURCE_ID = "assistant_initial";
 
 export type StudioRpcSupervisorErrorCode =
 	| "rpc_supervisor_unavailable"
@@ -71,6 +73,18 @@ export interface StudioRpcTransportExit {
 	expected: boolean;
 }
 
+/** The safe outcome reported when an accepted RPC prompt did not start the agent. */
+export interface StudioRpcPromptResult {
+	agentInvoked: boolean;
+}
+
+/** A text-only assistant snapshot produced by the server-side OMP transport. */
+export interface StudioRpcTranscriptUpdate {
+	sourceId: string;
+	status: "streaming" | "completed" | "failed";
+	text: string;
+}
+
 /**
  * Implemented by coding-agent. Studio owns lifecycle decisions while the host
  * owns child-process spawning, RPC framing, and OMP-specific transport details.
@@ -83,7 +97,10 @@ export interface StudioRpcTransport {
 	onApprovalRequest?(listener: (request: StudioRpcApprovalRequest) => void): () => void;
 	onEvent(listener: (event: StudioRpcAgentEvent) => void): () => void;
 	onExit(listener: (exit: StudioRpcTransportExit) => void): () => void;
+	onPromptFailure?(listener: () => void): () => void;
+	onPromptResult?(listener: (result: StudioRpcPromptResult) => void): () => void;
 	onSubagentState?(listener: (subagent: StudioSubagent) => void): () => void;
+	onTranscriptUpdate?(listener: (update: StudioRpcTranscriptUpdate) => void): () => void;
 	prompt(message: string): Promise<void>;
 	resolveApproval?(requestId: string, approved: boolean): Promise<void>;
 	stop(): Promise<void>;
@@ -99,15 +116,27 @@ export interface StudioRpcSupervisorEvents {
 	onApprovalResolved(studioSessionId: string, approval: StudioApproval): void;
 	onRunState(session: StudioSession, run: StudioRun): void;
 	onSubagentState(studioSessionId: string, subagent: StudioSubagent): void;
+	onTranscriptUpdated(studioSessionId: string, message: StudioTranscriptMessage): void;
 	onUsageUpdated(session: StudioSession, usage: StudioUsage): void;
 }
 
 interface ActiveStudioRpcSession {
+	awaitingPromptAcceptance: PendingStudioPrompt | undefined;
 	onApprovalRequest: () => void;
 	onEvent: () => void;
 	onExit: () => void;
+	onPromptFailure: () => void;
+	onPromptResult: () => void;
 	onSubagentState: () => void;
+	onTranscriptUpdate: () => void;
 	transport: StudioRpcTransport;
+}
+
+interface PendingStudioPrompt {
+	promptFailure: boolean;
+	promptResult: StudioRpcPromptResult | undefined;
+	runId: string;
+	transcriptUpdates: StudioRpcTranscriptUpdate[];
 }
 
 interface PendingStudioApproval {
@@ -140,6 +169,7 @@ export class StudioRpcSupervisor {
 	#startingSessions = new Map<string, Promise<StudioSession>>();
 	#store: StudioStore;
 	#subagentsBySession = new Map<string, Map<string, StudioSubagent>>();
+	#transcriptSourceIdsByRun = new Map<string, Map<string, string>>();
 	#transportFactory: StudioRpcTransportFactory | undefined;
 	#usageRefreshInFlight = new Set<string>();
 
@@ -209,20 +239,68 @@ export class StudioRpcSupervisor {
 			detail: { rpcProtocolVersion: active.transport.protocolVersion },
 		});
 
+		const awaitingPromptAcceptance: PendingStudioPrompt = {
+			promptFailure: false,
+			promptResult: undefined,
+			runId: created.run.id,
+			transcriptUpdates: [],
+		};
+		active.awaitingPromptAcceptance = awaitingPromptAcceptance;
 		try {
 			await active.transport.prompt(message);
-			const running = this.#markRunRunning(created);
-			return { run: running, session: this.#store.getStudioSession(studioSessionId) ?? startingSession };
-		} catch {
-			const failed = this.#store.finishStudioRun(created.run.id, "failed", "rpc_prompt_failed");
-			const readySession = this.#store.updateStudioSessionRuntime(studioSessionId, { status: "ready" });
-			if (failed && readySession) this.#events.onRunState(readySession, failed);
-			this.#store.appendAuditEntry({
-				action: "run_failed",
+			if (this.#activeSessions.get(studioSessionId) !== active) {
+				throw new Error("OMP RPC process exited while accepting the prompt.");
+			}
+			const userMessage = this.#store.createStudioUserTranscriptMessage({
 				studioSessionId,
 				runId: created.run.id,
-				detail: { reason: "rpc_prompt_failed" },
+				text: message,
 			});
+			if (!userMessage) throw new Error("Studio could not persist the accepted prompt.");
+			this.#events.onTranscriptUpdated(studioSessionId, userMessage);
+			const assistantMessage = this.#store.upsertStudioAssistantTranscriptMessage({
+				studioSessionId,
+				runId: created.run.id,
+				sourceId: INITIAL_ASSISTANT_TRANSCRIPT_SOURCE_ID,
+				status: "streaming",
+				text: "",
+			});
+			if (!assistantMessage) throw new Error("Studio could not initialize the assistant transcript.");
+			this.#events.onTranscriptUpdated(studioSessionId, assistantMessage);
+			const running = this.#markRunRunning(created);
+			if (active.awaitingPromptAcceptance === awaitingPromptAcceptance) {
+				active.awaitingPromptAcceptance = undefined;
+			}
+			for (const update of awaitingPromptAcceptance.transcriptUpdates) {
+				this.#persistTranscriptUpdate(studioSessionId, created.run.id, update);
+			}
+			if (awaitingPromptAcceptance.promptFailure) {
+				this.#handlePromptFailure(studioSessionId, active);
+			} else if (awaitingPromptAcceptance.promptResult?.agentInvoked === false) {
+				this.#handlePromptResult(studioSessionId, active, awaitingPromptAcceptance.promptResult);
+			}
+			this.#finishTranscriptForTerminalRun(created.run.id);
+			return {
+				run: this.#store.getStudioRun(created.run.id) ?? running,
+				session: this.#store.getStudioSession(studioSessionId) ?? startingSession,
+			};
+		} catch {
+			if (active.awaitingPromptAcceptance === awaitingPromptAcceptance) {
+				active.awaitingPromptAcceptance = undefined;
+			}
+			const current = this.#store.getStudioRun(created.run.id);
+			if (current && ["starting", "running", "cancelling"].includes(current.status)) {
+				const failed = this.#store.finishStudioRun(created.run.id, "failed", "rpc_prompt_failed");
+				this.#finishTranscriptMessages(created.run.id, "failed");
+				const readySession = this.#store.updateStudioSessionRuntime(studioSessionId, { status: "ready" });
+				if (failed && readySession) this.#events.onRunState(readySession, failed);
+				this.#store.appendAuditEntry({
+					action: "run_failed",
+					studioSessionId,
+					runId: created.run.id,
+					detail: { reason: "rpc_prompt_failed" },
+				});
+			}
 			throw new StudioRpcSupervisorError("rpc_prompt_failed", "OMP could not accept the prompt.");
 		}
 	}
@@ -364,13 +442,17 @@ export class StudioRpcSupervisor {
 			active.onApprovalRequest();
 			active.onEvent();
 			active.onExit();
+			active.onPromptFailure();
+			active.onPromptResult();
 			active.onSubagentState();
+			active.onTranscriptUpdate();
 			this.#activeSessions.delete(studioSessionId);
 			void active.transport.stop();
 		}
 		this.#pendingApprovals.clear();
 		this.#clearApprovalExpiryTimers();
 		this.#subagentsBySession.clear();
+		this.#transcriptSourceIdsByRun.clear();
 		this.#store.interruptActiveRuntime("studio_shutdown");
 	}
 
@@ -417,20 +499,32 @@ export class StudioRpcSupervisor {
 			const runtimeState = await transport.getSessionState();
 			if (!runtimeState.ompSessionId) throw new Error("OMP RPC session state did not include a session ID.");
 			const active: ActiveStudioRpcSession = {
+				awaitingPromptAcceptance: undefined,
 				onApprovalRequest: () => {},
 				onEvent: () => {},
 				onExit: () => {},
+				onPromptFailure: () => {},
+				onPromptResult: () => {},
 				onSubagentState: () => {},
+				onTranscriptUpdate: () => {},
 				transport,
 			};
 			this.#activeSessions.set(studioSessionId, active);
 			active.onEvent = transport.onEvent(event => this.#handleAgentEvent(studioSessionId, event));
 			active.onExit = transport.onExit(exit => this.#handleTransportExit(studioSessionId, active, exit));
+			active.onPromptFailure =
+				transport.onPromptFailure?.(() => this.#handlePromptFailure(studioSessionId, active)) ?? (() => {});
+			active.onPromptResult =
+				transport.onPromptResult?.(result => this.#handlePromptResult(studioSessionId, active, result)) ??
+				(() => {});
 			active.onApprovalRequest =
 				transport.onApprovalRequest?.(request => this.#handleApprovalRequest(studioSessionId, active, request)) ??
 				(() => {});
 			active.onSubagentState =
 				transport.onSubagentState?.(subagent => this.#handleSubagentState(studioSessionId, subagent)) ?? (() => {});
+			active.onTranscriptUpdate =
+				transport.onTranscriptUpdate?.(update => this.#handleTranscriptUpdate(studioSessionId, active, update)) ??
+				(() => {});
 			if (this.#activeSessions.get(studioSessionId) !== active) {
 				throw new Error("OMP RPC process exited while Studio was starting the session.");
 			}
@@ -610,6 +704,114 @@ export class StudioRpcSupervisor {
 		}
 	}
 
+	#finishTranscriptMessages(runId: string, status: "completed" | "failed" | "interrupted"): void {
+		for (const message of this.#store.finishStudioTranscriptMessages(runId, status)) {
+			this.#events.onTranscriptUpdated(message.studioSessionId, message);
+		}
+		this.#transcriptSourceIdsByRun.delete(runId);
+	}
+
+	#finishTranscriptForTerminalRun(runId: string): void {
+		const run = this.#store.getStudioRun(runId);
+		if (!run) return;
+		if (run.status === "completed" || run.status === "failed") {
+			this.#finishTranscriptMessages(run.id, run.status);
+		} else if (run.status === "cancelled" || run.status === "interrupted") {
+			this.#finishTranscriptMessages(run.id, "interrupted");
+		}
+	}
+
+	#persistedTranscriptSourceId(runId: string, transportSourceId: string): string {
+		let sourceIds = this.#transcriptSourceIdsByRun.get(runId);
+		if (!sourceIds) {
+			sourceIds = new Map();
+			this.#transcriptSourceIdsByRun.set(runId, sourceIds);
+		}
+		const existing = sourceIds.get(transportSourceId);
+		if (existing) return existing;
+		const sourceId = sourceIds.size === 0 ? INITIAL_ASSISTANT_TRANSCRIPT_SOURCE_ID : transportSourceId;
+		sourceIds.set(transportSourceId, sourceId);
+		return sourceId;
+	}
+
+	#handlePromptFailure(studioSessionId: string, active: ActiveStudioRpcSession): void {
+		if (this.#closed || this.#activeSessions.get(studioSessionId) !== active) return;
+		if (active.awaitingPromptAcceptance) {
+			active.awaitingPromptAcceptance.promptFailure = true;
+			return;
+		}
+		const session = this.#store.getStudioSession(studioSessionId);
+		const run = session?.activeRun;
+		if (!run || run.status === "cancelling") return;
+
+		this.#interruptRunApprovals(run.id, "rpc_prompt_failed");
+		const failed = this.#store.finishStudioRun(run.id, "failed", "rpc_prompt_failed");
+		if (!failed) return;
+		this.#finishTranscriptMessages(run.id, "failed");
+		const readySession = this.#store.updateStudioSessionRuntime(studioSessionId, { status: "ready" });
+		if (readySession) this.#events.onRunState(readySession, failed);
+		this.#store.appendAuditEntry({
+			action: "run_failed",
+			studioSessionId,
+			runId: run.id,
+			detail: { reason: "rpc_prompt_failed" },
+		});
+	}
+
+	#handlePromptResult(studioSessionId: string, active: ActiveStudioRpcSession, result: StudioRpcPromptResult): void {
+		if (this.#closed || this.#activeSessions.get(studioSessionId) !== active || result.agentInvoked) return;
+		if (active.awaitingPromptAcceptance) {
+			active.awaitingPromptAcceptance.promptResult = result;
+			return;
+		}
+		const session = this.#store.getStudioSession(studioSessionId);
+		const run = session?.activeRun;
+		if (!run || run.status === "cancelling") return;
+
+		this.#interruptRunApprovals(run.id, "run_completed");
+		const completed = this.#store.finishStudioRun(run.id, "completed");
+		if (!completed) return;
+		this.#finishTranscriptMessages(run.id, "completed");
+		const readySession = this.#store.updateStudioSessionRuntime(studioSessionId, { status: "ready" });
+		if (readySession) this.#events.onRunState(readySession, completed);
+		this.#store.appendAuditEntry({
+			action: "run_completed",
+			studioSessionId,
+			runId: run.id,
+			detail: {},
+		});
+	}
+
+	#handleTranscriptUpdate(
+		studioSessionId: string,
+		active: ActiveStudioRpcSession,
+		update: StudioRpcTranscriptUpdate,
+	): void {
+		if (this.#closed || this.#activeSessions.get(studioSessionId) !== active) return;
+		if (active.awaitingPromptAcceptance) {
+			active.awaitingPromptAcceptance.transcriptUpdates.push(update);
+			return;
+		}
+		const run = this.#store.getStudioSession(studioSessionId)?.activeRun;
+		if (!run) return;
+		this.#persistTranscriptUpdate(studioSessionId, run.id, update);
+	}
+
+	#persistTranscriptUpdate(studioSessionId: string, runId: string, update: StudioRpcTranscriptUpdate): void {
+		try {
+			const message = this.#store.upsertStudioAssistantTranscriptMessage({
+				studioSessionId,
+				runId,
+				sourceId: this.#persistedTranscriptSourceId(runId, update.sourceId),
+				status: update.status,
+				text: update.text,
+			});
+			if (message) this.#events.onTranscriptUpdated(studioSessionId, message);
+		} catch {
+			logger.warn("Studio rejected an OMP transcript update", { studioSessionId });
+		}
+	}
+
 	#handleAgentEvent(studioSessionId: string, event: StudioRpcAgentEvent): void {
 		if (this.#closed) return;
 		const session = this.#store.getStudioSession(studioSessionId);
@@ -625,17 +827,23 @@ export class StudioRpcSupervisor {
 		}
 		if (!isTerminalAgentEnd(event)) return;
 
-		const status = run.status === "cancelling" ? "cancelled" : "completed";
-		this.#interruptRunApprovals(run.id, status === "cancelled" ? "run_cancelled" : "run_completed");
+		const status = run.status === "cancelling" ? "cancelled" : event.isError ? "failed" : "completed";
+		const reason =
+			status === "cancelled" ? "run_cancelled" : status === "failed" ? "rpc_agent_failed" : "run_completed";
+		this.#interruptRunApprovals(run.id, reason);
 		const completed = this.#store.finishStudioRun(run.id, status);
+		this.#finishTranscriptMessages(
+			run.id,
+			status === "cancelled" ? "interrupted" : status === "failed" ? "failed" : "completed",
+		);
 		const readySession = this.#store.updateStudioSessionRuntime(studioSessionId, { status: "ready" });
 		if (completed && readySession) this.#events.onRunState(readySession, completed);
 		if (active) void this.#refreshUsage(studioSessionId, active.transport);
 		this.#store.appendAuditEntry({
-			action: status === "cancelled" ? "run_cancelled" : "run_completed",
+			action: status === "cancelled" ? "run_cancelled" : status === "failed" ? "run_failed" : "run_completed",
 			studioSessionId,
 			runId: run.id,
-			detail: {},
+			detail: status === "failed" ? { reason } : {},
 		});
 	}
 
@@ -644,7 +852,10 @@ export class StudioRpcSupervisor {
 		active.onApprovalRequest();
 		active.onEvent();
 		active.onExit();
+		active.onPromptFailure();
+		active.onPromptResult();
 		active.onSubagentState();
+		active.onTranscriptUpdate();
 		this.#activeSessions.delete(studioSessionId);
 		this.#subagentsBySession.delete(studioSessionId);
 		if (this.#closed || exit.expected) return;
@@ -655,6 +866,7 @@ export class StudioRpcSupervisor {
 			? this.#store.finishStudioRun(activeRun.id, "interrupted", "rpc_child_exited")
 			: undefined;
 		if (activeRun) this.#interruptRunApprovals(activeRun.id, "rpc_child_exited");
+		if (activeRun) this.#finishTranscriptMessages(activeRun.id, "interrupted");
 		const interruptedSession = this.#store.updateStudioSessionRuntime(studioSessionId, { status: "interrupted" });
 		if (interrupted && interruptedSession) this.#events.onRunState(interruptedSession, interrupted);
 		this.#store.appendAuditEntry({

@@ -1,0 +1,4 @@
+dist/
+release/
+release-*/
+resources/omp.exe

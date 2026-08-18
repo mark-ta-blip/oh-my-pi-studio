@@ -93,6 +93,30 @@ export interface StudioPromptResponse {
 	session: StudioSession;
 }
 
+/**
+ * Browser-safe text exchanged during a Studio run. Tool arguments, tool
+ * results, provider payloads, and native session identifiers are deliberately
+ * absent from this shape.
+ */
+export type StudioTranscriptMessageRole = "user" | "assistant";
+
+export type StudioTranscriptMessageStatus = "streaming" | "completed" | "failed" | "interrupted";
+
+export interface StudioTranscriptMessage {
+	id: string;
+	studioSessionId: string;
+	runId: string;
+	role: StudioTranscriptMessageRole;
+	text: string;
+	status: StudioTranscriptMessageStatus;
+	createdAtMs: number;
+	updatedAtMs: number;
+}
+
+export interface StudioTranscriptResponse {
+	messages: StudioTranscriptMessage[];
+}
+
 export interface StudioRunResponse {
 	run: StudioRun;
 }
@@ -274,6 +298,11 @@ export interface StudioAuthContinueResponse {
 	accepted: true;
 }
 
+export interface StudioAuthCancelResponse {
+	flowId: string;
+	cancelled: true;
+}
+
 export type StudioAuthProgressPhase = "authorization" | "progress" | "prompt" | "completed" | "failed" | "cancelled";
 
 export interface StudioAuthPrompt {
@@ -315,6 +344,7 @@ export type StudioEventType =
 	| "studio.resync_required"
 	| "studio.error"
 	| "run.state"
+	| "transcript.updated"
 	| "agent.event"
 	| "approval.requested"
 	| "approval.resolved"

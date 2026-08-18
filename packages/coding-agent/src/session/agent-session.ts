@@ -178,6 +178,7 @@ import {
 	obfuscateProviderContext,
 } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
+import { shouldRestoreDisplaySecrets } from "../secrets/studio-secret-redaction";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -2593,12 +2594,19 @@ export class AgentSession {
 
 		// Deobfuscate assistant message content for display emission — the LLM echoes back
 		// obfuscated placeholders, but listeners (TUI, extensions, exporters) must see real
-		// values. The original event.message stays obfuscated so the persistence path below
-		// writes `$$HASH$$` tokens to the session file; convertToLlm re-obfuscates outbound
-		// traffic on the next turn. Walks text, thinking, and toolCall arguments/intent.
+		// values. Studio's child RPC process opts out so its browser transcript cannot
+		// receive restored secrets. The original event.message stays obfuscated so the
+		// persistence path below writes `$$HASH$$` tokens to the session file; convertToLlm
+		// re-obfuscates outbound traffic on the next turn. Walks text, thinking, and toolCall
+		// arguments/intent.
 		let displayEvent: AgentEvent = event;
 		const obfuscator = this.#obfuscator;
-		if (obfuscator && event.type === "message_end" && event.message.role === "assistant") {
+		if (
+			obfuscator &&
+			shouldRestoreDisplaySecrets() &&
+			event.type === "message_end" &&
+			event.message.role === "assistant"
+		) {
 			const message = event.message;
 			const deobfuscatedContent = deobfuscateAssistantContent(obfuscator, message.content);
 			if (deobfuscatedContent !== message.content) {

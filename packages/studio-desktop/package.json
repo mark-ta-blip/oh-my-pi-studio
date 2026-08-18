@@ -1,0 +1,38 @@
+{
+	"type": "module",
+	"name": "@oh-my-pi/omp-studio-desktop",
+	"version": "17.3.6",
+	"description": "Electron desktop shell for OMP Studio",
+	"homepage": "https://omp.sh",
+	"author": "Can Boluk",
+	"license": "MIT",
+	"private": true,
+	"main": "./dist/main/index.js",
+	"scripts": {
+		"build": "bun run build:app",
+		"build:app": "bun scripts/build.ts",
+		"build:server": "bun scripts/build-server.ts",
+		"check": "biome check . && bun run check:types",
+		"check:types": "tsgo -p tsconfig.json --noEmit",
+		"desktop:dev": "bun run build:app && electron .",
+		"dist": "bun run build:server && bun run build:app && electron-builder",
+		"dist:linux": "bun run build:server -- --platform=linux && bun run build:app && electron-builder --linux",
+		"dist:mac": "bun run build:server -- --platform=darwin && bun run build:app && electron-builder --mac",
+		"dist:win": "bun run build:server -- --platform=win32 && bun run build:app && electron-builder --win",
+		"lint": "biome lint .",
+		"fmt": "biome format --write ."
+	},
+	"dependencies": {
+		"electron-updater": "^6.3.9"
+	},
+	"devDependencies": {
+		"@types/node": "^22.15.0",
+		"@types/bun": "catalog:",
+		"electron": "33.4.11",
+		"electron-builder": "^26.0.0",
+		"typescript": "catalog:"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	}
+}

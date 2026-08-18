@@ -3,7 +3,9 @@ import type {
 	StudioRpcAgentEvent,
 	StudioRpcApprovalRequest,
 	StudioRpcLaunch,
+	StudioRpcPromptResult,
 	StudioRpcSessionState,
+	StudioRpcTranscriptUpdate,
 	StudioRpcTransport,
 	StudioRpcTransportExit,
 	StudioRpcTransportFactory,
@@ -13,11 +15,13 @@ import type {
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder } from "../modes/rpc/rpc-frame";
-import type { RpcCommand, RpcExtensionUIResponse, RpcResponse } from "../modes/rpc/rpc-types";
+import type { RpcCommand, RpcExtensionUIResponse, RpcPromptResultFrame, RpcResponse } from "../modes/rpc/rpc-types";
+import { studioRpcChildEnvironment } from "../secrets/studio-secret-redaction";
 import { resolveOmpCommandInvocation } from "../task/omp-command";
 
 const RPC_START_TIMEOUT_MS = 30_000;
 const MAX_TRACKED_TOOL_CALLS = 256;
+const MAX_STUDIO_TRANSCRIPT_TEXT_LENGTH = 64 * 1024;
 const STUDIO_APPROVAL_REASON = "OMP requires confirmation for this tool.";
 
 const SESSION_EVENT_TYPES = new Set([
@@ -56,6 +60,7 @@ type StudioRpcCommand =
 	| { type: "abort" };
 
 interface PendingRequest {
+	command: StudioRpcCommand["type"];
 	reject(error: Error): void;
 	resolve(response: RpcResponse): void;
 	timeout: Timer;
@@ -87,6 +92,15 @@ function isRpcResponse(value: unknown): value is RpcResponse {
 		typeof value.command === "string" &&
 		typeof value.success === "boolean" &&
 		(value.id === undefined || typeof value.id === "string")
+	);
+}
+
+function isRpcPromptResultFrame(value: unknown): value is RpcPromptResultFrame {
+	return (
+		isRecord(value) &&
+		value.type === "prompt_result" &&
+		(value.id === undefined || typeof value.id === "string") &&
+		typeof value.agentInvoked === "boolean"
 	);
 }
 
@@ -196,6 +210,43 @@ export function redactStudioAgentEvent(event: Record<string, unknown>): StudioRp
 	return base;
 }
 
+/**
+ * Extract the explicitly displayable portion of an assistant frame. This is
+ * intentionally separate from generic Studio agent-event redaction: no tool
+ * arguments/results, thinking, images, provider payloads, or OMP identifiers
+ * can cross this boundary.
+ */
+export function extractStudioAssistantTranscriptText(event: Record<string, unknown>): string | undefined {
+	if (event.type !== "message_update" && event.type !== "message_end") return undefined;
+	const message = event.message;
+	if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) return undefined;
+	let text = "";
+	for (const block of message.content) {
+		if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
+		text += block.text;
+		if (text.length >= MAX_STUDIO_TRANSCRIPT_TEXT_LENGTH) {
+			return text.slice(0, MAX_STUDIO_TRANSCRIPT_TEXT_LENGTH);
+		}
+	}
+	return text || undefined;
+}
+
+export function studioAssistantMessageKeys(message: Record<string, unknown>): string[] {
+	const keys: string[] = [];
+	if (typeof message.timestamp === "number" && Number.isFinite(message.timestamp)) {
+		keys.push(`timestamp:${message.timestamp}`);
+	}
+	if (typeof message.responseId === "string" && message.responseId) {
+		keys.push(`response:${message.responseId}`);
+	}
+	return keys;
+}
+
+function isAssistantMessageError(frame: Record<string, unknown>): boolean {
+	if (frame.type !== "message_end" || !isRecord(frame.message)) return false;
+	return frame.message.role === "assistant" && frame.message.stopReason === "error";
+}
+
 function canonicalizeToolArguments(value: unknown, ancestors = new Set<object>()): unknown {
 	if (value === null || typeof value === "boolean" || typeof value === "string") return value;
 	if (typeof value === "number") return Number.isFinite(value) ? value : null;
@@ -244,21 +295,35 @@ function rpcCommandFailed(response: RpcResponse, command: StudioRpcCommand["type
 	return new Error("OMP RPC command failed.");
 }
 
+function localOnlyPromptResult(response: RpcResponse): StudioRpcPromptResult | undefined {
+	if (response.command !== "prompt" || !response.success || response.data?.agentInvoked !== false) return undefined;
+	return { agentInvoked: false };
+}
+
 /** Coding-agent implementation of Studio's server-only child-process transport. */
 class CodingAgentStudioRpcTransport implements StudioRpcTransport {
+	#acceptedPromptRequestIds = new Set<string>();
 	#approvalListeners = new Set<(request: StudioRpcApprovalRequest) => void>();
+	#assistantSourceIds = new Map<string, string>();
 	#child: ptree.ChildProcess<"pipe"> | undefined;
+	#currentAssistantSourceId: string | undefined;
 	#eventListeners = new Set<(event: StudioRpcAgentEvent) => void>();
 	#exit: StudioRpcTransportExit | undefined;
 	#exitListeners = new Set<(exit: StudioRpcTransportExit) => void>();
 	#expectedStop = false;
+	#nextAssistantSourceId = 0;
 	#pendingApprovals = new Map<string, StudioRpcApprovalRequest>();
+	#pendingPromptResults = new Map<string, StudioRpcPromptResult>();
 	#pendingRequests = new Map<string, PendingRequest>();
+	#promptFailureListeners = new Set<() => void>();
+	#promptResultListeners = new Set<(result: StudioRpcPromptResult) => void>();
 	#protocolVersion = 1;
 	#protocolV2Enabled = false;
 	#requestId = 0;
 	#subagentListeners = new Set<(subagent: StudioSubagent) => void>();
 	#toolArgumentsByCallId = new Map<string, unknown>();
+	#terminalAssistantError = false;
+	#transcriptListeners = new Set<(update: StudioRpcTranscriptUpdate) => void>();
 
 	constructor(private readonly launch: StudioRpcLaunch) {}
 
@@ -278,7 +343,11 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 				`${this.launch.model.provider}/${this.launch.model.id}`,
 				...(this.launch.sessionRef ? ["--resume", this.launch.sessionRef] : []),
 			]),
-			{ cwd: this.launch.cwd, stdin: "pipe" },
+			{
+				cwd: this.launch.cwd,
+				env: studioRpcChildEnvironment(),
+				stdin: "pipe",
+			},
 		);
 		this.#child = child;
 
@@ -430,9 +499,24 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 		return () => this.#exitListeners.delete(listener);
 	}
 
+	onPromptFailure(listener: () => void): () => void {
+		this.#promptFailureListeners.add(listener);
+		return () => this.#promptFailureListeners.delete(listener);
+	}
+
+	onPromptResult(listener: (result: StudioRpcPromptResult) => void): () => void {
+		this.#promptResultListeners.add(listener);
+		return () => this.#promptResultListeners.delete(listener);
+	}
+
 	onSubagentState(listener: (subagent: StudioSubagent) => void): () => void {
 		this.#subagentListeners.add(listener);
 		return () => this.#subagentListeners.delete(listener);
+	}
+
+	onTranscriptUpdate(listener: (update: StudioRpcTranscriptUpdate) => void): () => void {
+		this.#transcriptListeners.add(listener);
+		return () => this.#transcriptListeners.delete(listener);
 	}
 
 	async prompt(message: string): Promise<void> {
@@ -467,6 +551,9 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 		await child.exited.catch(() => {});
 		this.#rejectPending(new Error("OMP RPC transport stopped."));
 		this.#pendingApprovals.clear();
+		this.#acceptedPromptRequestIds.clear();
+		this.#pendingPromptResults.clear();
+		this.#clearAssistantSources();
 		this.#toolArgumentsByCallId.clear();
 		this.#notifyExit({ expected: true });
 	}
@@ -489,9 +576,31 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 			if (pending) {
 				this.#pendingRequests.delete(frame.id);
 				clearTimeout(pending.timeout);
+				if (pending.command === "prompt" && frame.command === "prompt" && frame.success) {
+					this.#acceptedPromptRequestIds.add(frame.id);
+					const earlyResult = this.#pendingPromptResults.get(frame.id);
+					this.#pendingPromptResults.delete(frame.id);
+					const result = localOnlyPromptResult(frame) ?? earlyResult;
+					if (result) this.#reportPromptResult(frame.id, result);
+				}
 				pending.resolve(frame);
 				return;
 			}
+			if (frame.command === "prompt" && !frame.success && this.#acceptedPromptRequestIds.delete(frame.id)) {
+				this.#pendingPromptResults.delete(frame.id);
+				this.#notifyPromptFailure();
+				return;
+			}
+		}
+		if (isRpcPromptResultFrame(frame)) {
+			if (typeof frame.id !== "string" || frame.agentInvoked) return;
+			const result: StudioRpcPromptResult = { agentInvoked: false };
+			if (this.#acceptedPromptRequestIds.has(frame.id)) {
+				this.#reportPromptResult(frame.id, result);
+			} else if (this.#pendingRequests.get(frame.id)?.command === "prompt") {
+				this.#rememberEarlyPromptResult(frame.id, result);
+			}
+			return;
 		}
 		if (isStudioApprovalRequest(frame)) {
 			const request = createStudioApprovalRequest(
@@ -523,17 +632,86 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 			return;
 		}
 		if (!isSessionEvent(frame)) return;
+		if (frame.type === "agent_start") this.#clearAssistantSources();
+		if (isAssistantMessageError(frame)) this.#terminalAssistantError = true;
+		this.#emitTranscriptUpdate(frame);
 		if (frame.type === "tool_execution_start" && typeof frame.toolCallId === "string") {
 			this.#trackToolArguments(frame.toolCallId, frame.args);
 		}
 		const event = redactStudioAgentEvent(frame);
+		if (frame.type === "agent_end" && frame.isTerminal !== false && this.#terminalAssistantError) {
+			event.isError = true;
+		}
 		for (const listener of this.#eventListeners) listener(event);
 		if (frame.type === "tool_execution_end" && typeof frame.toolCallId === "string") {
 			this.#toolArgumentsByCallId.delete(frame.toolCallId);
 		}
 		if (frame.type === "agent_end" && frame.isTerminal !== false) {
+			this.#acceptedPromptRequestIds.clear();
+			this.#pendingPromptResults.clear();
+			this.#clearAssistantSources();
 			this.#toolArgumentsByCallId.clear();
 			this.#cancelPendingApprovals();
+		}
+	}
+
+	#emitTranscriptUpdate(frame: Record<string, unknown>): void {
+		const text = extractStudioAssistantTranscriptText(frame);
+		const message = frame.message;
+		if (!isRecord(message)) return;
+		const failed = isAssistantMessageError(frame);
+		if (text === undefined && !failed) return;
+		const sourceId = this.#sourceIdForAssistantMessage(message);
+		const update: StudioRpcTranscriptUpdate = {
+			sourceId,
+			status: failed ? "failed" : frame.type === "message_end" ? "completed" : "streaming",
+			text: text ?? "",
+		};
+		for (const listener of this.#transcriptListeners) listener(update);
+		if (frame.type === "message_end") this.#currentAssistantSourceId = undefined;
+	}
+
+	#sourceIdForAssistantMessage(message: Record<string, unknown>): string {
+		const keys = studioAssistantMessageKeys(message);
+		const existing =
+			keys.map(key => this.#assistantSourceIds.get(key)).find(Boolean) ?? this.#currentAssistantSourceId;
+		if (existing) {
+			for (const key of keys) this.#assistantSourceIds.set(key, existing);
+			this.#currentAssistantSourceId = existing;
+			return existing;
+		}
+		const sourceId = `assistant_${++this.#nextAssistantSourceId}`;
+		for (const key of keys) this.#assistantSourceIds.set(key, sourceId);
+		this.#currentAssistantSourceId = sourceId;
+		return sourceId;
+	}
+
+	#clearAssistantSources(): void {
+		this.#assistantSourceIds.clear();
+		this.#currentAssistantSourceId = undefined;
+		this.#terminalAssistantError = false;
+	}
+
+	#notifyPromptFailure(): void {
+		for (const listener of this.#promptFailureListeners) listener();
+	}
+
+	#notifyPromptResult(result: StudioRpcPromptResult): void {
+		for (const listener of this.#promptResultListeners) listener(result);
+	}
+
+	#reportPromptResult(requestId: string, result: StudioRpcPromptResult): void {
+		if (!this.#acceptedPromptRequestIds.delete(requestId)) return;
+		this.#notifyPromptResult(result);
+	}
+
+	#rememberEarlyPromptResult(requestId: string, result: StudioRpcPromptResult): void {
+		this.#pendingPromptResults.delete(requestId);
+		this.#pendingPromptResults.set(requestId, result);
+		while (this.#pendingPromptResults.size > MAX_TRACKED_TOOL_CALLS) {
+			const oldest = this.#pendingPromptResults.keys().next();
+			if (oldest.done) break;
+			this.#pendingPromptResults.delete(oldest.value);
 		}
 	}
 
@@ -551,6 +729,9 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 	#notifyExit(exit: StudioRpcTransportExit): void {
 		if (this.#exit) return;
 		this.#exit = exit;
+		this.#acceptedPromptRequestIds.clear();
+		this.#pendingPromptResults.clear();
+		this.#clearAssistantSources();
 		this.#pendingApprovals.clear();
 		this.#toolArgumentsByCallId.clear();
 		for (const listener of this.#exitListeners) listener(exit);
@@ -600,7 +781,7 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 			reject(new Error("OMP RPC command timed out."));
 		}, RPC_START_TIMEOUT_MS);
 		timeout.unref();
-		this.#pendingRequests.set(id, { resolve, reject, timeout });
+		this.#pendingRequests.set(id, { command: command.type, resolve, reject, timeout });
 		void this.#writeFrame(frame).catch(error => {
 			const pending = this.#pendingRequests.get(id);
 			if (!pending) return;

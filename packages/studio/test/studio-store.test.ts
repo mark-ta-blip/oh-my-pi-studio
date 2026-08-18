@@ -15,7 +15,7 @@ async function createStore(): Promise<StudioStore> {
 	return StudioStore.open({ dbPath: path.join(root, "studio.db") });
 }
 
-function seedStudioSession(dbPath: string, sessionId: string): void {
+function seedStudioSession(dbPath: string, sessionId: string, status = "ready"): void {
 	const db = new Database(dbPath);
 	try {
 		db.exec("PRAGMA foreign_keys = ON");
@@ -27,7 +27,7 @@ function seedStudioSession(dbPath: string, sessionId: string): void {
 		db.run(
 			`INSERT INTO studio_sessions (id, profile, workspace_id, status, created_at_ms, updated_at_ms)
 			 VALUES (?, ?, ?, ?, ?, ?)`,
-			[sessionId, "default", "wsp_seed", "idle", 1, 1],
+			[sessionId, "default", "wsp_seed", status, 1, 1],
 		);
 	} finally {
 		db.close(true);
@@ -88,11 +88,29 @@ describe("Studio control leases", () => {
 			});
 
 			store.interruptActiveRuntime("studio_restart", 1_400);
+			expect(store.getStudioSession("sts_lease_contract")).toMatchObject({ status: "ready" });
 			expect(store.hasControlLease("sts_lease_contract", "tab-two", 1_400)).toBe(false);
 			expect(store.acquireControlLease("sts_lease_contract", "tab-three", 1_000, 1_400)).toMatchObject({
 				kind: "acquired",
 				lease: { holderId: "tab-three" },
 			});
+		} finally {
+			store.close();
+		}
+	});
+});
+
+describe("Studio runtime recovery", () => {
+	it("interrupts the session that owns an active run while preserving idle ready sessions", async () => {
+		const store = await createStore();
+		try {
+			seedStudioSession(store.dbPath, "sts_runtime_contract");
+			const created = store.createStudioRun("sts_runtime_contract", 2);
+			if (created.kind !== "created") throw new Error("Expected the seeded Studio session to accept a run.");
+
+			store.interruptActiveRuntime("studio_restart", 1_400);
+			expect(store.getStudioRun(created.run.id)).toMatchObject({ status: "interrupted" });
+			expect(store.getStudioSession("sts_runtime_contract")).toMatchObject({ status: "interrupted" });
 		} finally {
 			store.close();
 		}

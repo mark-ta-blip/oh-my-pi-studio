@@ -67,6 +67,23 @@ interface AvailableAddon extends CandidateAddon {
 	size: number;
 }
 
+/** Search a native binary without decoding its entire (often 150MB) payload. */
+function containsAscii(bytes: Uint8Array, value: string): boolean {
+	const needle = new TextEncoder().encode(value);
+	if (needle.length === 0 || needle.length > bytes.length) return false;
+	for (let start = 0; start <= bytes.length - needle.length; start++) {
+		let matched = true;
+		for (let offset = 0; offset < needle.length; offset++) {
+			if (bytes[start + offset] !== needle[offset]) {
+				matched = false;
+				break;
+			}
+		}
+		if (matched) return true;
+	}
+	return false;
+}
+
 const targetPlatform = Bun.env.TARGET_PLATFORM || process.platform;
 const targetArch = Bun.env.TARGET_ARCH || process.arch;
 const platformTag = `${targetPlatform}-${targetArch}`;
@@ -94,12 +111,24 @@ if (available.length === 0) {
 	throw new Error(`No native addons found for ${platformTag}. Expected one of:\n${expected}`);
 }
 const packageJson = (await Bun.file(packageJsonPath).json()) as { version: string };
+if (typeof packageJson.version !== "string" || packageJson.version.length === 0) {
+	throw new Error(`Invalid @oh-my-pi/pi-natives package version in ${packageJsonPath}`);
+}
+const versionSentinel = `__piNativesV${packageJson.version.replace(/[^A-Za-z0-9]/g, "_")}`;
 
 const archiveFilename = `${archivePrefix}${platformTag}${archiveSuffix}`;
 const archivePath = path.join(nativeDir, archiveFilename);
 const archiveEntries: Record<string, Uint8Array> = {};
 for (const addon of available) {
-	archiveEntries[addon.filename] = await fs.readFile(addon.path);
+	const bytes = await fs.readFile(addon.path);
+	if (!containsAscii(bytes, versionSentinel)) {
+		throw new Error(
+			`Native addon ${addon.path} does not expose ${versionSentinel}. ` +
+				"The artifact is stale or was built from a different @oh-my-pi/pi-natives release; " +
+				"rebuild it with `bun --cwd=packages/natives run build:bindings` before packaging.",
+		);
+	}
+	archiveEntries[addon.filename] = bytes;
 }
 await Bun.write(archivePath, await new Bun.Archive(archiveEntries, { compress: "gzip", level: 9 }).bytes());
 

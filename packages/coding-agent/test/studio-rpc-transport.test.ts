@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { createStudioApprovalRequest, redactStudioAgentEvent } from "../src/cli/studio-rpc-transport";
+import {
+	createStudioApprovalRequest,
+	extractStudioAssistantTranscriptText,
+	redactStudioAgentEvent,
+	studioAssistantMessageKeys,
+} from "../src/cli/studio-rpc-transport";
+import { shouldRestoreDisplaySecrets, studioRpcChildEnvironment } from "../src/secrets/studio-secret-redaction";
 
 describe("Studio RPC transport redaction", () => {
 	it("replaces sensitive tool arguments with a digest before an approval reaches Studio", () => {
@@ -55,5 +61,54 @@ describe("Studio RPC transport redaction", () => {
 		});
 		expect(JSON.stringify(event)).not.toContain("credentials.txt");
 		expect(JSON.stringify(event)).not.toContain("replace this secret value");
+	});
+
+	it("extracts only text blocks from assistant message snapshots", () => {
+		const transcript = extractStudioAssistantTranscriptText({
+			assistantMessageEvent: { delta: "Visible answer", type: "text_delta" },
+			message: {
+				content: [
+					{ thinking: "internal reasoning", type: "thinking" },
+					{ arguments: { path: "C:\\private\\credentials.txt" }, name: "read", type: "toolCall" },
+					{ text: "Visible answer", type: "text" },
+				],
+				providerPayload: { items: [{ secret: "replace this secret value" }] },
+				role: "assistant",
+			},
+			type: "message_update",
+		});
+
+		expect(transcript).toBe("Visible answer");
+		expect(
+			extractStudioAssistantTranscriptText({
+				message: {
+					content: [{ text: "C:\\private\\credentials.txt", type: "text" }],
+					role: "toolResult",
+				},
+				type: "message_end",
+			}),
+		).toBeUndefined();
+	});
+
+	it("keeps a streaming assistant reply attached to its timestamp when the final response adds an ID", () => {
+		expect(studioAssistantMessageKeys({ responseId: "response-final", timestamp: 1_700_000_000_000 })).toEqual([
+			"timestamp:1700000000000",
+			"response:response-final",
+		]);
+		expect(studioAssistantMessageKeys({ responseId: "response-only" })).toEqual(["response:response-only"]);
+	});
+
+	it("forces Studio RPC children to retain secret placeholders in display events", () => {
+		const environment = studioRpcChildEnvironment({
+			OMP_STUDIO_REDACT_DISPLAY_SECRETS: "0",
+			PATH: "C:\\bin",
+		});
+
+		expect(environment).toEqual({
+			OMP_STUDIO_REDACT_DISPLAY_SECRETS: "1",
+			PATH: "C:\\bin",
+		});
+		expect(shouldRestoreDisplaySecrets(environment)).toBe(false);
+		expect(shouldRestoreDisplaySecrets({})).toBe(true);
 	});
 });

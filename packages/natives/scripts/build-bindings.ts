@@ -7,6 +7,8 @@
  *
  * `OMP_NATIVE_CARGO_PROFILE` selects the cargo profile (default `local`:
  * incremental, unstripped). Image builds set `ci` for a stripped addon.
+ * `OMP_NATIVE_VARIANT` can force the x64 ISA variant (`modern` or `baseline`)
+ * when a packaging build needs both artifacts from one host.
  */
 
 import * as fsSync from "node:fs";
@@ -69,7 +71,15 @@ const localAddon = resolveLocalHostAddon({
 	arch: process.arch,
 	avx2: detectHostAvx2Support(),
 });
-const effectiveVariant = localAddon.x64Variant;
+const requestedVariant = Bun.env.OMP_NATIVE_VARIANT?.trim();
+if (requestedVariant && requestedVariant !== "modern" && requestedVariant !== "baseline") {
+	throw new Error(`OMP_NATIVE_VARIANT must be "modern" or "baseline", got "${requestedVariant}"`);
+}
+if (requestedVariant && process.arch !== "x64") {
+	throw new Error(`OMP_NATIVE_VARIANT is only supported on x64 hosts, got ${process.platform}-${process.arch}`);
+}
+const effectiveVariant =
+	requestedVariant === "modern" || requestedVariant === "baseline" ? requestedVariant : localAddon.x64Variant;
 const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
 
 // Pin Rust target-cpu so x64 baseline/modern variants get a reproducible ISA floor
@@ -171,7 +181,7 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 	}
 }
 
-const canonicalAddonFilename = localAddon.filename;
+const canonicalAddonFilename = `pi_natives.${process.platform}-${process.arch}${variantSuffix}.node`;
 const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
 
 console.log(`Building pi-natives bindings for ${process.platform}-${process.arch}${variantSuffix} (local)…`);

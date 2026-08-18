@@ -13,12 +13,15 @@ import type {
 	StudioRunStatus,
 	StudioSession,
 	StudioSessionStatus,
+	StudioTranscriptMessage,
+	StudioTranscriptMessageStatus,
 	StudioUsage,
 	StudioWorkspace,
 } from "../protocol";
 
-const STUDIO_SCHEMA_VERSION = 3;
+const STUDIO_SCHEMA_VERSION = 4;
 const ACTIVE_RUN_STATUSES = ["starting", "running", "cancelling"] as const;
+const MAX_STUDIO_TRANSCRIPT_TEXT_LENGTH = 100_000;
 const MAX_AUDIT_ENTRIES = 2_000;
 const MAX_AUDIT_DETAIL_TEXT_LENGTH = 240;
 const AUDIT_DETAIL_KEYS = [
@@ -32,6 +35,7 @@ const AUDIT_DETAIL_KEYS = [
 ] as const;
 const AUDIT_REASON_VALUES = new Set([
 	"approval expired",
+	"rpc_agent_failed",
 	"rpc_child_exited",
 	"rpc_prompt_failed",
 	"run_cancel_requested",
@@ -140,6 +144,26 @@ const STUDIO_MIGRATIONS = [
 			CREATE INDEX audit_log_session_id_idx ON audit_log(studio_session_id, id DESC);
 		`,
 	},
+	{
+		version: 4,
+		sql: `
+			CREATE TABLE transcript_messages (
+				ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+				id TEXT NOT NULL UNIQUE,
+				studio_session_id TEXT NOT NULL REFERENCES studio_sessions(id),
+				run_id TEXT NOT NULL REFERENCES runs(id),
+				source_id TEXT NOT NULL,
+				role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+				text TEXT NOT NULL,
+				status TEXT NOT NULL CHECK(status IN ('streaming', 'completed', 'failed', 'interrupted')),
+				created_at_ms INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL,
+				UNIQUE(run_id, source_id)
+			);
+			CREATE INDEX transcript_messages_session_ordinal_idx ON transcript_messages(studio_session_id, ordinal);
+			CREATE INDEX transcript_messages_run_status_idx ON transcript_messages(run_id, status);
+		`,
+	},
 ] as const;
 
 interface StudioMigrationRow {
@@ -213,6 +237,21 @@ interface StudioAuditRow {
 	studio_session_id: string | null;
 	run_id: string | null;
 	detail_json: string;
+}
+
+interface StudioTranscriptMessageRow {
+	id: string;
+	studio_session_id: string;
+	run_id: string;
+	role: StudioTranscriptMessage["role"];
+	text: string;
+	status: StudioTranscriptMessageStatus;
+	created_at_ms: number;
+	updated_at_ms: number;
+}
+
+interface StudioTranscriptTimestampRow {
+	latest_created_at_ms: number | null;
 }
 
 export interface StudioStoreOptions {
@@ -290,6 +329,20 @@ export interface CreateStudioApprovalInput {
 	expiresAtMs: number;
 }
 
+export interface CreateStudioUserTranscriptMessageInput {
+	studioSessionId: string;
+	runId: string;
+	text: string;
+}
+
+export interface UpsertStudioAssistantTranscriptMessageInput {
+	studioSessionId: string;
+	runId: string;
+	sourceId: string;
+	text: string;
+	status: Extract<StudioTranscriptMessageStatus, "streaming" | "completed" | "failed">;
+}
+
 export type ResolveStudioApprovalResult =
 	| { kind: "resolved"; approval: StudioApproval }
 	| { kind: "not_found" }
@@ -324,6 +377,31 @@ function toStudioRun(row: StudioRunRow): StudioRun {
 		...(row.ended_at_ms === null ? {} : { endedAtMs: row.ended_at_ms }),
 		...(row.interrupted_reason === null ? {} : { interruptedReason: row.interrupted_reason }),
 	};
+}
+
+function toStudioTranscriptMessage(row: StudioTranscriptMessageRow): StudioTranscriptMessage {
+	return {
+		id: row.id,
+		studioSessionId: row.studio_session_id,
+		runId: row.run_id,
+		role: row.role,
+		text: row.text,
+		status: row.status,
+		createdAtMs: row.created_at_ms,
+		updatedAtMs: row.updated_at_ms,
+	};
+}
+
+function assertTranscriptText(text: string, allowEmpty = false): void {
+	if ((!allowEmpty && !text) || text.length > MAX_STUDIO_TRANSCRIPT_TEXT_LENGTH) {
+		throw new Error("Studio transcript text is invalid or exceeds the maximum length.");
+	}
+}
+
+function assertTranscriptSourceId(sourceId: string): void {
+	if (!/^[A-Za-z0-9_-]{1,128}$/.test(sourceId)) {
+		throw new Error("Studio transcript source ID is invalid.");
+	}
 }
 
 function numberField(value: Record<string, unknown>, field: string): number | undefined {
@@ -728,6 +806,120 @@ export class StudioStore {
 		return row ? toStudioRun(row) : undefined;
 	}
 
+	createStudioUserTranscriptMessage(
+		input: CreateStudioUserTranscriptMessageInput,
+		now = Date.now(),
+	): StudioTranscriptMessage | undefined {
+		assertTranscriptText(input.text);
+		const id = `msg_${crypto.randomUUID().replaceAll("-", "")}`;
+		const createdAtMs = this.#nextTranscriptCreatedAtMs(input.studioSessionId, now);
+		const row = this.#db
+			.query<StudioTranscriptMessageRow, [string, string, string, string, number, number, string, string]>(
+				`INSERT INTO transcript_messages (
+					id, studio_session_id, run_id, source_id, role, text, status, created_at_ms, updated_at_ms
+				 )
+				 SELECT ?, ?, ?, 'user', 'user', ?, 'completed', ?, ?
+				 WHERE EXISTS (
+					SELECT 1 FROM runs WHERE id = ? AND studio_session_id = ?
+				 )
+				 RETURNING id, studio_session_id, run_id, role, text, status, created_at_ms, updated_at_ms`,
+			)
+			.get(
+				id,
+				input.studioSessionId,
+				input.runId,
+				input.text,
+				createdAtMs,
+				createdAtMs,
+				input.runId,
+				input.studioSessionId,
+			);
+		return row ? toStudioTranscriptMessage(row) : undefined;
+	}
+
+	upsertStudioAssistantTranscriptMessage(
+		input: UpsertStudioAssistantTranscriptMessageInput,
+		now = Date.now(),
+	): StudioTranscriptMessage | undefined {
+		assertTranscriptSourceId(input.sourceId);
+		assertTranscriptText(input.text, input.status !== "completed");
+		const id = `msg_${crypto.randomUUID().replaceAll("-", "")}`;
+		const createdAtMs = this.#nextTranscriptCreatedAtMs(input.studioSessionId, now);
+		const row = this.#db
+			.query<
+				StudioTranscriptMessageRow,
+				[string, string, string, string, string, StudioTranscriptMessageStatus, number, number, string, string]
+			>(
+				`INSERT INTO transcript_messages (
+					id, studio_session_id, run_id, source_id, role, text, status, created_at_ms, updated_at_ms
+				 )
+				 SELECT ?, ?, ?, ?, 'assistant', ?, ?, ?, ?
+				 WHERE EXISTS (
+					SELECT 1 FROM runs WHERE id = ? AND studio_session_id = ?
+				 )
+				 ON CONFLICT(run_id, source_id) DO UPDATE SET
+					text = CASE
+						WHEN transcript_messages.status IN ('completed', 'failed', 'interrupted') THEN transcript_messages.text
+						ELSE excluded.text
+					END,
+					status = CASE
+						WHEN transcript_messages.status IN ('completed', 'failed', 'interrupted') THEN transcript_messages.status
+						ELSE excluded.status
+					END,
+					updated_at_ms = MAX(excluded.updated_at_ms, transcript_messages.created_at_ms, transcript_messages.updated_at_ms)
+				 RETURNING id, studio_session_id, run_id, role, text, status, created_at_ms, updated_at_ms`,
+			)
+			.get(
+				id,
+				input.studioSessionId,
+				input.runId,
+				input.sourceId,
+				input.text,
+				input.status,
+				createdAtMs,
+				createdAtMs,
+				input.runId,
+				input.studioSessionId,
+			);
+		return row ? toStudioTranscriptMessage(row) : undefined;
+	}
+
+	listStudioTranscriptMessages(studioSessionId: string): StudioTranscriptMessage[] {
+		const rows = this.#db
+			.query<StudioTranscriptMessageRow, [string]>(
+				`SELECT id, studio_session_id, run_id, role, text, status, created_at_ms, updated_at_ms
+				 FROM transcript_messages
+				 WHERE studio_session_id = ?
+				 ORDER BY ordinal ASC`,
+			)
+			.all(studioSessionId);
+		return rows.map(toStudioTranscriptMessage);
+	}
+
+	#nextTranscriptCreatedAtMs(studioSessionId: string, now: number): number {
+		const row = this.#db
+			.query<StudioTranscriptTimestampRow, [string]>(
+				"SELECT MAX(created_at_ms) AS latest_created_at_ms FROM transcript_messages WHERE studio_session_id = ?",
+			)
+			.get(studioSessionId);
+		return Math.max(now, (row?.latest_created_at_ms ?? now - 1) + 1);
+	}
+
+	finishStudioTranscriptMessages(
+		runId: string,
+		status: Extract<StudioTranscriptMessageStatus, "completed" | "failed" | "interrupted">,
+		now = Date.now(),
+	): StudioTranscriptMessage[] {
+		const rows = this.#db
+			.query<StudioTranscriptMessageRow, [StudioTranscriptMessageStatus, number, string]>(
+				`UPDATE transcript_messages SET status = ?, updated_at_ms = MAX(?, created_at_ms, updated_at_ms)
+				 WHERE run_id = ? AND role = 'assistant' AND status = 'streaming'
+				 RETURNING id, studio_session_id, run_id, role, text, status, created_at_ms, updated_at_ms`,
+			)
+			.all(status, now, runId);
+		return rows.map(toStudioTranscriptMessage);
+	}
+
 	createStudioApproval(input: CreateStudioApprovalInput, now = Date.now()): StudioApproval | undefined {
 		const run = this.getStudioRun(input.runId);
 		if (!run || !ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number])) return undefined;
@@ -865,17 +1057,27 @@ export class StudioStore {
 				)
 				.run("interrupted", now, reason);
 			this.#db
+				.query<void, [StudioTranscriptMessageStatus, number]>(
+					`UPDATE transcript_messages SET status = ?, updated_at_ms = MAX(?, created_at_ms, updated_at_ms)
+					 WHERE role = 'assistant' AND status = 'streaming' AND run_id IN (
+						SELECT id FROM runs WHERE status IN ('starting', 'running', 'cancelling')
+					 )`,
+				)
+				.run("interrupted", now);
+			this.#db
+				.query<void, [StudioSessionStatus, number, number]>(
+					`UPDATE studio_sessions SET status = ?, updated_at_ms = ?, last_activity_at_ms = ?
+					 WHERE id IN (
+						SELECT studio_session_id FROM runs WHERE status IN ('starting', 'running', 'cancelling')
+					 )`,
+				)
+				.run("interrupted", now, now);
+			this.#db
 				.query<void, [StudioRunStatus, number, string]>(
 					`UPDATE runs SET status = ?, ended_at_ms = ?, interrupted_reason = ?
 					 WHERE status IN ('starting', 'running', 'cancelling')`,
 				)
 				.run("interrupted", now, reason);
-			this.#db
-				.query<void, [StudioSessionStatus, number, number]>(
-					`UPDATE studio_sessions SET status = ?, updated_at_ms = ?, last_activity_at_ms = ?
-					 WHERE status IN ('starting', 'ready', 'running')`,
-				)
-				.run("interrupted", now, now);
 			this.#db.exec("DELETE FROM control_leases");
 		});
 	}
