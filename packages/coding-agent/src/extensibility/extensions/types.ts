@@ -242,6 +242,13 @@ export interface ExtensionCustomOptions {
 /** Wrap the current autocomplete provider with additional behavior (pi-compatible). */
 export type AutocompleteProviderFactory = (current: AutocompleteProvider) => AutocompleteProvider;
 
+/** Native tool approval metadata that an RPC host can render without receiving tool arguments. */
+export interface ExtensionToolApprovalRequest {
+	toolCallId: string;
+	toolName: string;
+	reason?: string;
+}
+
 /**
  * UI context for extensions to request interactive UI.
  * Each mode (interactive, RPC, print) provides its own implementation.
@@ -254,6 +261,14 @@ export type AutocompleteProviderFactory = (current: AutocompleteProvider) => Aut
 export interface ExtensionUIContext {
 	/** True when selector timeouts start only after the dialog is presented. */
 	timeoutStartsOnPresentation?: boolean;
+	/**
+	 * Resolve a native tool approval with an RPC host that can preserve the exact
+	 * tool-call identity. Other UIs fall back to the normal selector.
+	 */
+	requestToolApproval?(
+		request: ExtensionToolApprovalRequest,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<boolean>;
 	/** Show a selector and return the selected label, even when an option also includes a description. */
 	select(
 		title: string,

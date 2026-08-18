@@ -13,6 +13,8 @@ import {
 	getPythonGatewayDir,
 	getSessionsDir,
 	getStatsDbPath,
+	getStudioDbPath,
+	getStudioDir,
 	normalizeProfileName,
 	resolveProfileEnv,
 	setAgentDir,
@@ -129,6 +131,8 @@ describe("profile directories", () => {
 		expect(getAgentDbPath()).toBe(path.join(agent, "agent.db"));
 		expect(getSessionsDir()).toBe(path.join(agent, "sessions"));
 		expect(getStatsDbPath()).toBe(path.join(root, "stats.db"));
+		expect(getStudioDir()).toBe(path.join(root, "studio"));
+		expect(getStudioDbPath()).toBe(path.join(root, "studio", "studio.db"));
 	});
 
 	it("treats the default profile as regular mode", () => {

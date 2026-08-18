@@ -90,6 +90,8 @@ export const sshHelp = { description: "Manage SSH host configurations" } satisfi
 
 export const statsHelp = { description: "View usage statistics" } satisfies CommandMetadata;
 
+export const studioHelp = { description: "Run the local single-user OMP Studio" } satisfies CommandMetadata;
+
 export const tinyModelsHelp = {
 	description: "Download tiny local models (session titles + memory)",
 } satisfies CommandMetadata;

@@ -25,6 +25,7 @@
       "@napi-rs/cli": "3.7.2",
       "@oh-my-pi/hashline": "17.3.6",
       "@oh-my-pi/omp-stats": "17.3.6",
+		"@oh-my-pi/omp-studio": "17.3.6",
       "@oh-my-pi/omptype": "17.3.6",
       "@oh-my-pi/pi-agent-core": "17.3.6",
       "@oh-my-pi/pi-ai": "17.3.6",

@@ -1,0 +1,71 @@
+{
+	"type": "module",
+	"name": "@oh-my-pi/omp-studio",
+	"version": "17.3.6",
+	"description": "Local single-user web control plane for Oh My Pi",
+	"homepage": "https://omp.sh",
+	"author": "Can Boluk",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/can1357/oh-my-pi.git",
+		"directory": "packages/studio"
+	},
+	"bugs": {
+		"url": "https://github.com/can1357/oh-my-pi/issues"
+	},
+	"keywords": [
+		"omp",
+		"studio",
+		"local",
+		"react",
+		"agent"
+	],
+	"main": "./src/index.ts",
+	"types": "./src/index.ts",
+	"scripts": {
+		"build": "bun run build.ts",
+		"gen:studio": "bun scripts/generate-client-bundle.ts --generate",
+		"gen:studio:reset": "bun scripts/generate-client-bundle.ts --reset",
+		"check": "biome check . && bun run check:types",
+		"check:types": "tsgo -p tsconfig.json --noEmit",
+		"lint": "biome lint .",
+		"test": "bun test",
+		"fix": "biome check --write --unsafe .",
+		"fmt": "biome format --write ."
+	},
+	"dependencies": {
+		"@oh-my-pi/pi-utils": "catalog:",
+		"react": "catalog:",
+		"react-dom": "catalog:"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"@types/react": "catalog:",
+		"@types/react-dom": "catalog:"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	},
+	"files": [
+		"src",
+		"dist",
+		"scripts",
+		"build.ts",
+		"CHANGELOG.md"
+	],
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"import": "./src/index.ts"
+		},
+		"./protocol": {
+			"types": "./src/protocol/index.ts",
+			"import": "./src/protocol/index.ts"
+		},
+		"./*": {
+			"types": "./src/*.ts",
+			"import": "./src/*.ts"
+		}
+	}
+}

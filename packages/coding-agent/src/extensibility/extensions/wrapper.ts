@@ -322,19 +322,30 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 
 			const uiContext = this.runner.getUIContext();
-			const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
-			const safetyPrompt =
-				pendingSafetyChecks.length > 0
-					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-					: basePrompt;
-			let choice: string | undefined;
+			let approved = false;
 			try {
-				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+				if (uiContext.requestToolApproval) {
+					approved = await uiContext.requestToolApproval(
+						{
+							toolCallId,
+							toolName: this.tool.name,
+							...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
+						},
+						{ signal },
+					);
+				} else {
+					const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
+					const safetyPrompt =
+						pendingSafetyChecks.length > 0
+							? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
+							: basePrompt;
+					const choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"], { signal });
+					approved = choice === "Approve";
+				}
 			} catch (err) {
 				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 				throw err;
 			}
-			const approved = choice === "Approve";
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
 			if (!approved) {
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);

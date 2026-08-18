@@ -84,6 +84,7 @@
         "@babel/parser": "catalog:",
         "@oh-my-pi/hashline": "catalog:",
         "@oh-my-pi/omp-stats": "catalog:",
+        "@oh-my-pi/omp-studio": "catalog:",
         "@oh-my-pi/omptype": "catalog:",
         "@oh-my-pi/pi-agent-core": "catalog:",
         "@oh-my-pi/pi-ai": "catalog:",
@@ -261,6 +262,20 @@
         "postcss": "catalog:",
       },
     },
+    "packages/studio": {
+      "name": "@oh-my-pi/omp-studio",
+      "version": "17.3.6",
+      "dependencies": {
+        "@oh-my-pi/pi-utils": "catalog:",
+        "react": "catalog:",
+        "react-dom": "catalog:",
+      },
+      "devDependencies": {
+        "@types/bun": "catalog:",
+        "@types/react": "catalog:",
+        "@types/react-dom": "catalog:",
+      },
+    },
     "packages/tui": {
       "name": "@oh-my-pi/pi-tui",
       "version": "17.3.6",
@@ -349,6 +364,7 @@
     "@napi-rs/cli": "3.7.2",
     "@oh-my-pi/hashline": "17.3.6",
     "@oh-my-pi/omp-stats": "17.3.6",
+    "@oh-my-pi/omp-studio": "17.3.6",
     "@oh-my-pi/omptype": "17.3.6",
     "@oh-my-pi/pi-agent-core": "17.3.6",
     "@oh-my-pi/pi-ai": "17.3.6",
@@ -728,6 +744,8 @@
     "@oh-my-pi/hashline": ["@oh-my-pi/hashline@workspace:packages/hashline"],
 
     "@oh-my-pi/omp-stats": ["@oh-my-pi/omp-stats@workspace:packages/stats"],
+
+    "@oh-my-pi/omp-studio": ["@oh-my-pi/omp-studio@workspace:packages/studio"],
 
     "@oh-my-pi/omptype": ["@oh-my-pi/omptype@workspace:packages/omptype"],
 

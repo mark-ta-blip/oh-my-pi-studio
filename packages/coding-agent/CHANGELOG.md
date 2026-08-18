@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `omp studio`, the loopback-only local single-user OMP Studio scaffold with a browser client shell and one-time local access handoff.
+- Added OMP-native provider, model, OAuth, and API-key bridge support to `omp studio`.
+- Added the OMP RPC child transport used by Studio to negotiate protocol v2, run model-backed sessions, stream agent events, and cancel active runs.
+- Added `rpc-ui` Studio transport support for redacted tool approvals, optional subagent events, and session usage summaries while keeping raw arguments and tool output server-only.
+
 ## [17.3.6] - 2026-08-17
 
 ### Added

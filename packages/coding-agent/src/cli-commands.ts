@@ -12,6 +12,7 @@ import type { CommandEntry } from "@oh-my-pi/pi-utils/cli";
 import * as commandHelp from "./cli/command-help";
 import { flagConsumesValue } from "./cli/flag-tables";
 import { launchHelp } from "./commands/launch-help";
+import Studio from "./commands/studio";
 
 export const commands: CommandEntry[] = [
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default), help: launchHelp },
@@ -154,6 +155,11 @@ export const commands: CommandEntry[] = [
 		name: "stats",
 		load: () => import("./commands/stats").then(m => m.default),
 		help: commandHelp.statsHelp,
+	},
+	{
+		name: "studio",
+		load: () => Promise.resolve(Studio),
+		help: commandHelp.studioHelp,
 	},
 	{
 		name: "update",

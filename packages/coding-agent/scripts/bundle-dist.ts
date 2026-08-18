@@ -81,10 +81,11 @@ async function cleanBundleOutputs(): Promise<void> {
 async function main(): Promise<void> {
 	const start = Bun.nanoseconds();
 	await cleanBundleOutputs();
-	// The npm bundle ships no stats dashboard sources, so embed the dashboard
-	// archive the same way compiled binaries do (scripts/build-binary.ts). Reset
-	// afterwards to keep the checked-in placeholder empty.
+	// The npm bundle ships no dashboard/client source trees, so embed the stats
+	// and Studio archives the same way compiled binaries do. Reset afterwards to
+	// keep the checked-in placeholders empty.
 	await runCommand(["bun", "--cwd=../stats", "run", "gen:stats"]);
+	await runCommand(["bun", "--cwd=../studio", "run", "gen:studio"]);
 	// One payload for both consumers: inlined into dist/cli.js via `--define` for
 	// the bundled CLI entrypoint, and written to dist/docs-index.generated.txt so
 	// SDK consumers importing `@oh-my-pi/pi-coding-agent/*` (TypeScript source, no
@@ -117,6 +118,7 @@ async function main(): Promise<void> {
 		await ensureShebang();
 		await Bun.write(path.join(outDir, "docs-index.generated.txt"), docsPayload.payload);
 	} finally {
+		await runCommand(["bun", "--cwd=../studio", "run", "gen:studio:reset"]);
 		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats:reset"]);
 	}
 	const stat = await fs.stat(cliPath);

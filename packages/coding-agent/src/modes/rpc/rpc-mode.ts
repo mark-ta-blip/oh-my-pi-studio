@@ -17,6 +17,7 @@ import { $env, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
+	type ExtensionToolApprovalRequest,
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
 	type ExtensionUISelectItem,
@@ -736,6 +737,32 @@ export async function runRpcMode(
 			private pendingRequests: Map<string, PendingExtensionRequest>,
 			private output: (obj: RpcResponse | RpcExtensionUIRequest | object) => void,
 		) {}
+
+		requestToolApproval(
+			request: ExtensionToolApprovalRequest,
+			dialogOptions?: ExtensionUIDialogOptions,
+		): Promise<boolean> {
+			return requestRpcDialog(
+				this.pendingRequests,
+				this.output,
+				dialogOptions,
+				false,
+				{
+					method: "tool_approval",
+					toolCallId: request.toolCallId,
+					toolName: request.toolName,
+					...(request.reason ? { reason: request.reason } : {}),
+					timeout: dialogOptions?.timeout,
+				},
+				response => {
+					if ("cancelled" in response && response.cancelled) {
+						if (response.timedOut) dialogOptions?.onTimeout?.();
+						return false;
+					}
+					return "confirmed" in response && response.confirmed;
+				},
+			);
+		}
 
 		select(
 			title: string,

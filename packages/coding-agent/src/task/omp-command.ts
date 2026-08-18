@@ -24,3 +24,19 @@ export function resolveOmpCommand(): OmpCommand {
 
 	return { cmd: DEFAULT_CMD, args: [], shell: DEFAULT_SHELL };
 }
+
+function quoteWindowsCommandArgument(value: string): string {
+	return `"${value.replaceAll("%", "%%").replaceAll('"', '""')}"`;
+}
+
+/**
+ * Build an executable argv for an OMP child. On Windows, `.cmd` launchers and
+ * `PI_SUBPROCESS_CMD` are dispatched through cmd.exe while generated arguments
+ * remain individually quoted instead of becoming an interpolated shell string.
+ */
+export function resolveOmpCommandInvocation(args: readonly string[]): string[] {
+	const command = resolveOmpCommand();
+	if (!command.shell) return [command.cmd, ...command.args, ...args];
+	const commandText = [command.cmd, ...command.args, ...args.map(quoteWindowsCommandArgument)].join(" ");
+	return [process.env.ComSpec ?? "cmd.exe", "/d", "/s", "/c", commandText];
+}

@@ -370,6 +370,15 @@ export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
 
 /** Emitted when an extension needs user input */
 export type RpcExtensionUIRequest =
+	| {
+			type: "extension_ui_request";
+			id: string;
+			method: "tool_approval";
+			toolCallId: string;
+			toolName: string;
+			reason?: string;
+			timeout?: number;
+	  }
 	| { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout?: number }
 	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
 	| {

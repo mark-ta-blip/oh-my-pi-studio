@@ -61,4 +61,10 @@ describe("resolveCliArgv routes subcommands hidden behind leading global flags",
 			argv: ["gc", "--apply"],
 		});
 	});
+
+	test("`studio` dispatches to the local control-plane command instead of becoming a prompt", () => {
+		expect(resolveCliArgv(["studio", "--no-open"])).toEqual({
+			argv: ["studio", "--no-open"],
+		});
+	});
 });

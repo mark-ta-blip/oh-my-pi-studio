@@ -2,7 +2,7 @@
 
 import * as path from "node:path";
 import { buildEmbeddedArchiveBase64 } from "@oh-my-pi/pi-utils/embedded-archive";
-import { $ } from "bun";
+import { buildStudioClient } from "../src/build-client";
 
 const GENERATED_FILE = path.join("src", "embedded-client.generated.txt");
 const DIST_CLIENT_DIR = path.join("dist", "client");
@@ -10,28 +10,22 @@ const DIST_CLIENT_DIR = path.join("dist", "client");
 const GENERATE_FLAG = "--generate";
 const RESET_FLAG = "--reset";
 
-// `--reset` restores the checked-in state: an empty file. The runtime treats
-// blank (or any non-base64) content as "no archive embedded" and builds the
-// dashboard from source instead; see src/embedded-client.ts.
-
-export { buildEmbeddedArchiveBase64 as buildArchiveBase64 } from "@oh-my-pi/pi-utils/embedded-archive";
-
 async function main(): Promise<void> {
 	if (process.argv.includes(RESET_FLAG)) {
 		await Bun.write(GENERATED_FILE, "");
-		console.log(`Reset ${GENERATED_FILE}`);
+		process.stdout.write(`Reset ${GENERATED_FILE}\n`);
 		return;
 	}
 
 	if (!process.argv.includes(GENERATE_FLAG)) {
-		console.log(`Skipping ${GENERATED_FILE}; pass ${GENERATE_FLAG} to build the embedded bundle`);
+		process.stdout.write(`Skipping ${GENERATED_FILE}; pass ${GENERATE_FLAG} to build the embedded bundle\n`);
 		return;
 	}
 
-	await $`bun run build`;
+	await buildStudioClient();
 	const archiveBase64 = await buildEmbeddedArchiveBase64(DIST_CLIENT_DIR);
 	await Bun.write(GENERATED_FILE, archiveBase64);
-	console.log(`Generated ${GENERATED_FILE}`);
+	process.stdout.write(`Generated ${GENERATED_FILE}\n`);
 }
 
 if (import.meta.main) await main();

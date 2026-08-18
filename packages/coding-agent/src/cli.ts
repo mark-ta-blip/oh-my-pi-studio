@@ -15,6 +15,7 @@ try {
  * lightweight CLI runner from pi-utils.
  */
 import { parentPort } from "node:worker_threads";
+import { smokeTestStudioServer } from "@oh-my-pi/omp-studio";
 import type { CliConfig, CommandMetadata } from "@oh-my-pi/pi-utils/cli";
 import {
 	APP_NAME,
@@ -97,6 +98,7 @@ async function runSmokeTest(): Promise<void> {
 	const { smokeTestLspMux } = await import("./lsp/mux/daemon");
 	const { smokeTestTerminalOutputWorker } = await import("./launch/terminal-output-worker-client");
 	await smokeTestSyncWorker();
+	await smokeTestStudioServer();
 
 	const statsServer = await startServer(0);
 	try {

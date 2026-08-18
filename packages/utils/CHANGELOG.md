@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added profile-aware Studio control-plane path helpers and shared deterministic embedded-client archive utilities.
+
 ## [17.3.5] - 2026-08-16
 
 ### Fixed

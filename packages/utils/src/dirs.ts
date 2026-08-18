@@ -709,6 +709,16 @@ export function getStatsDbPath(): string {
 	return dirs.rootSubdir("stats.db", "data");
 }
 
+/** Get the Studio control-plane directory (~/.omp/studio). */
+export function getStudioDir(): string {
+	return dirs.rootSubdir("studio", "data");
+}
+
+/** Get the Studio control-plane SQLite database path (~/.omp/studio/studio.db). */
+export function getStudioDbPath(): string {
+	return path.join(getStudioDir(), "studio.db");
+}
+
 /** Get the autoresearch state directory (~/.omp/autoresearch). */
 export function getAutoresearchDir(): string {
 	return dirs.rootSubdir("autoresearch", "state");

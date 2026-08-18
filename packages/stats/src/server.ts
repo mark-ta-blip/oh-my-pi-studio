@@ -2,7 +2,8 @@ import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { isEnoent } from "@oh-my-pi/pi-utils";
+import { extractEmbeddedArchive } from "@oh-my-pi/pi-utils/embedded-archive";
+import { isEnoent } from "@oh-my-pi/pi-utils/fs-error";
 import { $ } from "bun";
 import {
 	getBehaviorDashboardStats,
@@ -49,29 +50,6 @@ const USE_EMBEDDED_CLIENT = EMBEDDED_CLIENT_ARCHIVE !== null || IS_PREBUILT;
 const EMBEDDED_CLIENT_DIR_ROOT = path.join(os.tmpdir(), "omp-stats-client");
 let embeddedClientDirPromise: Promise<string> | null = null;
 
-function sanitizeArchivePath(archivePath: string): string | null {
-	const normalized = archivePath.replaceAll("\\", "/").replace(/^\.\//, "");
-	if (!normalized || normalized === ".") return null;
-	if (normalized.includes("..") || path.isAbsolute(normalized)) return null;
-	return normalized;
-}
-
-async function extractEmbeddedClientArchive(archiveBytes: Buffer, outputDir: string): Promise<void> {
-	const archive = new Bun.Archive(archiveBytes);
-	const files = await archive.files();
-	const extractRoot = path.resolve(outputDir);
-
-	for (const [archivePath, file] of files) {
-		const sanitizedPath = sanitizeArchivePath(archivePath);
-		if (!sanitizedPath) continue;
-		const destinationPath = path.resolve(extractRoot, sanitizedPath);
-		if (!destinationPath.startsWith(extractRoot + path.sep)) {
-			throw new Error(`Archive entry escapes extraction directory: ${archivePath}`);
-		}
-		await Bun.write(destinationPath, file);
-	}
-}
-
 async function getEmbeddedClientDir(): Promise<string> {
 	if (!USE_EMBEDDED_CLIENT) return STATIC_DIR;
 	if (embeddedClientDirPromise) return embeddedClientDirPromise;
@@ -93,7 +71,7 @@ async function getEmbeddedClientDir(): Promise<string> {
 
 		await fs.rm(outputDir, { recursive: true, force: true });
 		await fs.mkdir(outputDir, { recursive: true });
-		await extractEmbeddedClientArchive(EMBEDDED_CLIENT_ARCHIVE, outputDir);
+		await extractEmbeddedArchive(EMBEDDED_CLIENT_ARCHIVE, outputDir);
 		return outputDir;
 	})();
 

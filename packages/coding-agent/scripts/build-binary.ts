@@ -76,9 +76,10 @@ async function main(): Promise<void> {
 	const outName = crossBuild ? `omp-${crossBuild.id}` : "omp";
 	const outputPath = path.join(packageDir, "dist", outName);
 	// Generate inside the try so the finally always restores the empty checked-in
-	// placeholders (stats client archive, docs index) even on failure.
+	// placeholders (stats and Studio client archives, docs index) even on failure.
 	try {
 		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats"]);
+		await runCommand(["bun", "--cwd=../studio", "run", "gen:studio"]);
 		// The in-memory legacy Pi virtual module reaches the coding-agent
 		// `export/html` subpath, whose source imports `tool-views.generated.js`.
 		// Rebuild it before compilation so clean checkouts that skipped install
@@ -106,6 +107,7 @@ async function main(): Promise<void> {
 			await runCommand(["bun", "--cwd=../natives", "run", "gen:native:reset"]);
 		}
 	} finally {
+		await runCommand(["bun", "--cwd=../studio", "run", "gen:studio:reset"]);
 		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats:reset"]);
 	}
 }

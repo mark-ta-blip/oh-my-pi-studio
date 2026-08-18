@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Shared deterministic embedded-client archive handling with `@oh-my-pi/pi-utils`.
+
 ## [17.3.6] - 2026-08-17
 
 ### Fixed
