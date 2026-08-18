@@ -216,6 +216,7 @@ function eventsUrl(origin: string): string {
 
 interface StudioEventSubscription {
 	close(): void;
+	received(): StudioEventEnvelope<unknown>[];
 	waitFor<T>(predicate: (event: StudioEventEnvelope<unknown>) => boolean): Promise<StudioEventEnvelope<T>>;
 }
 
@@ -237,6 +238,7 @@ async function subscribeStudioEvents(studio: StudioServer, cookie: string): Prom
 			for (const waiter of waiters.splice(0)) waiter.reject(new Error("Studio event subscription closed"));
 			if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) socket.close(1000);
 		},
+		received: () => [...events],
 		waitFor: <T>(predicate: (event: StudioEventEnvelope<unknown>) => boolean): Promise<StudioEventEnvelope<T>> => {
 			const existing = events.find(predicate);
 			if (existing) return Promise.resolve(existing as StudioEventEnvelope<T>);
@@ -509,6 +511,61 @@ describe("Studio RPC session supervision", () => {
 			expect(transcript.messages[1].createdAtMs).toBeLessThan(transcript.messages[2].createdAtMs);
 			expect(JSON.stringify(transcript)).not.toContain("assistant_one");
 			expect(JSON.stringify(transcript)).not.toContain("assistant_two");
+		} finally {
+			events.close();
+		}
+	});
+
+	it("coalesces a burst of streaming snapshots into the final browser transcript event", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-transcript-burst");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const events = await subscribeStudioEvents(studio, cookie);
+		try {
+			const created = await createSession(studio, cookie, workspace.workspace.id);
+			const promptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+				method: "POST",
+				headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+				body: JSON.stringify({ holderId: HOLDER_A, message: "Stream a detailed response." }),
+			});
+			expect(promptResponse.status).toBe(202);
+			const prompt = (await promptResponse.json()) as StudioPromptResponse;
+			await events.waitFor<StudioTranscriptMessage>(
+				event =>
+					event.type === "transcript.updated" &&
+					event.runId === prompt.run.id &&
+					(event.data as StudioTranscriptMessage).role === "assistant" &&
+					(event.data as StudioTranscriptMessage).text === "",
+			);
+			const eventCountBeforeBurst = events.received().length;
+			const transport = factory.transports[0];
+			for (let index = 1; index <= 20; index += 1) {
+				transport.emitTranscript({
+					sourceId: "assistant_burst",
+					status: "streaming",
+					text: `Partial response ${index}`,
+				});
+			}
+			transport.emitTranscript({
+				sourceId: "assistant_burst",
+				status: "completed",
+				text: "Completed response.",
+			});
+
+			const finalSnapshot = await events.waitFor<StudioTranscriptMessage>(
+				event =>
+					event.type === "transcript.updated" &&
+					event.runId === prompt.run.id &&
+					(event.data as StudioTranscriptMessage).text === "Completed response.",
+			);
+			expect(finalSnapshot.data).toMatchObject({ status: "completed", text: "Completed response." });
+			const transcriptUpdates = events
+				.received()
+				.slice(eventCountBeforeBurst)
+				.filter(event => event.type === "transcript.updated" && event.runId === prompt.run.id);
+			expect(transcriptUpdates).toHaveLength(1);
 		} finally {
 			events.close();
 		}

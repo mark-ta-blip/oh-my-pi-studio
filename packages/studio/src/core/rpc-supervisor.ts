@@ -14,6 +14,7 @@ import type { CreateStudioRunResult, StudioStore } from "./studio-store";
 const APPROVAL_EXPIRY_MS = 5 * 60_000;
 const STUDIO_APPROVAL_REASON = "OMP requires confirmation for this tool.";
 const INITIAL_ASSISTANT_TRANSCRIPT_SOURCE_ID = "assistant_initial";
+const STUDIO_TRANSCRIPT_UPDATE_INTERVAL_MS = 50;
 
 export type StudioRpcSupervisorErrorCode =
 	| "rpc_supervisor_unavailable"
@@ -139,6 +140,12 @@ interface PendingStudioPrompt {
 	transcriptUpdates: StudioRpcTranscriptUpdate[];
 }
 
+interface PendingStudioTranscriptUpdate {
+	runId: string;
+	studioSessionId: string;
+	update: StudioRpcTranscriptUpdate;
+}
+
 interface PendingStudioApproval {
 	argumentsDigest: string;
 	runId: string;
@@ -166,10 +173,12 @@ export class StudioRpcSupervisor {
 	#closed = false;
 	#events: StudioRpcSupervisorEvents;
 	#pendingApprovals = new Map<string, PendingStudioApproval>();
+	#pendingTranscriptUpdates = new Map<string, PendingStudioTranscriptUpdate>();
 	#startingSessions = new Map<string, Promise<StudioSession>>();
 	#store: StudioStore;
 	#subagentsBySession = new Map<string, Map<string, StudioSubagent>>();
 	#transcriptSourceIdsByRun = new Map<string, Map<string, string>>();
+	#transcriptUpdateTimers = new Map<string, Timer>();
 	#transportFactory: StudioRpcTransportFactory | undefined;
 	#usageRefreshInFlight = new Set<string>();
 
@@ -272,7 +281,7 @@ export class StudioRpcSupervisor {
 				active.awaitingPromptAcceptance = undefined;
 			}
 			for (const update of awaitingPromptAcceptance.transcriptUpdates) {
-				this.#persistTranscriptUpdate(studioSessionId, created.run.id, update);
+				this.#queueTranscriptUpdate(studioSessionId, created.run.id, update);
 			}
 			if (awaitingPromptAcceptance.promptFailure) {
 				this.#handlePromptFailure(studioSessionId, active);
@@ -436,6 +445,7 @@ export class StudioRpcSupervisor {
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#flushPendingTranscriptUpdates();
 		for (const [studioSessionId, active] of this.#activeSessions) {
 			const activeRun = this.#store.getStudioSession(studioSessionId)?.activeRun;
 			if (activeRun) this.#interruptRunApprovals(activeRun.id, "studio_shutdown");
@@ -705,6 +715,7 @@ export class StudioRpcSupervisor {
 	}
 
 	#finishTranscriptMessages(runId: string, status: "completed" | "failed" | "interrupted"): void {
+		this.#flushPendingTranscriptUpdatesForRun(runId);
 		for (const message of this.#store.finishStudioTranscriptMessages(runId, status)) {
 			this.#events.onTranscriptUpdated(message.studioSessionId, message);
 		}
@@ -732,6 +743,49 @@ export class StudioRpcSupervisor {
 		const sourceId = sourceIds.size === 0 ? INITIAL_ASSISTANT_TRANSCRIPT_SOURCE_ID : transportSourceId;
 		sourceIds.set(transportSourceId, sourceId);
 		return sourceId;
+	}
+
+	#queueTranscriptUpdate(studioSessionId: string, runId: string, update: StudioRpcTranscriptUpdate): void {
+		const sourceId = this.#persistedTranscriptSourceId(runId, update.sourceId);
+		const key = `${runId}\u0000${sourceId}`;
+		const normalizedUpdate = { ...update, sourceId };
+		if (normalizedUpdate.status !== "streaming") {
+			this.#clearPendingTranscriptUpdate(key);
+			this.#persistTranscriptUpdate(studioSessionId, runId, normalizedUpdate);
+			return;
+		}
+
+		this.#pendingTranscriptUpdates.set(key, { runId, studioSessionId, update: normalizedUpdate });
+		if (this.#transcriptUpdateTimers.has(key)) return;
+		const timer = setTimeout(() => {
+			this.#transcriptUpdateTimers.delete(key);
+			this.#flushPendingTranscriptUpdate(key);
+		}, STUDIO_TRANSCRIPT_UPDATE_INTERVAL_MS);
+		timer.unref();
+		this.#transcriptUpdateTimers.set(key, timer);
+	}
+
+	#clearPendingTranscriptUpdate(key: string): void {
+		const timer = this.#transcriptUpdateTimers.get(key);
+		if (timer) clearTimeout(timer);
+		this.#transcriptUpdateTimers.delete(key);
+		this.#pendingTranscriptUpdates.delete(key);
+	}
+
+	#flushPendingTranscriptUpdate(key: string): void {
+		const pending = this.#pendingTranscriptUpdates.get(key);
+		this.#clearPendingTranscriptUpdate(key);
+		if (pending) this.#persistTranscriptUpdate(pending.studioSessionId, pending.runId, pending.update);
+	}
+
+	#flushPendingTranscriptUpdatesForRun(runId: string): void {
+		for (const [key, pending] of this.#pendingTranscriptUpdates) {
+			if (pending.runId === runId) this.#flushPendingTranscriptUpdate(key);
+		}
+	}
+
+	#flushPendingTranscriptUpdates(): void {
+		for (const key of this.#pendingTranscriptUpdates.keys()) this.#flushPendingTranscriptUpdate(key);
 	}
 
 	#handlePromptFailure(studioSessionId: string, active: ActiveStudioRpcSession): void {
@@ -794,7 +848,7 @@ export class StudioRpcSupervisor {
 		}
 		const run = this.#store.getStudioSession(studioSessionId)?.activeRun;
 		if (!run) return;
-		this.#persistTranscriptUpdate(studioSessionId, run.id, update);
+		this.#queueTranscriptUpdate(studioSessionId, run.id, update);
 	}
 
 	#persistTranscriptUpdate(studioSessionId: string, runId: string, update: StudioRpcTranscriptUpdate): void {
@@ -818,7 +872,7 @@ export class StudioRpcSupervisor {
 		const run = session?.activeRun;
 		if (!session || !run) return;
 
-		this.#events.onAgentEvent(studioSessionId, run.id, event);
+		if (event.type !== "message_update") this.#events.onAgentEvent(studioSessionId, run.id, event);
 		const active = this.#activeSessions.get(studioSessionId);
 		if (event.type === "message_end" && active) void this.#refreshUsage(studioSessionId, active.transport);
 		if (isAgentStart(event) && run.status === "starting") {

@@ -13,6 +13,8 @@ if (!hasLock) {
 	let windowManager: WindowManager | undefined;
 	let trayManager: TrayManager | undefined;
 	let studioServer: StudioServerProcess | undefined;
+	let studioServerStartup: Promise<StudioServerProcess> | undefined;
+	let studioServerStartupAbort: AbortController | undefined;
 	let shutdownStarted = false;
 
 	function installIpc(): void {
@@ -39,14 +41,18 @@ if (!hasLock) {
 	async function shutdown(): Promise<void> {
 		if (shutdownStarted) return;
 		shutdownStarted = true;
+		studioServerStartupAbort?.abort();
 		windowManager?.allowClose();
 		await windowManager?.save();
+		await studioServerStartup?.catch(() => undefined);
 		await studioServer?.stop();
 		trayManager?.destroy();
 		app.exit(0);
 	}
 
 	async function failStartup(error: unknown): Promise<void> {
+		if (shutdownStarted) return;
+		shutdownStarted = true;
 		const message = error instanceof Error ? error.message : String(error);
 		windowManager?.allowClose();
 		await studioServer?.stop();
@@ -65,18 +71,28 @@ if (!hasLock) {
 
 	app.whenReady()
 		.then(async () => {
+			if (shutdownStarted) return;
 			const paths = createDesktopPaths(app.getPath("userData"), process.resourcesPath, packageRoot);
 			windowManager = new WindowManager(paths);
 			installIpc();
-			studioServer = await startStudioServer({
+			studioServerStartupAbort = new AbortController();
+			studioServerStartup = startStudioServer({
 				paths,
 				packaged: app.isPackaged,
 				command: process.env.OMP_STUDIO_OMP_EXECUTABLE,
+				signal: studioServerStartupAbort.signal,
 			});
-			await windowManager.create(studioServer.url);
+			try {
+				const startedServer = await studioServerStartup;
+				studioServer = startedServer;
+				await windowManager.create(startedServer.url);
+			} finally {
+				studioServerStartup = undefined;
+				studioServerStartupAbort = undefined;
+			}
 			trayManager = new TrayManager(windowManager, () => void app.quit());
 		})
 		.catch(error => {
-			void failStartup(error);
+			if (!shutdownStarted) void failStartup(error);
 		});
 }

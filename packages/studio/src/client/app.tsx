@@ -29,9 +29,12 @@ import type {
 	StudioWorkspaceResponse,
 } from "../protocol";
 import { mergeStudioAuthProgress } from "./auth-flow";
-import { isTerminalRunStatus, reconcileStudioSession } from "./session-state";
+import { isActiveRun, isTerminalRunStatus, mergeStudioSessionSnapshot, reconcileStudioSession } from "./session-state";
+import { mergeStudioTranscriptSnapshot, upsertStudioTranscriptMessage } from "./transcript-state";
 
 type ConnectionState = "connecting" | "ready" | "offline";
+
+const STUDIO_MUTATION_TIMEOUT_MS = 30_000;
 
 interface StudioAgentEventItem {
 	emittedAtMs: number;
@@ -333,58 +336,6 @@ function parseTranscriptUpdated(
 	);
 }
 
-function sortTranscript(messages: StudioTranscriptMessage[]): StudioTranscriptMessage[] {
-	return [...messages].sort(
-		(left, right) =>
-			left.createdAtMs - right.createdAtMs ||
-			left.updatedAtMs - right.updatedAtMs ||
-			left.id.localeCompare(right.id),
-	);
-}
-
-function upsertTranscriptMessage(
-	messages: StudioTranscriptMessage[],
-	message: StudioTranscriptMessage,
-): StudioTranscriptMessage[] {
-	const existingIndex = messages.findIndex(current => current.id === message.id);
-	if (existingIndex >= 0) {
-		const existing = messages[existingIndex];
-		if (
-			existing.updatedAtMs > message.updatedAtMs ||
-			(existing.updatedAtMs === message.updatedAtMs &&
-				((existing.status !== "streaming" && message.status === "streaming") ||
-					existing.text.length > message.text.length))
-		) {
-			return sortTranscript(messages);
-		}
-		const next = [...messages];
-		next[existingIndex] = { ...next[existingIndex], ...message };
-		return sortTranscript(next);
-	}
-
-	const optimisticIndex = messages.findIndex(
-		current =>
-			(current.id.startsWith("local_") || message.id.startsWith("local_")) &&
-			current.role === message.role &&
-			current.text === message.text &&
-			Math.abs(current.createdAtMs - message.createdAtMs) < 30_000,
-	);
-	if (optimisticIndex >= 0) {
-		if (message.id.startsWith("local_")) return sortTranscript(messages);
-		const next = [...messages];
-		next[optimisticIndex] = message;
-		return sortTranscript(next);
-	}
-	return sortTranscript([...messages, message]);
-}
-
-function mergeTranscriptSnapshot(
-	messages: StudioTranscriptMessage[],
-	snapshot: StudioTranscriptMessage[],
-): StudioTranscriptMessage[] {
-	return snapshot.reduce(upsertTranscriptMessage, messages);
-}
-
 function sessionTitle(session: StudioSession): string {
 	return session.name ?? `Session ${session.id.slice(4, 12)}`;
 }
@@ -430,10 +381,16 @@ export function App(): ReactNode {
 	const [selectedSessionId, setSelectedSessionId] = useState<string | null>(loadStoredSessionId);
 	const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>({});
 	const [promptPending, setPromptPending] = useState(false);
+	const [cancelPending, setCancelPending] = useState(false);
 	const [transcriptBySession, setTranscriptBySession] = useState<Record<string, StudioTranscriptMessage[]>>({});
 	const [transcriptErrorsBySession, setTranscriptErrorsBySession] = useState<Record<string, string>>({});
 	const [transcriptLoadingBySession, setTranscriptLoadingBySession] = useState<Record<string, boolean>>({});
-	const [setupOpen, setSetupOpen] = useState(() => loadStoredSessionId() === null);
+	const setupAutoOpenedRef = useRef(false);
+	const [setupOpen, setSetupOpen] = useState(() => {
+		const shouldOpen = loadStoredSessionId() === null;
+		setupAutoOpenedRef.current = shouldOpen;
+		return shouldOpen;
+	});
 	const [controlPendingId, setControlPendingId] = useState<string | null>(null);
 	const [leaseExpiresAtMs, setLeaseExpiresAtMs] = useState<Record<string, number>>({});
 	const [agentEventsBySession, setAgentEventsBySession] = useState<Record<string, StudioAgentEventItem[]>>({});
@@ -443,7 +400,7 @@ export function App(): ReactNode {
 	const [resyncRevision, setResyncRevision] = useState(0);
 	const lastEventSequenceRef = useRef(0);
 	const autoOpenedAuthFlowIdsRef = useRef(new Set<string>());
-	const conversationEndRef = useRef<HTMLDivElement>(null);
+	const conversationScrollRef = useRef<HTMLElement>(null);
 	const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
 	const workspacePathRef = useRef<HTMLInputElement>(null);
 	const sessionNameRef = useRef<HTMLInputElement>(null);
@@ -451,6 +408,12 @@ export function App(): ReactNode {
 	const runStateBySessionRef = useRef(new Map<string, StudioRun>());
 	const sessionSnapshotVersionRef = useRef(0);
 	const transcriptRequestIdsRef = useRef(new Map<string, number>());
+	const conversationScrollFrameRef = useRef<number | undefined>(undefined);
+	const shouldAutoScrollConversationRef = useRef(true);
+	const openSetup = useCallback((): void => {
+		setupAutoOpenedRef.current = false;
+		setSetupOpen(true);
+	}, []);
 
 	const loadProviders = useCallback(async (): Promise<void> => {
 		setProviderError(null);
@@ -472,18 +435,21 @@ export function App(): ReactNode {
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioSessionListResponse;
 			const snapshot = body.sessions.map(session => {
-				const reconciled = reconcileStudioSession(
-					session,
-					undefined,
-					runStateBySessionRef.current.get(session.id),
-				);
+				const reconciled = reconcileStudioSession(session, undefined, runStateBySessionRef.current.get(session.id));
 				if (reconciled.run) runStateBySessionRef.current.set(session.id, reconciled.run);
+				else runStateBySessionRef.current.delete(session.id);
 				return reconciled.session;
 			});
 			setSessions(current => {
 				if (sessionSnapshotVersionRef.current === snapshotVersion) return sortSessions(snapshot);
-				const currentIds = new Set(current.map(session => session.id));
-				return sortSessions([...current, ...snapshot.filter(session => !currentIds.has(session.id))]);
+				const snapshotById = new Map(snapshot.map(session => [session.id, session]));
+				const merged = current.map(session => {
+					const next = snapshotById.get(session.id);
+					if (!next) return session;
+					snapshotById.delete(session.id);
+					return mergeStudioSessionSnapshot(session, next);
+				});
+				return sortSessions([...merged, ...snapshotById.values()]);
 			});
 		} catch (reason) {
 			setSessionError(reason instanceof Error ? reason.message : "Studio could not load local sessions.");
@@ -511,7 +477,7 @@ export function App(): ReactNode {
 			if (transcriptRequestIdsRef.current.get(studioSessionId) !== requestId) return;
 			setTranscriptBySession(current => ({
 				...current,
-				[studioSessionId]: mergeTranscriptSnapshot(current[studioSessionId] ?? [], body.messages),
+				[studioSessionId]: mergeStudioTranscriptSnapshot(current[studioSessionId] ?? [], body.messages),
 			}));
 		} catch (reason) {
 			if (transcriptRequestIdsRef.current.get(studioSessionId) === requestId) {
@@ -599,6 +565,12 @@ export function App(): ReactNode {
 	}, [selectedSessionId, sessions]);
 
 	useEffect(() => {
+		if (!setupAutoOpenedRef.current || sessions.length === 0) return;
+		setupAutoOpenedRef.current = false;
+		setSetupOpen(false);
+	}, [sessions.length]);
+
+	useEffect(() => {
 		persistSelectedSessionId(selectedSessionId);
 	}, [selectedSessionId]);
 
@@ -676,6 +648,14 @@ export function App(): ReactNode {
 				reconnectTimer = undefined;
 				connect();
 			}, delayMs);
+		}
+
+		function closeSocket(socket: WebSocket): void {
+			try {
+				if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) socket.close();
+			} catch {
+				// A failed browser socket can transition to CLOSED between the state check and close call.
+			}
 		}
 
 		function connect(): void {
@@ -785,7 +765,7 @@ export function App(): ReactNode {
 					if (parseTranscriptUpdated(message)) {
 						setTranscriptBySession(current => ({
 							...current,
-							[message.studioSessionId]: upsertTranscriptMessage(
+							[message.studioSessionId]: upsertStudioTranscriptMessage(
 								current[message.studioSessionId] ?? [],
 								message.data,
 							),
@@ -816,7 +796,10 @@ export function App(): ReactNode {
 				}
 			});
 			socket.addEventListener("error", () => {
-				if (activeSocket === socket) scheduleReconnect();
+				if (activeSocket !== socket) return;
+				activeSocket = undefined;
+				closeSocket(socket);
+				scheduleReconnect();
 			});
 			socket.addEventListener("close", () => {
 				if (activeSocket !== socket) return;
@@ -829,7 +812,9 @@ export function App(): ReactNode {
 		return () => {
 			disposed = true;
 			if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
-			activeSocket?.close();
+			const socket = activeSocket;
+			activeSocket = undefined;
+			if (socket) closeSocket(socket);
 		};
 	}, [loadProviders]);
 
@@ -871,20 +856,24 @@ export function App(): ReactNode {
 	const promptText = selectedSessionId ? (promptDrafts[selectedSessionId] ?? "") : "";
 	const transcriptError = selectedSessionId ? (transcriptErrorsBySession[selectedSessionId] ?? null) : null;
 	const transcriptLoading = selectedSessionId ? transcriptLoadingBySession[selectedSessionId] === true : false;
-	const displayedTranscript = selectedTranscript.filter(
-		message => message.role === "user" || message.text.length > 0 || message.status !== "streaming",
-	);
-	const hasStreamingAssistant = selectedTranscript.some(
-		message => message.role === "assistant" && message.status === "streaming",
-	);
+	const { displayedTranscript, hasStreamingAssistant } = useMemo(() => {
+		let hasStreamingAssistant = false;
+		const displayedTranscript = selectedTranscript.filter(message => {
+			if (message.role === "assistant" && message.status === "streaming") hasStreamingAssistant = true;
+			return message.role === "user" || message.text.length > 0 || message.status !== "streaming";
+		});
+		return { displayedTranscript, hasStreamingAssistant };
+	}, [selectedTranscript]);
 	const selectedApprovals = selectedSessionId ? (approvalsBySession[selectedSessionId] ?? []) : [];
 	const selectedSubagents = selectedSessionId ? (subagentsBySession[selectedSessionId] ?? []) : [];
+	const selectedActiveRun = isActiveRun(selectedSession?.activeRun) ? selectedSession.activeRun : undefined;
 	const selectedWorkspace = useMemo(
 		() => workspaces.find(workspace => workspace.id === selectedSession?.workspaceId) ?? null,
 		[selectedSession?.workspaceId, workspaces],
 	);
 	const pendingApprovalCount = selectedApprovals.filter(approval => approval.status === "pending").length;
-	const composerBlocked = promptPending || controlPendingId !== null || selectedSession?.activeRun !== undefined;
+	const composerBlocked =
+		promptPending || cancelPending || controlPendingId !== null || selectedActiveRun !== undefined;
 
 	const registerWorkspacePath = async (path: string): Promise<void> => {
 		if (!path || workspacePending) return;
@@ -1057,6 +1046,7 @@ export function App(): ReactNode {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ holderId, ttlMs: 45_000 }),
+				signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
 			});
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioControlLeaseResponse;
@@ -1078,12 +1068,12 @@ export function App(): ReactNode {
 		if (sessionPending) return;
 		if (!sessionWorkspaceId) {
 			setSessionError("Choose a project before starting a session.");
-			setSetupOpen(true);
+			openSetup();
 			return;
 		}
 		if (!sessionProviderId || !sessionModelId) {
 			setSessionError("Connect a provider and choose a model before starting a session.");
-			setSetupOpen(true);
+			openSetup();
 			return;
 		}
 		setSessionError(null);
@@ -1132,6 +1122,7 @@ export function App(): ReactNode {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ holderId, message }),
+				signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
 			});
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioPromptResponse;
@@ -1147,7 +1138,7 @@ export function App(): ReactNode {
 			);
 			setTranscriptBySession(current => ({
 				...current,
-				[studioSessionId]: upsertTranscriptMessage(current[studioSessionId] ?? [], {
+				[studioSessionId]: upsertStudioTranscriptMessage(current[studioSessionId] ?? [], {
 					id: optimisticMessageId,
 					studioSessionId,
 					runId: body.run.id,
@@ -1170,6 +1161,8 @@ export function App(): ReactNode {
 					transcriptMessage => transcriptMessage.id !== optimisticMessageId,
 				),
 			}));
+			void loadSessions();
+			void loadTranscript(studioSessionId);
 			setSessionError(reason instanceof Error ? reason.message : "Studio could not send the prompt to OMP.");
 		} finally {
 			setPromptPending(false);
@@ -1177,17 +1170,18 @@ export function App(): ReactNode {
 	};
 
 	const cancelActiveRun = async (): Promise<void> => {
-		const run = selectedSession?.activeRun;
-		if (!selectedSession || !run || promptPending) return;
+		const run = selectedActiveRun;
+		if (!selectedSession || !run || cancelPending) return;
 		const studioSessionId = selectedSession.id;
 		if (!(await acquireControl(studioSessionId, false))) return;
 		setSessionError(null);
-		setPromptPending(true);
+		setCancelPending(true);
 		try {
 			const response = await fetch(`/api/v1/runs/${encodeURIComponent(run.id)}/cancel`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ holderId }),
+				signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
 			});
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioRunResponse;
@@ -1204,9 +1198,10 @@ export function App(): ReactNode {
 				),
 			);
 		} catch (reason) {
+			void loadSessions();
 			setSessionError(reason instanceof Error ? reason.message : "Studio could not cancel the active OMP run.");
 		} finally {
-			setPromptPending(false);
+			setCancelPending(false);
 		}
 	};
 
@@ -1236,12 +1231,27 @@ export function App(): ReactNode {
 	};
 
 	useEffect(() => {
-		if (!selectedSessionId) return;
-		conversationEndRef.current?.scrollIntoView({
-			behavior: hasStreamingAssistant ? "auto" : "smooth",
-			block: "end",
+		shouldAutoScrollConversationRef.current = true;
+	}, [selectedSessionId]);
+
+	useEffect(() => {
+		if (!selectedSessionId || !shouldAutoScrollConversationRef.current) return;
+		if (conversationScrollFrameRef.current !== undefined) return;
+		conversationScrollFrameRef.current = window.requestAnimationFrame(() => {
+			conversationScrollFrameRef.current = undefined;
+			const conversation = conversationScrollRef.current;
+			if (!conversation || !shouldAutoScrollConversationRef.current) return;
+			conversation.scrollTop = conversation.scrollHeight;
 		});
-	}, [hasStreamingAssistant, selectedSessionId, selectedTranscript]);
+	}, [selectedSessionId, selectedTranscript]);
+
+	useEffect(() => {
+		return () => {
+			if (conversationScrollFrameRef.current === undefined) return;
+			window.cancelAnimationFrame(conversationScrollFrameRef.current);
+			conversationScrollFrameRef.current = undefined;
+		};
+	}, []);
 
 	useEffect(() => {
 		const onKeyDown = (event: KeyboardEvent): void => {
@@ -1249,25 +1259,25 @@ export function App(): ReactNode {
 			const key = event.key.toLowerCase();
 			if (key === "n") {
 				event.preventDefault();
-				setSetupOpen(true);
+				openSetup();
 				window.requestAnimationFrame(() => sessionNameRef.current?.focus());
 				return;
 			}
 			if (key === "o") {
 				event.preventDefault();
-				setSetupOpen(true);
+				openSetup();
 				if (window.ompStudio) void selectWorkspace();
 				else window.requestAnimationFrame(() => workspacePathRef.current?.focus());
 				return;
 			}
 			if (key === ",") {
 				event.preventDefault();
-				setSetupOpen(true);
+				openSetup();
 			}
 		};
 		window.addEventListener("keydown", onKeyDown);
 		return () => window.removeEventListener("keydown", onKeyDown);
-	}, [selectWorkspace]);
+	}, [openSetup, selectWorkspace]);
 
 	return (
 		<div className="studio-shell studio-desktop-shell">
@@ -1285,7 +1295,7 @@ export function App(): ReactNode {
 						<span className="studio-connection-dot" />
 						{connection === "ready" ? "connected" : connection === "offline" ? "reconnecting" : "connecting"}
 					</div>
-					<button className="studio-titlebar-button" onClick={() => setSetupOpen(true)} type="button">
+					<button className="studio-titlebar-button" onClick={openSetup} type="button">
 						Setup
 					</button>
 				</div>
@@ -1294,10 +1304,10 @@ export function App(): ReactNode {
 			<div className="studio-workspace-layout">
 				<aside className="studio-sidebar" aria-label="Projects and sessions">
 					<div className="studio-sidebar-actions">
-						<button className="studio-new-session" onClick={() => setSetupOpen(true)} type="button">
+						<button className="studio-new-session" onClick={openSetup} type="button">
 							+ New session
 						</button>
-						<button className="studio-sidebar-button" onClick={() => setSetupOpen(true)} type="button">
+						<button className="studio-sidebar-button" onClick={openSetup} type="button">
 							Settings
 						</button>
 					</div>
@@ -1308,7 +1318,7 @@ export function App(): ReactNode {
 							<button
 								aria-label="Add project"
 								onClick={() => {
-									setSetupOpen(true);
+									openSetup();
 									window.requestAnimationFrame(() => workspacePathRef.current?.focus());
 								}}
 								type="button"
@@ -1330,7 +1340,7 @@ export function App(): ReactNode {
 										key={workspace.id}
 										onClick={() => {
 											setSessionWorkspaceId(workspace.id);
-											setSetupOpen(true);
+											openSetup();
 										}}
 										type="button"
 									>
@@ -1419,15 +1429,24 @@ export function App(): ReactNode {
 								</div>
 								<div className="studio-conversation-header-actions">
 									<span className={`studio-session-status studio-session-status-${selectedSession.status}`}>
-										{selectedSession.activeRun ? "running" : selectedSession.status}
+										{selectedActiveRun ? "running" : selectedSession.status}
 									</span>
-									<button onClick={() => setSetupOpen(true)} type="button">
+									<button onClick={openSetup} type="button">
 										Configure
 									</button>
 								</div>
 							</header>
 
-							<section className="studio-conversation-scroll" aria-live="polite">
+							<section
+								aria-live="polite"
+								className="studio-conversation-scroll"
+								onScroll={event => {
+									const conversation = event.currentTarget;
+									shouldAutoScrollConversationRef.current =
+										conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight < 40;
+								}}
+								ref={conversationScrollRef}
+							>
 								{transcriptLoading && displayedTranscript.length === 0 && (
 									<p className="studio-conversation-notice">Loading conversation...</p>
 								)}
@@ -1455,13 +1474,12 @@ export function App(): ReactNode {
 										<p>{transcriptDisplayText(message)}</p>
 									</article>
 								))}
-								{selectedSession.activeRun && hasStreamingAssistant && (
+								{selectedActiveRun && hasStreamingAssistant && (
 									<div className="studio-run-indicator">
 										<span />
 										OMP is working
 									</div>
 								)}
-								<div ref={conversationEndRef} />
 							</section>
 
 							<form className="studio-composer" onSubmit={submitPrompt}>
@@ -1481,7 +1499,7 @@ export function App(): ReactNode {
 											}
 										}}
 										placeholder={
-											selectedSession.activeRun
+											selectedActiveRun
 												? "OMP is working on the current task"
 												: "Message OMP about the next task"
 										}
@@ -1490,16 +1508,16 @@ export function App(): ReactNode {
 									/>
 								</label>
 								<div className="studio-composer-footer">
-									<span>{selectedSession.activeRun ? "Run in progress" : "Ctrl+Enter to send"}</span>
+									<span>{selectedActiveRun ? "Run in progress" : "Ctrl+Enter to send"}</span>
 									<div>
-										{selectedSession.activeRun && (
+										{selectedActiveRun && (
 											<button
 												className="studio-cancel-button"
-												disabled={promptPending || controlPendingId !== null}
+												disabled={cancelPending || controlPendingId !== null}
 												onClick={() => void cancelActiveRun()}
 												type="button"
 											>
-												Stop
+												{cancelPending ? "Stopping" : "Stop"}
 											</button>
 										)}
 										<button disabled={composerBlocked || !promptText.trim()} type="submit">
@@ -1516,7 +1534,7 @@ export function App(): ReactNode {
 							<span className="studio-empty-conversation-mark">OMP</span>
 							<h1>Open a focused session</h1>
 							<p>Choose a local project and provider once, then work in a persistent conversation.</p>
-							<button onClick={() => setSetupOpen(true)} type="button">
+							<button onClick={openSetup} type="button">
 								New session
 							</button>
 							{sessionError && <p className="studio-inline-error">{sessionError}</p>}
@@ -1527,7 +1545,7 @@ export function App(): ReactNode {
 				<aside className="studio-inspector" aria-label="Session inspector">
 					<div className="studio-inspector-topline">
 						<span>Inspector</span>
-						<button onClick={() => setSetupOpen(true)} type="button">
+						<button onClick={openSetup} type="button">
 							Setup
 						</button>
 					</div>
@@ -1538,7 +1556,7 @@ export function App(): ReactNode {
 								<div className="studio-inspector-heading">
 									<h2>Session</h2>
 									<span className={`studio-session-status studio-session-status-${selectedSession.status}`}>
-										{selectedSession.activeRun ? "active" : selectedSession.status}
+										{selectedActiveRun ? "active" : selectedSession.status}
 									</span>
 								</div>
 								<dl className="studio-inspector-facts">

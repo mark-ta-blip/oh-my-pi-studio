@@ -10,3 +10,8 @@
 - Added the Phase 4 supervised OMP RPC session lifecycle, durable run state, tab-scoped session control, prompt/cancel endpoints, and live event-stream UI.
 - Added Phase 5 tool approval cards, browser-safe subagent and usage summaries, and lease-gated approval decisions.
 - Added Phase 6 reconnect cursors with bounded replay/resync recovery, stale-lease clearing on restart, and a paginated local audit review ledger.
+
+### Fixed
+
+- Fixed Studio chat stalls caused by unbounded transcript updates, stale WebSocket reconnects, and forced scrolling during streaming.
+- Fixed stale run locks and setup overlays that could leave the chat composer unusable after a desktop restart, and added bounded mutation requests with automatic state recovery.
