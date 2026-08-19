@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { StudioSession } from "../../protocol";
 import { sessionTitle } from "../presentation";
 
@@ -12,7 +13,7 @@ interface StudioTitlebarProps {
 	selectedSession?: StudioSession;
 }
 
-export function StudioTitlebar({
+export const StudioTitlebar = memo(function StudioTitlebar({
 	connection,
 	onOpenContext,
 	onOpenNavigation,
@@ -47,4 +48,4 @@ export function StudioTitlebar({
 			</div>
 		</header>
 	);
-}
+});

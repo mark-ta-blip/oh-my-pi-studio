@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type {
 	StudioActivityEntry,
 	StudioApproval,
@@ -48,7 +49,7 @@ function toolLabel(kind: StudioToolDisplay["kind"]): string {
 	}
 }
 
-export function StudioExecutionStrip({
+export const StudioExecutionStrip = memo(function StudioExecutionStrip({
 	activeRun,
 	activityEntries,
 	approvals,
@@ -139,4 +140,4 @@ export function StudioExecutionStrip({
 			)}
 		</section>
 	);
-}
+});

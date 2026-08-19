@@ -1,4 +1,4 @@
-import type { FormEvent } from "react";
+import { type FormEvent, memo } from "react";
 import type {
 	StudioActivityEntry,
 	StudioApproval,
@@ -10,9 +10,10 @@ import type {
 	StudioWorkspace,
 } from "../../protocol";
 import type { StudioContextPanel } from "../context-panel";
-import { formatShortTime, sessionTitle, transcriptDisplayText } from "../presentation";
+import { sessionTitle } from "../presentation";
 import { StudioComposer } from "./composer";
 import { StudioExecutionStrip } from "./execution-strip";
+import { StudioTranscriptMessageView } from "./transcript-message";
 
 interface StudioConversationPaneProps {
 	activityEntries: StudioActivityEntry[];
@@ -22,9 +23,12 @@ interface StudioConversationPaneProps {
 	composerBlocked: boolean;
 	controlPending: boolean;
 	draft: string;
+	earlierPending: boolean;
+	hasEarlierTranscript: boolean;
 	hasStreamingAssistant: boolean;
 	plan?: StudioPlanSummary;
 	onCancel(): void;
+	onLoadEarlier(): void;
 	onReconnect(): void;
 	onDraftChange(value: string): void;
 	onOpenContext(panel: StudioContextPanel): void;
@@ -45,7 +49,7 @@ interface StudioConversationPaneProps {
 	promptPending: boolean;
 }
 
-export function StudioConversationPane({
+export const StudioConversationPane = memo(function StudioConversationPane({
 	activityEntries,
 	approvals,
 	cancelPending,
@@ -53,9 +57,12 @@ export function StudioConversationPane({
 	composerBlocked,
 	controlPending,
 	draft,
+	earlierPending,
+	hasEarlierTranscript,
 	hasStreamingAssistant,
 	plan,
 	onCancel,
+	onLoadEarlier,
 	onReconnect,
 	onDraftChange,
 	onOpenContext,
@@ -142,9 +149,17 @@ export function StudioConversationPane({
 				}}
 				ref={scrollRef}
 			>
+				{hasEarlierTranscript && (
+					<div className="studio-transcript-earlier">
+						<button disabled={earlierPending} onClick={onLoadEarlier} type="button">
+							{earlierPending ? "Loading earlier messages" : "Load earlier messages"}
+						</button>
+					</div>
+				)}
 				{connectionPending && (
 					<p className="studio-conversation-notice" role="status">
-						Starting the OMP session. Your first instruction will be available as soon as the connection is ready.
+						Starting the OMP session. Type your instruction now and OMP will run it as soon as the session is
+						ready.
 					</p>
 				)}
 				{selectedSession.status === "failed" && !connectionPending && (
@@ -168,18 +183,7 @@ export function StudioConversationPane({
 					</div>
 				)}
 				{transcript.map(message => (
-					<article className={`studio-message studio-message-${message.role}`} key={message.id}>
-						<div className="studio-message-meta">
-							<span>{message.role === "user" ? "You" : "OMP"}</span>
-							<time dateTime={new Date(message.createdAtMs).toISOString()}>
-								{formatShortTime(message.createdAtMs)}
-							</time>
-							{message.status === "streaming" && <span className="studio-message-streaming">Streaming</span>}
-							{message.status === "failed" && <span className="studio-message-failed">Stopped</span>}
-							{message.status === "interrupted" && <span className="studio-message-failed">Interrupted</span>}
-						</div>
-						<p>{transcriptDisplayText(message)}</p>
-					</article>
+					<StudioTranscriptMessageView key={message.id} message={message} />
 				))}
 				{selectedActiveRun && hasStreamingAssistant && (
 					<div className="studio-run-indicator">
@@ -206,4 +210,4 @@ export function StudioConversationPane({
 			{sessionError && <p className="studio-inline-error">{sessionError}</p>}
 		</main>
 	);
-}
+});

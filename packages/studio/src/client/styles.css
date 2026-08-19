@@ -532,6 +532,26 @@ textarea {
 	margin-left: auto;
 }
 
+.studio-transcript-earlier {
+	display: flex;
+	justify-content: center;
+	margin-bottom: 20px;
+}
+
+.studio-desktop-shell .studio-transcript-earlier button {
+	padding: 0 0.75rem;
+	border-color: #d8dedb;
+	background: #fff;
+	color: var(--studio-muted);
+	font-size: 0.72rem;
+	font-weight: 600;
+}
+
+.studio-desktop-shell .studio-transcript-earlier button:hover:not(:disabled) {
+	border-color: #c2dad3;
+	color: var(--studio-ink);
+}
+
 .studio-message {
 	max-width: min(720px, 91%) !important;
 	margin-bottom: 22px !important;

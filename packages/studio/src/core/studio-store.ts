@@ -31,6 +31,9 @@ import type {
 const STUDIO_SCHEMA_VERSION = 8;
 const ACTIVE_RUN_STATUSES = ["starting", "running", "cancelling"] as const;
 const MAX_STUDIO_TRANSCRIPT_TEXT_LENGTH = 100_000;
+const DEFAULT_STUDIO_TRANSCRIPT_PAGE_SIZE = 200;
+/** Upper bound for a single transcript page so one session select never reloads an unbounded history. */
+export const MAX_STUDIO_TRANSCRIPT_PAGE_SIZE = 500;
 const MAX_STUDIO_ACTIVITY_ENTRIES_PER_SESSION = 500;
 const MAX_STUDIO_TOOL_DISPLAYS_PER_SESSION = 200;
 const MAX_STUDIO_USAGE_HISTORY_ENTRIES_PER_SESSION = 120;
@@ -371,6 +374,10 @@ interface StudioTranscriptMessageRow {
 	updated_at_ms: number;
 }
 
+interface StudioTranscriptMessagePageRow extends StudioTranscriptMessageRow {
+	ordinal: number;
+}
+
 interface StudioTranscriptTimestampRow {
 	latest_created_at_ms: number | null;
 }
@@ -478,6 +485,16 @@ export interface ListStudioAuditEntriesInput {
 export interface ListStudioAuditEntriesResult {
 	entries: StudioAuditEntry[];
 	nextBeforeId?: number;
+}
+
+export interface ListStudioTranscriptMessagesInput {
+	beforeOrdinal?: number;
+	limit?: number;
+}
+
+export interface ListStudioTranscriptMessagesResult {
+	messages: StudioTranscriptMessage[];
+	nextBeforeOrdinal?: number;
 }
 
 export interface CreateStudioApprovalInput {
@@ -894,7 +911,12 @@ export class StudioStore {
 		try {
 			db.exec("PRAGMA busy_timeout = 5000");
 			db.exec("PRAGMA foreign_keys = ON");
-			if (dbPath !== ":memory:") db.exec("PRAGMA journal_mode = WAL");
+			if (dbPath !== ":memory:") {
+				db.exec("PRAGMA journal_mode = WAL");
+				// WAL already survives process crashes at NORMAL; FULL would fsync on every transcript
+				// update, and streaming writes one per 50ms tick on the request event loop.
+				db.exec("PRAGMA synchronous = NORMAL");
+			}
 			runMigrations(db);
 			const store = new StudioStore(db, dbPath);
 			store.#pruneAuditEntries();
@@ -1293,16 +1315,33 @@ export class StudioStore {
 		return row ? toStudioTranscriptMessage(row) : undefined;
 	}
 
-	listStudioTranscriptMessages(studioSessionId: string): StudioTranscriptMessage[] {
+	/**
+	 * Returns one page of transcript messages in ascending order, newest page first.
+	 * Paging keeps a session select from reloading an entire history; pass the returned
+	 * `nextBeforeOrdinal` back as `beforeOrdinal` to walk further into the past.
+	 */
+	listStudioTranscriptMessages(
+		studioSessionId: string,
+		input: ListStudioTranscriptMessagesInput = {},
+	): ListStudioTranscriptMessagesResult {
+		const limit = Math.min(
+			Math.max(input.limit ?? DEFAULT_STUDIO_TRANSCRIPT_PAGE_SIZE, 1),
+			MAX_STUDIO_TRANSCRIPT_PAGE_SIZE,
+		);
 		const rows = this.#db
-			.query<StudioTranscriptMessageRow, [string]>(
-				`SELECT id, studio_session_id, run_id, role, text, status, created_at_ms, updated_at_ms
+			.query<StudioTranscriptMessagePageRow, [string, number | null, number]>(
+				`SELECT ordinal, id, studio_session_id, run_id, role, text, status, created_at_ms, updated_at_ms
 				 FROM transcript_messages
-				 WHERE studio_session_id = ?
-				 ORDER BY ordinal ASC`,
+				 WHERE studio_session_id = ?1 AND (?2 IS NULL OR ordinal < ?2)
+				 ORDER BY ordinal DESC LIMIT ?3`,
 			)
-			.all(studioSessionId);
-		return rows.map(toStudioTranscriptMessage);
+			.all(studioSessionId, input.beforeOrdinal ?? null, limit + 1);
+		const hasMore = rows.length > limit;
+		const page = hasMore ? rows.slice(0, limit) : rows;
+		const oldest = page.at(-1);
+		page.reverse();
+		const messages = page.map(toStudioTranscriptMessage);
+		return { messages, ...(hasMore && oldest ? { nextBeforeOrdinal: oldest.ordinal } : {}) };
 	}
 
 	appendStudioActivityEntry(input: AppendStudioActivityEntryInput, now = Date.now()): StudioActivityEntry | undefined {

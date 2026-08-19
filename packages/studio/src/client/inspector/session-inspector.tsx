@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type {
 	StudioActivityEntry,
 	StudioApproval,
@@ -87,7 +88,7 @@ interface StudioSessionInspectorProps {
 	usageHistory: StudioUsageHistoryEntry[];
 }
 
-export function StudioSessionInspector({
+export const StudioSessionInspector = memo(function StudioSessionInspector({
 	activePanel,
 	activityEnabled,
 	activityEntries,
@@ -449,4 +450,4 @@ export function StudioSessionInspector({
 			)}
 		</aside>
 	);
-}
+});

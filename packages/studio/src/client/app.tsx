@@ -55,6 +55,19 @@ import { mergeStudioTranscriptSnapshot, upsertStudioTranscriptMessage } from "./
 type ConnectionState = StudioConnectionState;
 
 const STUDIO_MUTATION_TIMEOUT_MS = 30_000;
+/** Reuse an unexpired control lease instead of renewing it, leaving room for the prompt round trip. */
+const STUDIO_CONTROL_LEASE_REUSE_MARGIN_MS = 5_000;
+/**
+ * Shared empty collections for unselected or not-yet-loaded sessions. Inline `?? []` fallbacks would
+ * allocate a fresh array on every render and defeat the memoized panes during streaming.
+ */
+const EMPTY_ACTIVITY: StudioActivityEntry[] = [];
+const EMPTY_APPROVALS: StudioApproval[] = [];
+const EMPTY_RUN_HISTORY: StudioRun[] = [];
+const EMPTY_SUBAGENTS: StudioSubagent[] = [];
+const EMPTY_TOOL_DISPLAYS: StudioToolDisplay[] = [];
+const EMPTY_TRANSCRIPT: StudioTranscriptMessage[] = [];
+const EMPTY_USAGE_HISTORY: StudioUsageHistoryEntry[] = [];
 
 function parseStudioReady(message: unknown): message is StudioEventEnvelope<StudioBootstrap> {
 	if (!message || typeof message !== "object") return false;
@@ -193,14 +206,28 @@ function parseResyncRequired(message: unknown): message is StudioEventEnvelope<S
 	);
 }
 
-async function responseError(response: Response): Promise<string> {
+interface StudioResponseFailure {
+	code?: string;
+	message: string;
+}
+
+async function readResponseFailure(response: Response): Promise<StudioResponseFailure> {
 	try {
 		const body: unknown = await response.json();
-		if (isRecord(body) && isRecord(body.error) && typeof body.error.message === "string") return body.error.message;
+		if (isRecord(body) && isRecord(body.error) && typeof body.error.message === "string") {
+			return {
+				...(typeof body.error.code === "string" ? { code: body.error.code } : {}),
+				message: body.error.message,
+			};
+		}
 	} catch {
 		// Use the stable HTTP fallback when a local response does not contain an API error body.
 	}
-	return `Studio request failed with HTTP ${response.status}.`;
+	return { message: `Studio request failed with HTTP ${response.status}.` };
+}
+
+async function responseError(response: Response): Promise<string> {
+	return (await readResponseFailure(response)).message;
 }
 
 function sortWorkspaces(workspaces: StudioWorkspace[]): StudioWorkspace[] {
@@ -475,6 +502,9 @@ export function App(): ReactNode {
 	const [transcriptBySession, setTranscriptBySession] = useState<Record<string, StudioTranscriptMessage[]>>({});
 	const [transcriptErrorsBySession, setTranscriptErrorsBySession] = useState<Record<string, string>>({});
 	const [transcriptLoadingBySession, setTranscriptLoadingBySession] = useState<Record<string, boolean>>({});
+	/** Ordinal cursor for the oldest loaded message per session; absent once the head of history is loaded. */
+	const [transcriptCursorBySession, setTranscriptCursorBySession] = useState<Record<string, number | undefined>>({});
+	const [earlierTranscriptPendingId, setEarlierTranscriptPendingId] = useState<string | null>(null);
 	const [activityBySession, setActivityBySession] = useState<Record<string, StudioActivityEntry[]>>({});
 	const [activityErrorsBySession, setActivityErrorsBySession] = useState<Record<string, string>>({});
 	const [activityLoadingBySession, setActivityLoadingBySession] = useState<Record<string, boolean>>({});
@@ -516,6 +546,8 @@ export function App(): ReactNode {
 	const sessionSnapshotVersionRef = useRef(0);
 	const sessionListRequestIdRef = useRef(0);
 	const transcriptRequestIdsRef = useRef(new Map<string, number>());
+	const earlierTranscriptPendingIdsRef = useRef(new Set<string>());
+	const controlPendingIdRef = useRef<string | null>(null);
 	const activityRequestIdsRef = useRef(new Map<string, number>());
 	const toolDisplayRequestIdsRef = useRef(new Map<string, number>());
 	const planRequestIdsRef = useRef(new Map<string, number>());
@@ -664,6 +696,7 @@ export function App(): ReactNode {
 			if (transcriptRequestIdsRef.current.get(studioSessionId) !== requestId) return;
 			if (response.status === 404) {
 				setTranscriptBySession(current => ({ ...current, [studioSessionId]: current[studioSessionId] ?? [] }));
+				setTranscriptCursorBySession(current => ({ ...current, [studioSessionId]: undefined }));
 				return;
 			}
 			if (!response.ok) throw new Error(await responseError(response));
@@ -673,6 +706,7 @@ export function App(): ReactNode {
 				...current,
 				[studioSessionId]: mergeStudioTranscriptSnapshot(current[studioSessionId] ?? [], body.messages),
 			}));
+			setTranscriptCursorBySession(current => ({ ...current, [studioSessionId]: body.nextBeforeOrdinal }));
 		} catch (reason) {
 			if (transcriptRequestIdsRef.current.get(studioSessionId) === requestId) {
 				setTranscriptErrorsBySession(current => ({
@@ -684,6 +718,49 @@ export function App(): ReactNode {
 			if (transcriptRequestIdsRef.current.get(studioSessionId) === requestId) {
 				setTranscriptLoadingBySession(current => ({ ...current, [studioSessionId]: false }));
 			}
+		}
+	}, []);
+
+	/**
+	 * Prepends the page immediately older than the loaded head of a conversation. The transcript
+	 * generation is read without being bumped so a concurrent full reload always wins, and the
+	 * paging state is tracked separately from `transcriptLoading` to keep the composer usable.
+	 */
+	const loadEarlierTranscript = useCallback(async (studioSessionId: string, beforeOrdinal: number): Promise<void> => {
+		if (earlierTranscriptPendingIdsRef.current.has(studioSessionId)) return;
+		earlierTranscriptPendingIdsRef.current.add(studioSessionId);
+		const requestId = transcriptRequestIdsRef.current.get(studioSessionId) ?? 0;
+		setEarlierTranscriptPendingId(studioSessionId);
+		setTranscriptErrorsBySession(current => {
+			const next = { ...current };
+			delete next[studioSessionId];
+			return next;
+		});
+		try {
+			const query = new URLSearchParams({ before: String(beforeOrdinal) });
+			const response = await fetch(
+				`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/transcript?${query.toString()}`,
+			);
+			if (transcriptRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			if (!response.ok) throw new Error(await responseError(response));
+			const body = (await response.json()) as StudioTranscriptResponse;
+			if (transcriptRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			shouldAutoScrollConversationRef.current = false;
+			setTranscriptBySession(current => ({
+				...current,
+				[studioSessionId]: mergeStudioTranscriptSnapshot(current[studioSessionId] ?? [], body.messages),
+			}));
+			setTranscriptCursorBySession(current => ({ ...current, [studioSessionId]: body.nextBeforeOrdinal }));
+		} catch (reason) {
+			if (transcriptRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setTranscriptErrorsBySession(current => ({
+					...current,
+					[studioSessionId]: reason instanceof Error ? reason.message : "Studio could not load earlier messages.",
+				}));
+			}
+		} finally {
+			earlierTranscriptPendingIdsRef.current.delete(studioSessionId);
+			setEarlierTranscriptPendingId(current => (current === studioSessionId ? null : current));
 		}
 	}, []);
 
@@ -974,11 +1051,14 @@ export function App(): ReactNode {
 		setSelectedSessionId(sessions[0]?.id ?? null);
 	}, [selectedSessionId, sessions]);
 
+	// Tracked as a primitive so the connect effect below does not re-run on every unrelated session-list
+	// update (status flips, activity timestamps) while a spawn is still in flight.
+	const selectedSessionKnown = sessions.some(session => session.id === selectedSessionId);
+
 	useEffect(() => {
-		if (!bootstrap?.features.rpcSupervisor || !selectedSessionId) return;
-		if (!sessions.some(session => session.id === selectedSessionId)) return;
+		if (!bootstrap?.features.rpcSupervisor || !selectedSessionId || !selectedSessionKnown) return;
 		void connectSession(selectedSessionId);
-	}, [bootstrap?.features.rpcSupervisor, connectSession, selectedSessionId, sessions]);
+	}, [bootstrap?.features.rpcSupervisor, connectSession, selectedSessionId, selectedSessionKnown]);
 
 	useEffect(() => {
 		if (!setupAutoOpenedRef.current || sessions.length === 0) return;
@@ -1151,6 +1231,7 @@ export function App(): ReactNode {
 						setTranscriptBySession({});
 						setTranscriptErrorsBySession({});
 						setTranscriptLoadingBySession({});
+						setTranscriptCursorBySession({});
 						sessionListRequestIdRef.current += 1;
 						invalidateSessionRequestIds(transcriptRequestIdsRef.current);
 						invalidateSessionRequestIds(activityRequestIdsRef.current);
@@ -1343,14 +1424,18 @@ export function App(): ReactNode {
 			: !sessionProviderId || !sessionModelId
 				? "connect model"
 				: "start session";
-	const selectedActivity = selectedSessionId ? (activityBySession[selectedSessionId] ?? []) : [];
-	const selectedTranscript = selectedSessionId ? (transcriptBySession[selectedSessionId] ?? []) : [];
+	const selectedActivity = (selectedSessionId ? activityBySession[selectedSessionId] : undefined) ?? EMPTY_ACTIVITY;
+	const selectedTranscript =
+		(selectedSessionId ? transcriptBySession[selectedSessionId] : undefined) ?? EMPTY_TRANSCRIPT;
 	const promptText = selectedSessionId ? (promptDrafts[selectedSessionId] ?? "") : "";
 	const transcriptError = selectedSessionId ? (transcriptErrorsBySession[selectedSessionId] ?? null) : null;
 	const transcriptLoading = selectedSessionId ? transcriptLoadingBySession[selectedSessionId] === true : false;
+	const earlierTranscriptOrdinal = selectedSessionId ? transcriptCursorBySession[selectedSessionId] : undefined;
+	const earlierTranscriptPending = selectedSessionId !== null && earlierTranscriptPendingId === selectedSessionId;
 	const activityError = selectedSessionId ? (activityErrorsBySession[selectedSessionId] ?? null) : null;
 	const activityLoading = selectedSessionId ? activityLoadingBySession[selectedSessionId] === true : false;
-	const selectedToolDisplays = selectedSessionId ? (toolDisplaysBySession[selectedSessionId] ?? []) : [];
+	const selectedToolDisplays =
+		(selectedSessionId ? toolDisplaysBySession[selectedSessionId] : undefined) ?? EMPTY_TOOL_DISPLAYS;
 	const toolDisplayError = selectedSessionId ? (toolDisplayErrorsBySession[selectedSessionId] ?? null) : null;
 	const toolDisplayLoading = selectedSessionId ? toolDisplayLoadingBySession[selectedSessionId] === true : false;
 	const selectedPlan = selectedSessionId ? plansBySession[selectedSessionId] : undefined;
@@ -1359,10 +1444,12 @@ export function App(): ReactNode {
 	const selectedChangeSet = selectedSessionId ? changeSetsBySession[selectedSessionId] : undefined;
 	const changeSetError = selectedSessionId ? (changeSetErrorsBySession[selectedSessionId] ?? null) : null;
 	const changeSetLoading = selectedSessionId ? changeSetLoadingBySession[selectedSessionId] === true : false;
-	const selectedRunHistory = selectedSessionId ? (runHistoryBySession[selectedSessionId] ?? []) : [];
+	const selectedRunHistory =
+		(selectedSessionId ? runHistoryBySession[selectedSessionId] : undefined) ?? EMPTY_RUN_HISTORY;
 	const runHistoryError = selectedSessionId ? (runHistoryErrorsBySession[selectedSessionId] ?? null) : null;
 	const runHistoryLoading = selectedSessionId ? runHistoryLoadingBySession[selectedSessionId] === true : false;
-	const selectedUsageHistory = selectedSessionId ? (usageHistoryBySession[selectedSessionId] ?? []) : [];
+	const selectedUsageHistory =
+		(selectedSessionId ? usageHistoryBySession[selectedSessionId] : undefined) ?? EMPTY_USAGE_HISTORY;
 	const usageHistoryError = selectedSessionId ? (usageHistoryErrorsBySession[selectedSessionId] ?? null) : null;
 	const usageHistoryLoading = selectedSessionId ? usageHistoryLoadingBySession[selectedSessionId] === true : false;
 	const { displayedTranscript, hasStreamingAssistant } = useMemo(() => {
@@ -1373,8 +1460,8 @@ export function App(): ReactNode {
 		});
 		return { displayedTranscript, hasStreamingAssistant };
 	}, [selectedTranscript]);
-	const selectedApprovals = selectedSessionId ? (approvalsBySession[selectedSessionId] ?? []) : [];
-	const selectedSubagents = selectedSessionId ? (subagentsBySession[selectedSessionId] ?? []) : [];
+	const selectedApprovals = (selectedSessionId ? approvalsBySession[selectedSessionId] : undefined) ?? EMPTY_APPROVALS;
+	const selectedSubagents = (selectedSessionId ? subagentsBySession[selectedSessionId] : undefined) ?? EMPTY_SUBAGENTS;
 	const selectedActiveRun = isActiveRun(selectedSession?.activeRun) ? selectedSession.activeRun : undefined;
 	const selectedWorkspace = useMemo(
 		() => workspaces.find(workspace => workspace.id === selectedSession?.workspaceId) ?? null,
@@ -1383,45 +1470,51 @@ export function App(): ReactNode {
 	const selectedSessionConnecting =
 		selectedSession !== null &&
 		(sessionConnectPendingId === selectedSession.id || selectedSession.status === "starting");
+	/**
+	 * A cold RPC spawn takes a couple of seconds, so the composer deliberately stays live while a
+	 * session connects: `submitPrompt` awaits the in-flight connect and sends as soon as it lands.
+	 */
 	const composerBlocked =
-		promptPending ||
-		cancelPending ||
-		controlPendingId !== null ||
-		selectedSessionConnecting ||
-		selectedActiveRun !== undefined;
+		promptPending || cancelPending || controlPendingId !== null || selectedActiveRun !== undefined;
 
-	const registerWorkspacePath = async (path: string): Promise<void> => {
-		if (!path || workspacePending) return;
-		setWorkspaceError(null);
-		setWorkspacePending(true);
-		try {
-			const label = workspaceLabel.trim();
-			const response = await fetch("/api/v1/workspaces", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ ...(label ? { label } : {}), path }),
-			});
-			if (!response.ok) throw new Error(await responseError(response));
-			const body = (await response.json()) as StudioWorkspaceResponse;
-			setWorkspaces(current =>
-				sortWorkspaces([...current.filter(workspace => workspace.id !== body.workspace.id), body.workspace]),
-			);
-			setSessionWorkspaceId(body.workspace.id);
-			setWorkspaceLabel("");
-			setWorkspacePath("");
-		} catch (reason) {
-			setWorkspaceError(reason instanceof Error ? reason.message : "Studio could not register the workspace.");
-		} finally {
-			setWorkspacePending(false);
-		}
-	};
+	const registerWorkspacePath = useCallback(
+		async (path: string): Promise<void> => {
+			if (!path || workspacePending) return;
+			setWorkspaceError(null);
+			setWorkspacePending(true);
+			try {
+				const label = workspaceLabel.trim();
+				const response = await fetch("/api/v1/workspaces", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ ...(label ? { label } : {}), path }),
+				});
+				if (!response.ok) throw new Error(await responseError(response));
+				const body = (await response.json()) as StudioWorkspaceResponse;
+				setWorkspaces(current =>
+					sortWorkspaces([...current.filter(workspace => workspace.id !== body.workspace.id), body.workspace]),
+				);
+				setSessionWorkspaceId(body.workspace.id);
+				setWorkspaceLabel("");
+				setWorkspacePath("");
+			} catch (reason) {
+				setWorkspaceError(reason instanceof Error ? reason.message : "Studio could not register the workspace.");
+			} finally {
+				setWorkspacePending(false);
+			}
+		},
+		[workspaceLabel, workspacePending],
+	);
 
-	const registerWorkspace = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
-		event.preventDefault();
-		await registerWorkspacePath(workspacePath.trim());
-	};
+	const registerWorkspace = useCallback(
+		async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+			event.preventDefault();
+			await registerWorkspacePath(workspacePath.trim());
+		},
+		[registerWorkspacePath, workspacePath],
+	);
 
-	const selectWorkspace = async (): Promise<void> => {
+	const selectWorkspace = useCallback(async (): Promise<void> => {
 		const desktopApi = window.ompStudio;
 		if (!desktopApi) {
 			setWorkspaceError("The desktop folder picker is unavailable. Restart OMP Studio and try again.");
@@ -1438,7 +1531,7 @@ export function App(): ReactNode {
 		} finally {
 			setWorkspacePickerPending(false);
 		}
-	};
+	}, [registerWorkspacePath, workspacePending, workspacePickerPending]);
 
 	const removeWorkspace = async (workspaceId: string): Promise<void> => {
 		if (workspacePending) return;
@@ -1485,6 +1578,7 @@ export function App(): ReactNode {
 			setTranscriptBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
 			setTranscriptErrorsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
 			setTranscriptLoadingBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setTranscriptCursorBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
 			setActivityBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
 			setActivityErrorsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
 			setActivityLoadingBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
@@ -1615,31 +1709,38 @@ export function App(): ReactNode {
 		}
 	};
 
-	const acquireControl = async (studioSessionId: string, selectSession = true): Promise<boolean> => {
-		if (controlPendingId !== null) return false;
-		setSessionError(null);
-		setControlPendingId(studioSessionId);
-		try {
-			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/lease`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ holderId, ttlMs: 45_000 }),
-				signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
-			});
-			if (!response.ok) throw new Error(await responseError(response));
-			const body = (await response.json()) as StudioControlLeaseResponse;
-			setLeaseExpiresAtMs(current => ({ ...current, [studioSessionId]: body.lease.expiresAtMs }));
-			if (selectSession) setSelectedSessionId(studioSessionId);
-			return true;
-		} catch (reason) {
-			setSessionError(
-				reason instanceof Error ? reason.message : "Studio could not acquire control of this session.",
-			);
-			return false;
-		} finally {
-			setControlPendingId(null);
-		}
-	};
+	const acquireControl = useCallback(
+		async (studioSessionId: string, selectSession = true): Promise<boolean> => {
+			// Guarded by a ref rather than the pending state: state updates are async, so two calls in the
+			// same tick would both pass a state check, and reading state here would also churn this callback.
+			if (controlPendingIdRef.current !== null) return false;
+			controlPendingIdRef.current = studioSessionId;
+			setSessionError(null);
+			setControlPendingId(studioSessionId);
+			try {
+				const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/lease`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ holderId, ttlMs: 45_000 }),
+					signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
+				});
+				if (!response.ok) throw new Error(await responseError(response));
+				const body = (await response.json()) as StudioControlLeaseResponse;
+				setLeaseExpiresAtMs(current => ({ ...current, [studioSessionId]: body.lease.expiresAtMs }));
+				if (selectSession) setSelectedSessionId(studioSessionId);
+				return true;
+			} catch (reason) {
+				setSessionError(
+					reason instanceof Error ? reason.message : "Studio could not acquire control of this session.",
+				);
+				return false;
+			} finally {
+				controlPendingIdRef.current = null;
+				setControlPendingId(null);
+			}
+		},
+		[holderId],
+	);
 
 	const createSession = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
 		event.preventDefault();
@@ -1686,77 +1787,108 @@ export function App(): ReactNode {
 		}
 	};
 
-	const submitPrompt = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
-		event.preventDefault();
-		const message = promptText.trim();
-		if (!selectedSession || !message || promptPending) return;
-		const studioSessionId = selectedSession.id;
-		setSessionError(null);
-		setPromptPending(true);
-		let optimisticMessageId: string | undefined;
-		try {
-			if (!(await connectSession(studioSessionId, true))) return;
-			if (!(await acquireControl(studioSessionId, false))) return;
-			const optimisticId = `local_${crypto.randomUUID().replaceAll("-", "")}`;
-			optimisticMessageId = optimisticId;
-			const promptedAtMs = Date.now();
-			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/prompts`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ holderId, message }),
-				signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
-			});
-			if (!response.ok) throw new Error(await responseError(response));
-			const body = (await response.json()) as StudioPromptResponse;
-			const reconciled = reconcileStudioSession(
-				body.session,
-				body.run,
-				runStateBySessionRef.current.get(studioSessionId),
-			);
-			if (reconciled.run) runStateBySessionRef.current.set(studioSessionId, reconciled.run);
-			sessionSnapshotVersionRef.current += 1;
-			setSessions(current =>
-				sortSessions([reconciled.session, ...current.filter(session => session.id !== reconciled.session.id)]),
-			);
-			setTranscriptBySession(current => ({
-				...current,
-				[studioSessionId]: upsertStudioTranscriptMessage(current[studioSessionId] ?? [], {
-					id: optimisticId,
-					studioSessionId,
-					runId: body.run.id,
-					role: "user",
-					text: message,
-					status: "completed",
-					createdAtMs: promptedAtMs,
-					updatedAtMs: Date.now(),
-				}),
-			}));
-			setPromptDrafts(current => {
-				const next = { ...current };
-				delete next[studioSessionId];
-				return next;
-			});
-		} catch (reason) {
-			if (optimisticMessageId) {
+	const submitPrompt = useCallback(
+		async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+			event.preventDefault();
+			const message = promptText.trim();
+			if (!selectedSessionId || !selectedSessionKnown || !message || promptPending) return;
+			const studioSessionId = selectedSessionId;
+			setSessionError(null);
+			setPromptPending(true);
+			let optimisticMessageId: string | undefined;
+			try {
+				// Only force a reconnect when this tab has no live connection: a redundant /connect on a warm
+				// session costs a round trip and flips the session back to "starting", which disables the composer.
+				const connecting = connectSession(studioSessionId, !connectedSessionIdsRef.current.has(studioSessionId));
+				// The prompt needs a live lease, not a fresh one. Reuse an unexpired lease, and when a renewal is
+				// needed overlap it with the connect instead of chaining both round trips ahead of the prompt.
+				const reusedLease =
+					(leaseExpiresAtMs[studioSessionId] ?? 0) - Date.now() > STUDIO_CONTROL_LEASE_REUSE_MARGIN_MS;
+				const controlling = reusedLease ? Promise.resolve(true) : acquireControl(studioSessionId, false);
+				const [connected, controlled] = await Promise.all([connecting, controlling]);
+				if (!connected || !controlled) return;
+				const optimisticId = `local_${crypto.randomUUID().replaceAll("-", "")}`;
+				optimisticMessageId = optimisticId;
+				const promptedAtMs = Date.now();
+				const sendPrompt = async (): Promise<Response> =>
+					await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/prompts`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ holderId, message }),
+						signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
+					});
+				let response = await sendPrompt();
+				if (!response.ok) {
+					const failure = await readResponseFailure(response);
+					// A reused lease can be stale when the server restarted or another tab took control.
+					if (!reusedLease || failure.code !== "control_lease_required") throw new Error(failure.message);
+					if (!(await acquireControl(studioSessionId, false))) return;
+					response = await sendPrompt();
+					if (!response.ok) throw new Error(await responseError(response));
+				}
+				const body = (await response.json()) as StudioPromptResponse;
+				const reconciled = reconcileStudioSession(
+					body.session,
+					body.run,
+					runStateBySessionRef.current.get(studioSessionId),
+				);
+				if (reconciled.run) runStateBySessionRef.current.set(studioSessionId, reconciled.run);
+				sessionSnapshotVersionRef.current += 1;
+				setSessions(current =>
+					sortSessions([reconciled.session, ...current.filter(session => session.id !== reconciled.session.id)]),
+				);
 				setTranscriptBySession(current => ({
 					...current,
-					[studioSessionId]: (current[studioSessionId] ?? []).filter(
-						transcriptMessage => transcriptMessage.id !== optimisticMessageId,
-					),
+					[studioSessionId]: upsertStudioTranscriptMessage(current[studioSessionId] ?? [], {
+						id: optimisticId,
+						studioSessionId,
+						runId: body.run.id,
+						role: "user",
+						text: message,
+						status: "completed",
+						createdAtMs: promptedAtMs,
+						updatedAtMs: Date.now(),
+					}),
 				}));
+				setPromptDrafts(current => {
+					const next = { ...current };
+					delete next[studioSessionId];
+					return next;
+				});
+			} catch (reason) {
+				if (optimisticMessageId) {
+					setTranscriptBySession(current => ({
+						...current,
+						[studioSessionId]: (current[studioSessionId] ?? []).filter(
+							transcriptMessage => transcriptMessage.id !== optimisticMessageId,
+						),
+					}));
+				}
+				void loadSessions();
+				void loadTranscript(studioSessionId);
+				setSessionError(reason instanceof Error ? reason.message : "Studio could not send the prompt to OMP.");
+			} finally {
+				setPromptPending(false);
 			}
-			void loadSessions();
-			void loadTranscript(studioSessionId);
-			setSessionError(reason instanceof Error ? reason.message : "Studio could not send the prompt to OMP.");
-		} finally {
-			setPromptPending(false);
-		}
-	};
+		},
+		[
+			acquireControl,
+			connectSession,
+			holderId,
+			leaseExpiresAtMs,
+			loadSessions,
+			loadTranscript,
+			promptPending,
+			promptText,
+			selectedSessionId,
+			selectedSessionKnown,
+		],
+	);
 
-	const cancelActiveRun = async (): Promise<void> => {
+	const cancelActiveRun = useCallback(async (): Promise<void> => {
 		const run = selectedActiveRun;
-		if (!selectedSession || !run || cancelPending) return;
-		const studioSessionId = selectedSession.id;
+		if (!selectedSessionId || !run || cancelPending) return;
+		const studioSessionId = selectedSessionId;
 		if (!(await acquireControl(studioSessionId, false))) return;
 		setSessionError(null);
 		setCancelPending(true);
@@ -1787,32 +1919,35 @@ export function App(): ReactNode {
 		} finally {
 			setCancelPending(false);
 		}
-	};
+	}, [acquireControl, cancelPending, holderId, loadSessions, selectedActiveRun, selectedSessionId]);
 
-	const resolveToolApproval = async (approval: StudioApproval, decision: "approve" | "reject"): Promise<void> => {
-		if (approval.status !== "pending" || approvalPendingId !== null) return;
-		if (!(await acquireControl(approval.studioSessionId))) return;
-		setSessionError(null);
-		setApprovalPendingId(approval.id);
-		try {
-			const response = await fetch(`/api/v1/approvals/${encodeURIComponent(approval.id)}`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ decision, holderId }),
-			});
-			if (!response.ok) throw new Error(await responseError(response));
-			const body = (await response.json()) as StudioApprovalResponse;
-			if (body.approval.id !== approval.id) throw new Error("Studio resolved an unexpected tool approval.");
-			setApprovalsBySession(current => ({
-				...current,
-				[approval.studioSessionId]: upsertApproval(current[approval.studioSessionId] ?? [], body.approval),
-			}));
-		} catch (reason) {
-			setSessionError(reason instanceof Error ? reason.message : "Studio could not resolve the tool approval.");
-		} finally {
-			setApprovalPendingId(null);
-		}
-	};
+	const resolveToolApproval = useCallback(
+		async (approval: StudioApproval, decision: "approve" | "reject"): Promise<void> => {
+			if (approval.status !== "pending" || approvalPendingId !== null) return;
+			if (!(await acquireControl(approval.studioSessionId))) return;
+			setSessionError(null);
+			setApprovalPendingId(approval.id);
+			try {
+				const response = await fetch(`/api/v1/approvals/${encodeURIComponent(approval.id)}`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ decision, holderId }),
+				});
+				if (!response.ok) throw new Error(await responseError(response));
+				const body = (await response.json()) as StudioApprovalResponse;
+				if (body.approval.id !== approval.id) throw new Error("Studio resolved an unexpected tool approval.");
+				setApprovalsBySession(current => ({
+					...current,
+					[approval.studioSessionId]: upsertApproval(current[approval.studioSessionId] ?? [], body.approval),
+				}));
+			} catch (reason) {
+				setSessionError(reason instanceof Error ? reason.message : "Studio could not resolve the tool approval.");
+			} finally {
+				setApprovalPendingId(null);
+			}
+		},
+		[acquireControl, approvalPendingId, holderId],
+	);
 
 	useEffect(() => {
 		shouldAutoScrollConversationRef.current = true;
@@ -1868,11 +2003,68 @@ export function App(): ReactNode {
 		return () => window.removeEventListener("keydown", onKeyDown);
 	}, [openSetup, selectWorkspace]);
 
+	// Stable render-site handlers. Inline arrows here would change identity on every render and defeat the
+	// memoized rail, pane and inspector, which is what makes a 20 Hz streaming tick cheap.
+	const closeNavigation = useCallback((): void => setNavigationOpen(false), []);
+	const openActiveContextPanel = useCallback((): void => openContext(contextPanel), [contextPanel, openContext]);
+	const handleAcquireControl = useCallback(
+		(studioSessionId: string): void => void acquireControl(studioSessionId),
+		[acquireControl],
+	);
+	const handleAddProject = useCallback((): void => {
+		openSetup();
+		window.requestAnimationFrame(() => workspacePathRef.current?.focus());
+	}, [openSetup]);
+	const handleSelectSession = useCallback((studioSessionId: string): void => {
+		setSelectedSessionId(studioSessionId);
+		setNavigationOpen(false);
+	}, []);
+	const handleSelectWorkspaceId = useCallback(
+		(workspaceId: string): void => {
+			setSessionWorkspaceId(workspaceId);
+			openSetup();
+		},
+		[openSetup],
+	);
+	const handleCancelActiveRun = useCallback((): void => void cancelActiveRun(), [cancelActiveRun]);
+	const handleDraftChange = useCallback(
+		(value: string): void => {
+			if (!selectedSessionId) return;
+			setPromptDrafts(current => ({ ...current, [selectedSessionId]: value }));
+		},
+		[selectedSessionId],
+	);
+	const handleReconnect = useCallback((): void => {
+		if (selectedSessionId) void connectSession(selectedSessionId, true);
+	}, [connectSession, selectedSessionId]);
+	const handleConversationScroll = useCallback(
+		(scrollHeight: number, scrollTop: number, clientHeight: number): void => {
+			shouldAutoScrollConversationRef.current = scrollHeight - scrollTop - clientHeight < 40;
+		},
+		[],
+	);
+	const handleLoadEarlierTranscript = useCallback((): void => {
+		if (!selectedSessionId || earlierTranscriptOrdinal === undefined) return;
+		void loadEarlierTranscript(selectedSessionId, earlierTranscriptOrdinal);
+	}, [earlierTranscriptOrdinal, loadEarlierTranscript, selectedSessionId]);
+	const handleRefreshChanges = useCallback((): void => {
+		if (selectedSessionId) void loadChangeSet(selectedSessionId);
+	}, [loadChangeSet, selectedSessionId]);
+	const handleRefreshHistory = useCallback((): void => {
+		if (!selectedSessionId) return;
+		if (runHistory) void loadRunHistory(selectedSessionId);
+		if (usageHistory) void loadUsageHistory(selectedSessionId);
+	}, [loadRunHistory, loadUsageHistory, runHistory, selectedSessionId, usageHistory]);
+	const handleResolveApproval = useCallback(
+		(approval: StudioApproval, decision: "approve" | "reject"): void => void resolveToolApproval(approval, decision),
+		[resolveToolApproval],
+	);
+
 	return (
 		<div className="studio-shell studio-desktop-shell">
 			<StudioTitlebar
 				connection={connection}
-				onOpenContext={() => openContext(contextPanel)}
+				onOpenContext={openActiveContextPanel}
 				onOpenNavigation={openNavigation}
 				onOpenSetup={openSetup}
 				profile={profile}
@@ -1886,27 +2078,18 @@ export function App(): ReactNode {
 					<button
 						aria-label="Close session navigation"
 						className="studio-mobile-scrim studio-navigation-scrim"
-						onClick={() => setNavigationOpen(false)}
+						onClick={closeNavigation}
 						type="button"
 					/>
 				)}
 				<StudioSessionRail
 					controlPendingId={controlPendingId}
 					leaseExpiresAtMs={leaseExpiresAtMs}
-					onAcquireControl={studioSessionId => void acquireControl(studioSessionId)}
-					onAddProject={() => {
-						openSetup();
-						window.requestAnimationFrame(() => workspacePathRef.current?.focus());
-					}}
+					onAcquireControl={handleAcquireControl}
+					onAddProject={handleAddProject}
 					onOpenSetup={openSetup}
-					onSelectSession={sessionId => {
-						setSelectedSessionId(sessionId);
-						setNavigationOpen(false);
-					}}
-					onSelectWorkspace={workspaceId => {
-						setSessionWorkspaceId(workspaceId);
-						openSetup();
-					}}
+					onSelectSession={handleSelectSession}
+					onSelectWorkspace={handleSelectWorkspaceId}
 					selectedSessionId={selectedSessionId}
 					sessionWorkspaceId={sessionWorkspaceId}
 					sessions={sessions}
@@ -1921,22 +2104,18 @@ export function App(): ReactNode {
 					composerBlocked={composerBlocked}
 					controlPending={controlPendingId !== null}
 					draft={promptText}
+					earlierPending={earlierTranscriptPending}
+					hasEarlierTranscript={earlierTranscriptOrdinal !== undefined}
 					hasStreamingAssistant={hasStreamingAssistant}
 					plan={selectedPlan}
-					onCancel={() => void cancelActiveRun()}
-					onDraftChange={value => {
-						if (!selectedSessionId) return;
-						setPromptDrafts(current => ({ ...current, [selectedSessionId]: value }));
-					}}
+					onCancel={handleCancelActiveRun}
+					onDraftChange={handleDraftChange}
+					onLoadEarlier={handleLoadEarlierTranscript}
 					onOpenContext={openContext}
 					onOpenNavigation={openNavigation}
 					onOpenSetup={openSetup}
-					onReconnect={() => {
-						if (selectedSessionId) void connectSession(selectedSessionId, true);
-					}}
-					onScroll={(scrollHeight, scrollTop, clientHeight) => {
-						shouldAutoScrollConversationRef.current = scrollHeight - scrollTop - clientHeight < 40;
-					}}
+					onReconnect={handleReconnect}
+					onScroll={handleConversationScroll}
 					onSubmit={submitPrompt}
 					promptPending={promptPending}
 					selectedActiveRun={selectedActiveRun}
@@ -1985,19 +2164,13 @@ export function App(): ReactNode {
 							approvals={selectedApprovals}
 							controlPendingId={controlPendingId}
 							leaseExpiresAtMs={selectedSession ? (leaseExpiresAtMs[selectedSession.id] ?? 0) : 0}
-							onAcquireControl={studioSessionId => void acquireControl(studioSessionId)}
+							onAcquireControl={handleAcquireControl}
 							onClose={closeContext}
 							onPanelChange={openContext}
 							onOpenSetup={openSetup}
-							onRefreshChanges={() => {
-								if (selectedSessionId) void loadChangeSet(selectedSessionId);
-							}}
-							onRefreshHistory={() => {
-								if (!selectedSessionId) return;
-								if (runHistory) void loadRunHistory(selectedSessionId);
-								if (usageHistory) void loadUsageHistory(selectedSessionId);
-							}}
-							onResolveApproval={(approval, decision) => void resolveToolApproval(approval, decision)}
+							onRefreshChanges={handleRefreshChanges}
+							onRefreshHistory={handleRefreshHistory}
+							onResolveApproval={handleResolveApproval}
 							selectedActiveRun={selectedActiveRun}
 							selectedSession={selectedSession ?? undefined}
 							selectedWorkspace={selectedWorkspace ?? undefined}

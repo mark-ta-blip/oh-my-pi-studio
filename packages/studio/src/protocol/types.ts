@@ -131,6 +131,8 @@ export interface StudioTranscriptMessage {
 
 export interface StudioTranscriptResponse {
 	messages: StudioTranscriptMessage[];
+	/** Present when older messages exist; pass it back as `before` to fetch the previous page. */
+	nextBeforeOrdinal?: number;
 }
 
 /** A fixed, browser-safe category for one durable Studio run activity event. */

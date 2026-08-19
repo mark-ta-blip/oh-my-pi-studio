@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import type { StudioSession, StudioWorkspace } from "../../protocol";
 import { formatWorkspaceDate, sessionTitle } from "../presentation";
 
@@ -16,7 +16,7 @@ interface StudioSessionRailProps {
 	workspaces: StudioWorkspace[];
 }
 
-export function StudioSessionRail({
+export const StudioSessionRail = memo(function StudioSessionRail({
 	controlPendingId,
 	leaseExpiresAtMs,
 	onAcquireControl,
@@ -164,4 +164,4 @@ export function StudioSessionRail({
 			</div>
 		</aside>
 	);
-}
+});

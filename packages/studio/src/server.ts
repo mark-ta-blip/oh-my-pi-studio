@@ -14,7 +14,11 @@ import {
 	type StudioRpcSupervisorEvents,
 	type StudioRpcTransportFactory,
 } from "./core/rpc-supervisor";
-import { StudioStore } from "./core/studio-store";
+import {
+	type ListStudioTranscriptMessagesInput,
+	MAX_STUDIO_TRANSCRIPT_PAGE_SIZE,
+	StudioStore,
+} from "./core/studio-store";
 import { resolveWorkspaceRegistration, WorkspaceRegistrationError } from "./core/workspace-registry";
 import embeddedClientArchiveTxt from "./embedded-client.generated.txt";
 import {
@@ -433,6 +437,15 @@ function readAuditQuery(url: URL): { beforeId?: number; limit?: number; studioSe
 	};
 }
 
+function readTranscriptQuery(url: URL): ListStudioTranscriptMessagesInput {
+	const beforeOrdinal = readOptionalPositiveInteger(url, "before", Number.MAX_SAFE_INTEGER);
+	const limit = readOptionalPositiveInteger(url, "limit", MAX_STUDIO_TRANSCRIPT_PAGE_SIZE);
+	return {
+		...(beforeOrdinal === undefined ? {} : { beforeOrdinal }),
+		...(limit === undefined ? {} : { limit }),
+	};
+}
+
 function parseProviderLoginId(pathname: string): string | null {
 	const match = /^\/api\/v1\/providers\/([^/]+)\/login$/.exec(pathname);
 	if (!match) return null;
@@ -765,17 +778,26 @@ function handleSessionSubagents(request: Request, studioSessionId: string, runti
 	return jsonResponse(body);
 }
 
-function handleSessionTranscript(request: Request, studioSessionId: string, runtime: StudioRuntime): Response {
+function handleSessionTranscript(
+	request: Request,
+	url: URL,
+	studioSessionId: string,
+	runtime: StudioRuntime,
+): Response {
 	if (request.method !== "GET") {
 		return errorResponse(405, "method_not_allowed", "Studio session transcripts support GET requests.");
 	}
 	if (!runtime.store.getStudioSession(studioSessionId)) {
 		return errorResponse(404, "studio_session_not_found", "The requested Studio session was not found.");
 	}
-	const body: StudioTranscriptResponse = {
-		messages: runtime.store.listStudioTranscriptMessages(studioSessionId),
-	};
-	return jsonResponse(body);
+	try {
+		const page = runtime.store.listStudioTranscriptMessages(studioSessionId, readTranscriptQuery(url));
+		const body: StudioTranscriptResponse = page;
+		return jsonResponse(body);
+	} catch (error) {
+		if (error instanceof StudioRequestError) return requestErrorResponse(error);
+		throw error;
+	}
 }
 
 function handleSessionActivity(request: Request, studioSessionId: string, runtime: StudioRuntime): Response {
@@ -1363,7 +1385,9 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 					const sessionSubagentId = parseStudioSessionActionId(url.pathname, "subagents");
 					if (sessionSubagentId !== null) return handleSessionSubagents(request, sessionSubagentId, runtime);
 					const sessionTranscriptId = parseStudioSessionActionId(url.pathname, "transcript");
-					if (sessionTranscriptId !== null) return handleSessionTranscript(request, sessionTranscriptId, runtime);
+					if (sessionTranscriptId !== null) {
+						return handleSessionTranscript(request, url, sessionTranscriptId, runtime);
+					}
 					const sessionActivityId = parseStudioSessionActionId(url.pathname, "activity");
 					if (sessionActivityId !== null) return handleSessionActivity(request, sessionActivityId, runtime);
 					const sessionRunHistoryId = parseStudioSessionActionId(url.pathname, "runs");

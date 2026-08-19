@@ -1,4 +1,4 @@
-import type { FormEvent } from "react";
+import { type FormEvent, memo } from "react";
 import type { StudioRun } from "../../protocol";
 
 interface StudioComposerProps {
@@ -15,7 +15,7 @@ interface StudioComposerProps {
 	promptPending: boolean;
 }
 
-export function StudioComposer({
+export const StudioComposer = memo(function StudioComposer({
 	activeRun,
 	cancelPending,
 	connectionPending,
@@ -43,10 +43,10 @@ export function StudioComposer({
 						}
 					}}
 					placeholder={
-						connectionPending
-							? "OMP is starting this session"
-							: activeRun
-								? "OMP is working on the current task"
+						activeRun
+							? "OMP is working on the current task"
+							: connectionPending
+								? "Type the first instruction while the session starts"
 								: "Message OMP about the next task"
 					}
 					rows={3}
@@ -55,7 +55,13 @@ export function StudioComposer({
 			</label>
 			<div className="studio-composer-footer">
 				<span>
-					{connectionPending ? "Connecting to OMP" : activeRun ? "Run in progress" : "Ctrl+Enter to send"}
+					{promptPending && connectionPending
+						? "Waiting for the session to start"
+						: activeRun
+							? "Run in progress"
+							: connectionPending
+								? "Starting the session - you can type now"
+								: "Ctrl+Enter to send"}
 				</span>
 				<div>
 					{activeRun && (
@@ -69,10 +75,10 @@ export function StudioComposer({
 						</button>
 					)}
 					<button disabled={composerBlocked || !draft.trim()} type="submit">
-						{connectionPending ? "Starting" : promptPending ? "Sending" : "Send"}
+						{promptPending ? "Sending" : "Send"}
 					</button>
 				</div>
 			</div>
 		</form>
 	);
-}
+});

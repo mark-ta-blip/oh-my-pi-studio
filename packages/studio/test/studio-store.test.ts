@@ -300,6 +300,73 @@ describe("Studio tool cards and plan summaries", () => {
 	});
 });
 
+describe("Studio transcript paging", () => {
+	it("bounds the first page and walks backwards through older messages by ordinal", async () => {
+		const store = await createStore();
+		try {
+			seedStudioSession(store.dbPath, "sts_transcript_paging");
+			const created = store.createStudioRun("sts_transcript_paging", 2);
+			if (created.kind !== "created") throw new Error("Expected the seeded Studio session to accept a run.");
+			// A run holds at most one user turn, so the rest of the page is filled with assistant
+			// messages under distinct source ids.
+			const opening = store.createStudioUserTranscriptMessage(
+				{ runId: created.run.id, studioSessionId: "sts_transcript_paging", text: "message 1" },
+				3,
+			);
+			if (!opening) throw new Error("Expected the transcript row to be linked to the seeded run.");
+			for (let index = 2; index <= 501; index += 1) {
+				const message = store.upsertStudioAssistantTranscriptMessage(
+					{
+						runId: created.run.id,
+						sourceId: `src_${index}`,
+						status: "completed",
+						studioSessionId: "sts_transcript_paging",
+						text: `message ${index}`,
+					},
+					index + 2,
+				);
+				if (!message) throw new Error("Expected the transcript row to be linked to the seeded run.");
+			}
+
+			const firstPage = store.listStudioTranscriptMessages("sts_transcript_paging");
+			expect(firstPage.messages).toHaveLength(200);
+			expect(firstPage.messages[0]).toMatchObject({ role: "assistant", text: "message 302" });
+			expect(firstPage.messages.at(-1)).toMatchObject({ text: "message 501" });
+			if (firstPage.nextBeforeOrdinal === undefined) {
+				throw new Error("Expected the bounded transcript page to expose a cursor.");
+			}
+
+			const secondPage = store.listStudioTranscriptMessages("sts_transcript_paging", {
+				beforeOrdinal: firstPage.nextBeforeOrdinal,
+				limit: 2,
+			});
+			expect(secondPage.messages.map(message => message.text)).toEqual(["message 300", "message 301"]);
+
+			const clamped = store.listStudioTranscriptMessages("sts_transcript_paging", { limit: 1_000 });
+			expect(clamped.messages).toHaveLength(500);
+			expect(clamped.messages[0]).toMatchObject({ text: "message 2" });
+			if (clamped.nextBeforeOrdinal === undefined) {
+				throw new Error("Expected the clamped transcript page to stop short of the oldest message.");
+			}
+
+			const head = store.listStudioTranscriptMessages("sts_transcript_paging", {
+				beforeOrdinal: clamped.nextBeforeOrdinal,
+				limit: 5,
+			});
+			expect(head.messages.map(message => message.text)).toEqual(["message 1"]);
+			expect(head.messages[0]).toMatchObject({ role: "user" });
+			expect(head.nextBeforeOrdinal).toBeUndefined();
+			expect(
+				Object.keys(head.messages[0] ?? {})
+					.sort()
+					.join(","),
+			).toBe("createdAtMs,id,role,runId,status,studioSessionId,text,updatedAtMs");
+		} finally {
+			store.close();
+		}
+	});
+});
+
 describe("Studio audit ledger", () => {
 	it("pages control-plane records while filtering unapproved detail keys before review", async () => {
 		const store = await createStore();
