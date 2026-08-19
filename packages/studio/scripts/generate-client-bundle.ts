@@ -10,6 +10,13 @@ const DIST_CLIENT_DIR = path.join("dist", "client");
 const GENERATE_FLAG = "--generate";
 const RESET_FLAG = "--reset";
 
+// `--reset` restores the checked-in state: an empty file. Source checkouts build
+// the client from src/client instead, so a populated bundle must never be
+// committed — it would ship stale UI in every release built from that tree.
+// Release paths generate it and reset afterwards; see the `finally` blocks in
+// scripts/ci-release-build-binaries.ts, packages/coding-agent/scripts/build-binary.ts,
+// and packages/coding-agent/scripts/bundle-dist.ts.
+
 async function main(): Promise<void> {
 	if (process.argv.includes(RESET_FLAG)) {
 		await Bun.write(GENERATED_FILE, "");
