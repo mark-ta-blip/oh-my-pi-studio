@@ -1,9 +1,31 @@
 import * as path from "node:path";
 import { app, dialog, ipcMain, Notification, type OpenDialogOptions } from "electron";
 import { createDesktopPaths, resolveTrayIconPath } from "./paths";
-import { type StudioServerProcess, smokeTestStudioSidecar, startStudioServer } from "./studio-server";
+import {
+	type StudioServerProcess,
+	StudioSidecarStartupError,
+	smokeTestStudioSidecar,
+	startStudioServer,
+} from "./studio-server";
 import { TrayManager } from "./tray-manager";
 import { WindowManager } from "./window-manager";
+
+function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Startup failures are the one class of error with no UI behind it, so the
+ * dialog has to carry the sidecar's own output and the log path with it.
+ */
+function describeStartupFailure(error: unknown): string {
+	const message = describeError(error);
+	if (!(error instanceof StudioSidecarStartupError)) return message;
+	const sections = [message];
+	if (error.stderrTail.length > 0) sections.push(`Recent OMP Studio server output:\n${error.stderrTail.join("\n")}`);
+	if (error.logPath) sections.push(`Full server log:\n${error.logPath}`);
+	return sections.join("\n\n");
+}
 
 const smokeTest = process.argv.includes("--smoke-test");
 const hasLock = smokeTest || app.requestSingleInstanceLock();
@@ -42,34 +64,50 @@ if (!hasLock) {
 	async function shutdown(): Promise<void> {
 		if (shutdownStarted) return;
 		shutdownStarted = true;
-		studioServerStartupAbort?.abort();
-		windowManager?.allowClose();
-		await windowManager?.save();
-		await studioServerStartup?.catch(() => undefined);
-		await studioServer?.stop();
-		trayManager?.destroy();
-		app.exit(0);
+		// Every step here is best-effort. A throw before app.exit() would strand a
+		// hidden window and an orphaned sidecar with no way left to quit the app.
+		try {
+			studioServerStartupAbort?.abort();
+			windowManager?.allowClose();
+			await windowManager?.save();
+			await studioServerStartup?.catch(() => undefined);
+			await studioServer?.stop();
+			trayManager?.destroy();
+		} catch (error) {
+			process.stderr.write(`OMP Studio shutdown error: ${describeError(error)}\n`);
+		} finally {
+			app.exit(0);
+		}
 	}
 
 	async function failStartup(error: unknown): Promise<void> {
 		if (shutdownStarted) return;
 		shutdownStarted = true;
-		const message = error instanceof Error ? error.message : String(error);
-		windowManager?.allowClose();
-		await studioServer?.stop();
-		trayManager?.destroy();
-		process.stderr.write(`OMP Studio could not start: ${message}\n`);
-		dialog.showErrorBox("OMP Studio could not start", message);
-		app.exit(1);
+		const detail = describeStartupFailure(error);
+		try {
+			windowManager?.allowClose();
+			await studioServer?.stop();
+			trayManager?.destroy();
+			process.stderr.write(`OMP Studio could not start: ${detail}\n`);
+			dialog.showErrorBox("OMP Studio could not start", detail);
+		} catch (cleanupError) {
+			process.stderr.write(`OMP Studio startup cleanup error: ${describeError(cleanupError)}\n`);
+		} finally {
+			app.exit(1);
+		}
 	}
 
 	function failSmokeTest(error: unknown): void {
-		const message = error instanceof Error ? error.message : String(error);
-		process.stderr.write(`OMP Studio desktop smoke failed: ${message}\n`);
+		process.stderr.write(`OMP Studio desktop smoke failed: ${describeStartupFailure(error)}\n`);
 		app.exit(1);
 	}
 
 	app.on("second-instance", () => windowManager?.show());
+	// Only reachable when the tray is unavailable; with a tray, close hides the
+	// window and never closes it.
+	app.on("window-all-closed", () => {
+		if (trayManager?.available !== true) void shutdown();
+	});
 	app.on("before-quit", event => {
 		if (shutdownStarted) return;
 		event.preventDefault();
@@ -115,6 +153,14 @@ if (!hasLock) {
 				() => void app.quit(),
 				resolveTrayIconPath(paths, app.isPackaged),
 			);
+			if (!trayManager.available) {
+				// No tray means no way to reopen a hidden window, so close has to
+				// quit instead. See the window-all-closed handler below.
+				process.stderr.write(
+					`OMP Studio tray unavailable (${trayManager.failure ?? "unknown"}); close will quit.\n`,
+				);
+				windowManager.enableCloseToQuit();
+			}
 		})
 		.catch(error => {
 			if (!shutdownStarted) void failStartup(error);

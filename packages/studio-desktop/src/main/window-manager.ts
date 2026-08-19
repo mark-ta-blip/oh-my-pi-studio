@@ -1,58 +1,35 @@
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { BrowserWindow, dialog, session, shell } from "electron";
+import { BrowserWindow, dialog, screen, session, shell } from "electron";
 import { resolveExternalHttpUrl } from "./external-url";
 import type { DesktopPaths } from "./paths";
-
-interface WindowState {
-	width: number;
-	height: number;
-	x?: number;
-	y?: number;
-}
-
-const DEFAULT_STATE: WindowState = { width: 1280, height: 840 };
-
-async function readWindowState(filePath: string): Promise<WindowState> {
-	try {
-		const parsed: unknown = JSON.parse(await fs.readFile(filePath, "utf8"));
-		if (!parsed || typeof parsed !== "object") return DEFAULT_STATE;
-		const value = parsed as Partial<WindowState>;
-		if (
-			typeof value.width !== "number" ||
-			typeof value.height !== "number" ||
-			!Number.isInteger(value.width) ||
-			!Number.isInteger(value.height)
-		) {
-			return DEFAULT_STATE;
-		}
-		if (value.width < 800 || value.height < 600) return DEFAULT_STATE;
-		return {
-			width: value.width,
-			height: value.height,
-			...(typeof value.x === "number" && Number.isInteger(value.x) ? { x: value.x } : {}),
-			...(typeof value.y === "number" && Number.isInteger(value.y) ? { y: value.y } : {}),
-		};
-	} catch {
-		return DEFAULT_STATE;
-	}
-}
+import {
+	clampWindowStateToDisplays,
+	MIN_WINDOW_HEIGHT,
+	MIN_WINDOW_WIDTH,
+	readWindowState,
+	writeWindowState,
+} from "./window-state";
 
 export class WindowManager {
 	#window: BrowserWindow | null = null;
 	#allowClose = false;
+	#closeToQuit = false;
 	#saveTimer: NodeJS.Timeout | undefined;
 
 	constructor(readonly paths: DesktopPaths) {}
 
 	async create(serverUrl: string): Promise<BrowserWindow> {
-		const state = await readWindowState(this.paths.windowStatePath);
+		const saved = await readWindowState(this.paths.windowStatePath);
+		const state = clampWindowStateToDisplays(
+			saved,
+			screen.getAllDisplays().map(display => display.workArea),
+		);
 		const preloadPath = path.join(this.paths.packageRoot, "dist", "preload", "index.cjs");
 		const window = new BrowserWindow({
 			...state,
 			show: false,
-			minWidth: 800,
-			minHeight: 600,
+			minWidth: MIN_WINDOW_WIDTH,
+			minHeight: MIN_WINDOW_HEIGHT,
 			webPreferences: {
 				contextIsolation: true,
 				nodeIntegration: false,
@@ -72,9 +49,10 @@ export class WindowManager {
 		this.#installNavigationPolicy(window, serverUrl);
 		window.on("move", () => this.#scheduleSave());
 		window.on("resize", () => this.#scheduleSave());
-		window.on("minimize", () => window.hide());
+		// Minimize stays a real minimize: hiding it too leaves the taskbar and the
+		// window both empty, so the tray would be the only way back.
 		window.on("close", event => {
-			if (this.#allowClose) return;
+			if (this.#allowClose || this.#closeToQuit) return;
 			event.preventDefault();
 			window.hide();
 		});
@@ -100,6 +78,15 @@ export class WindowManager {
 		this.#allowClose = true;
 	}
 
+	/**
+	 * Let close actually close the window. Used when no tray was created: hiding
+	 * would otherwise leave the app running with no window and no tray to reopen
+	 * it from.
+	 */
+	enableCloseToQuit(): void {
+		this.#closeToQuit = true;
+	}
+
 	async openExternal(url: string): Promise<void> {
 		const externalUrl = resolveExternalHttpUrl(url);
 		if (!externalUrl) throw new Error("OMP Studio can only open HTTP or HTTPS links outside the app.");
@@ -108,9 +95,7 @@ export class WindowManager {
 
 	async save(): Promise<void> {
 		if (!this.#window) return;
-		const bounds = this.#window.getBounds();
-		await fs.mkdir(path.dirname(this.paths.windowStatePath), { recursive: true });
-		await fs.writeFile(this.paths.windowStatePath, JSON.stringify(bounds, null, 2), "utf8");
+		await writeWindowState(this.paths.windowStatePath, this.#window.getBounds());
 	}
 
 	#scheduleSave(): void {

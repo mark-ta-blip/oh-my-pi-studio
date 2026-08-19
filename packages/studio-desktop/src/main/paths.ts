@@ -4,6 +4,8 @@ export interface DesktopPaths {
 	packageRoot: string;
 	userDataDir: string;
 	windowStatePath: string;
+	/** Append-only sidecar stderr log, kept so a failed startup can point at it. */
+	sidecarLogPath: string;
 	resourceDir: string;
 	serverResourceDir: string;
 }
@@ -13,6 +15,7 @@ export function createDesktopPaths(userDataDir: string, resourcesPath: string, p
 		packageRoot,
 		userDataDir,
 		windowStatePath: path.join(userDataDir, "window-state.json"),
+		sidecarLogPath: path.join(userDataDir, "logs", "studio-server.log"),
 		resourceDir: resourcesPath,
 		serverResourceDir: path.join(resourcesPath, "omp-server"),
 	};
