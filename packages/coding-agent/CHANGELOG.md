@@ -11,6 +11,10 @@
 - Added ephemeral Studio control-plane storage for the packaged Desktop smoke path,
   so release verification does not alter persistent Studio session state.
 
+### Fixed
+
+- Fixed Studio RPC terminal provider errors being reduced to an unhelpful generic failure instead of a browser-safe recovery category.
+
 ## [17.3.6] - 2026-08-17
 
 ### Added

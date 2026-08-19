@@ -71,6 +71,7 @@ class FakeStudioRpcTransport implements StudioRpcTransport {
 	promptGate: Promise<void> | undefined;
 	prompts: string[] = [];
 	protocolVersion = 2;
+	stopGate: Promise<void> | undefined;
 	stopped = false;
 	usage: StudioRpcUsage = {
 		cacheReadTokens: 4,
@@ -149,6 +150,7 @@ class FakeStudioRpcTransport implements StudioRpcTransport {
 	}
 
 	async stop(): Promise<void> {
+		if (this.stopGate) await this.stopGate;
 		this.stopped = true;
 	}
 
@@ -187,10 +189,12 @@ class FakeStudioRpcTransport implements StudioRpcTransport {
 
 class FakeStudioRpcTransportFactory implements StudioRpcTransportFactory {
 	launches: StudioRpcLaunch[] = [];
+	startGate: Promise<void> | undefined;
 	transports: FakeStudioRpcTransport[] = [];
 
 	async start(launch: StudioRpcLaunch): Promise<StudioRpcTransport> {
 		this.launches.push(launch);
+		if (this.startGate) await this.startGate;
 		const transport = new FakeStudioRpcTransport();
 		this.transports.push(transport);
 		return transport;
@@ -326,6 +330,7 @@ async function createSession(
 	cookie: string,
 	workspaceId: string,
 	holderId = HOLDER_A,
+	connect = true,
 ): Promise<StudioSessionResponse> {
 	const response = await fetch(`${studio.origin}/api/v1/sessions`, {
 		method: "POST",
@@ -333,6 +338,20 @@ async function createSession(
 		body: JSON.stringify({ holderId, modelId: "example-model", provider: "example", workspaceId }),
 	});
 	expect(response.status).toBe(201);
+	const created = (await response.json()) as StudioSessionResponse;
+	return connect ? await connectSession(studio, cookie, created.session.id) : created;
+}
+
+async function connectSession(
+	studio: StudioServer,
+	cookie: string,
+	studioSessionId: string,
+): Promise<StudioSessionResponse> {
+	const response = await fetch(`${studio.origin}/api/v1/sessions/${studioSessionId}/connect`, {
+		method: "POST",
+		headers: { Cookie: cookie, Origin: studio.origin },
+	});
+	expect(response.status).toBe(200);
 	return (await response.json()) as StudioSessionResponse;
 }
 
@@ -365,15 +384,18 @@ describe("Studio RPC session supervision", () => {
 		const workspace = await registerWorkspace(studio, cookie, workspacePath);
 		const events = await subscribeStudioEvents(studio, cookie);
 		try {
-			const created = await createSession(studio, cookie, workspace.workspace.id);
+			const created = await createSession(studio, cookie, workspace.workspace.id, HOLDER_A, false);
 			const studioSessionId = created.session.id;
 			expect(studioSessionId).toMatch(/^sts_[a-f0-9]{32}$/);
 			expect(created.session).toMatchObject({
 				model: { id: "example-model", provider: "example" },
-				status: "ready",
+				status: "starting",
 				workspaceId: workspace.workspace.id,
 			});
 			expect(JSON.stringify(created)).not.toContain("omp-session.jsonl");
+			expect(factory.launches).toEqual([]);
+			const connected = await connectSession(studio, cookie, studioSessionId);
+			expect(connected.session).toMatchObject({ status: "ready", workspaceId: workspace.workspace.id });
 			expect(factory.launches).toEqual([
 				{
 					cwd: workspacePath,
@@ -461,6 +483,101 @@ describe("Studio RPC session supervision", () => {
 		} finally {
 			events.close();
 		}
+	});
+
+	it("removes an idle project together with its Studio sessions without touching project files", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-remove");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const events = await subscribeStudioEvents(studio, cookie);
+		try {
+			const created = await createSession(studio, cookie, workspace.workspace.id);
+			const promptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+				method: "POST",
+				headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+				body: JSON.stringify({ holderId: HOLDER_A, message: "finish before removal" }),
+			});
+			expect(promptResponse.status).toBe(202);
+			const prompt = (await promptResponse.json()) as StudioPromptResponse;
+			factory.transports[0].emit({ type: "agent_end" });
+			await events.waitFor<StudioRun>(
+				event =>
+					event.type === "run.state" &&
+					event.runId === prompt.run.id &&
+					(event.data as StudioRun).status === "completed",
+			);
+
+			const deleted = await fetch(`${studio.origin}/api/v1/workspaces/${workspace.workspace.id}`, {
+				method: "DELETE",
+				headers: { Cookie: cookie, Origin: studio.origin },
+			});
+			expect(deleted.status).toBe(204);
+			expect(factory.transports[0].stopped).toBe(true);
+			expect((await fs.stat(workspacePath)).isDirectory()).toBe(true);
+
+			const missingSession = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}`, {
+				headers: { Cookie: cookie },
+			});
+			expect(missingSession.status).toBe(404);
+		} finally {
+			events.close();
+		}
+	});
+
+	it("removes an idle project without waiting for an unresponsive child to stop", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-remove-stuck-child");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		await createSession(studio, cookie, workspace.workspace.id);
+		const stopGate = Promise.withResolvers<void>();
+		factory.transports[0].stopGate = stopGate.promise;
+
+		const deleted = await fetch(`${studio.origin}/api/v1/workspaces/${workspace.workspace.id}`, {
+			method: "DELETE",
+			headers: { Cookie: cookie, Origin: studio.origin },
+		});
+		expect(deleted.status).toBe(204);
+		expect(factory.transports[0].stopped).toBe(false);
+
+		stopGate.resolve();
+		await waitForCondition(() => factory.transports[0].stopped);
+	});
+
+	it("removes a project while its OMP child is still starting", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-remove-starting");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const created = await createSession(studio, cookie, workspace.workspace.id, HOLDER_A, false);
+		const startGate = Promise.withResolvers<void>();
+		factory.startGate = startGate.promise;
+
+		const connectRequest = fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/connect`, {
+			method: "POST",
+			headers: { Cookie: cookie, Origin: studio.origin },
+		});
+		await waitForCondition(() => factory.launches.length === 1);
+
+		const deleted = await fetch(`${studio.origin}/api/v1/workspaces/${workspace.workspace.id}`, {
+			method: "DELETE",
+			headers: { Cookie: cookie, Origin: studio.origin },
+		});
+		expect(deleted.status).toBe(204);
+
+		startGate.resolve();
+		const connectResponse = await connectRequest;
+		expect(connectResponse.status).toBe(409);
+		await waitForCondition(() => factory.transports[0]?.stopped === true);
+
+		const missingSession = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}`, {
+			headers: { Cookie: cookie },
+		});
+		expect(missingSession.status).toBe(404);
 	});
 
 	it("replays durable fixed-enum activity without disclosing a native tool payload", async () => {
@@ -678,7 +795,7 @@ describe("Studio RPC session supervision", () => {
 					event.runId === prompt.run.id &&
 					(event.data as StudioRun).status === "failed",
 			);
-			expect(failed.data).toMatchObject({ id: prompt.run.id, status: "failed" });
+			expect(failed.data).toMatchObject({ id: prompt.run.id, status: "failed", failureKind: "connection" });
 
 			const transcriptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/transcript`, {
 				headers: { Cookie: cookie },
@@ -723,6 +840,13 @@ describe("Studio RPC session supervision", () => {
 			headers: { Cookie: cookie },
 		});
 		expect(((await sessionResponse.json()) as StudioSessionResponse).session).toMatchObject({ status: "ready" });
+		const runHistoryResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/runs`, {
+			headers: { Cookie: cookie },
+		});
+		expect(runHistoryResponse.status).toBe(200);
+		expect((await runHistoryResponse.json()) as StudioRunHistoryResponse).toMatchObject({
+			runs: [expect.objectContaining({ failureKind: "connection", status: "failed" })],
+		});
 	});
 
 	it("returns a terminal session when OMP ends before prompt acceptance completes", async () => {
@@ -856,14 +980,18 @@ describe("Studio RPC session supervision", () => {
 			});
 			const prompt = (await promptResponse.json()) as StudioPromptResponse;
 			factory.transports[0].emitTranscript({ sourceId: "assistant_error", status: "failed", text: "" });
-			factory.transports[0].emit({ isError: true, type: "agent_end" });
+			factory.transports[0].emit({ failureKind: "authentication", isError: true, type: "agent_end" });
 			const failed = await events.waitFor<StudioRun>(
 				event =>
 					event.type === "run.state" &&
 					event.runId === prompt.run.id &&
 					(event.data as StudioRun).status === "failed",
 			);
-			expect(failed.data).toMatchObject({ id: prompt.run.id, status: "failed" });
+			expect(failed.data).toMatchObject({
+				failureKind: "authentication",
+				id: prompt.run.id,
+				status: "failed",
+			});
 
 			const transcriptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/transcript`, {
 				headers: { Cookie: cookie },

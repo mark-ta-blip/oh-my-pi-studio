@@ -11,8 +11,10 @@ import type {
 	StudioRpcTransportExit,
 	StudioRpcTransportFactory,
 	StudioRpcUsage,
+	StudioRunFailureKind,
 	StudioSubagent,
 } from "@oh-my-pi/omp-studio";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder } from "../modes/rpc/rpc-frame";
@@ -203,6 +205,40 @@ function toStudioSubagent(frame: Record<string, unknown>): StudioSubagent | unde
 	};
 }
 
+function classifyStudioFailureKind(message: Record<string, unknown>): StudioRunFailureKind {
+	const errorId = AIError.classifyMessage({
+		...(typeof message.errorId === "number" ? { errorId: message.errorId } : {}),
+		...(typeof message.errorMessage === "string" ? { errorMessage: message.errorMessage } : {}),
+		...(typeof message.errorStatus === "number" ? { errorStatus: message.errorStatus } : {}),
+	});
+	if (AIError.is(errorId, AIError.Flag.AuthFailed) || AIError.is(errorId, AIError.Flag.OAuthExpiry)) {
+		return "authentication";
+	}
+	if (AIError.is(errorId, AIError.Flag.UsageLimit)) return "rate_limit";
+	if (AIError.is(errorId, AIError.Flag.ContextOverflow)) return "context_limit";
+	if (AIError.is(errorId, AIError.Flag.ContentBlocked) || AIError.is(errorId, AIError.Flag.AccountPolicy)) {
+		return "policy";
+	}
+	const status = message.errorStatus;
+	if (status === 401 || status === 403) return "authentication";
+	if (status === 402 || status === 429) return "rate_limit";
+	if (AIError.is(errorId, AIError.Flag.Transient) || AIError.is(errorId, AIError.Flag.Timeout)) return "connection";
+	return "provider";
+}
+
+function studioFailureKindForFrame(frame: Record<string, unknown>): StudioRunFailureKind | undefined {
+	if (frame.type === "message_end" && isAssistantMessageError(frame) && isRecord(frame.message)) {
+		return classifyStudioFailureKind(frame.message);
+	}
+	if (frame.type !== "agent_end" || !Array.isArray(frame.messages)) return undefined;
+	for (let index = frame.messages.length - 1; index >= 0; index -= 1) {
+		const message = frame.messages[index];
+		if (!isRecord(message) || message.role !== "assistant" || message.stopReason !== "error") continue;
+		return classifyStudioFailureKind(message);
+	}
+	return undefined;
+}
+
 /** Redact a native OMP event before it leaves coding-agent for Studio's server-side supervisor. */
 export function redactStudioAgentEvent(event: Record<string, unknown>): StudioRpcAgentEvent {
 	const base: StudioRpcAgentEvent = { type: event.type as string };
@@ -210,6 +246,8 @@ export function redactStudioAgentEvent(event: Record<string, unknown>): StudioRp
 	if (typeof event.isError === "boolean") base.isError = event.isError;
 	if (typeof event.toolCallId === "string") base.toolCallId = event.toolCallId;
 	if (typeof event.toolName === "string") base.toolName = event.toolName;
+	const failureKind = studioFailureKindForFrame(event);
+	if (failureKind) base.failureKind = failureKind;
 	return base;
 }
 
@@ -379,7 +417,7 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 	#requestId = 0;
 	#subagentListeners = new Set<(subagent: StudioSubagent) => void>();
 	#toolArgumentsByCallId = new Map<string, unknown>();
-	#terminalAssistantError = false;
+	#terminalAssistantFailureKind: StudioRunFailureKind | undefined;
 	#transcriptListeners = new Set<(update: StudioRpcTranscriptUpdate) => void>();
 
 	constructor(private readonly launch: StudioRpcLaunch) {}
@@ -695,7 +733,8 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 		}
 		if (!isSessionEvent(frame)) return;
 		if (frame.type === "agent_start") this.#clearAssistantSources();
-		if (isAssistantMessageError(frame)) this.#terminalAssistantError = true;
+		const frameFailureKind = studioFailureKindForFrame(frame);
+		if (frameFailureKind) this.#terminalAssistantFailureKind = frameFailureKind;
 		this.#emitTranscriptUpdate(frame);
 		if (frame.type === "tool_execution_start" && typeof frame.toolCallId === "string") {
 			this.#trackToolArguments(frame.toolCallId, frame.args);
@@ -705,7 +744,14 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 		if (planSummary) {
 			for (const listener of this.#planListeners) listener(planSummary);
 		}
-		if (frame.type === "agent_end" && frame.isTerminal !== false && this.#terminalAssistantError) {
+		if (
+			frame.type === "agent_end" &&
+			frame.isTerminal !== false &&
+			(this.#terminalAssistantFailureKind || event.failureKind)
+		) {
+			if (event.failureKind === undefined && this.#terminalAssistantFailureKind) {
+				event.failureKind = this.#terminalAssistantFailureKind;
+			}
 			event.isError = true;
 		}
 		for (const listener of this.#eventListeners) listener(event);
@@ -755,7 +801,7 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 	#clearAssistantSources(): void {
 		this.#assistantSourceIds.clear();
 		this.#currentAssistantSourceId = undefined;
-		this.#terminalAssistantError = false;
+		this.#terminalAssistantFailureKind = undefined;
 	}
 
 	#notifyPromptFailure(): void {

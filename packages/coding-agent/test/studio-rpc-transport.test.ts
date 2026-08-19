@@ -64,6 +64,34 @@ describe("Studio RPC transport redaction", () => {
 		expect(JSON.stringify(event)).not.toContain("replace this secret value");
 	});
 
+	it("classifies a terminal provider error without exposing provider details", () => {
+		const event = redactStudioAgentEvent({
+			message: {
+				errorMessage: "Request exceeds the context window. C:\\private\\credentials.txt",
+				errorStatus: 400,
+				role: "assistant",
+				stopReason: "error",
+			},
+			type: "message_end",
+		});
+
+		expect(event).toEqual({ failureKind: "context_limit", type: "message_end" });
+		expect(JSON.stringify(event)).not.toContain("credentials.txt");
+	});
+
+	it("classifies a provider quota response as a rate limit", () => {
+		const event = redactStudioAgentEvent({
+			message: {
+				errorStatus: 429,
+				role: "assistant",
+				stopReason: "error",
+			},
+			type: "message_end",
+		});
+
+		expect(event).toEqual({ failureKind: "rate_limit", type: "message_end" });
+	});
+
 	it("extracts only text blocks from assistant message snapshots", () => {
 		const transcript = extractStudioAssistantTranscriptText({
 			assistantMessageEvent: { delta: "Visible answer", type: "text_delta" },

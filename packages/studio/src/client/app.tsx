@@ -233,6 +233,25 @@ function invalidateSessionRequestIds(requestIds: Map<string, number>): void {
 	for (const [studioSessionId, requestId] of requestIds) requestIds.set(studioSessionId, requestId + 1);
 }
 
+function invalidateRemovedSessionRequestIds(
+	requestIds: Map<string, number>,
+	studioSessionIds: ReadonlySet<string>,
+): void {
+	for (const studioSessionId of studioSessionIds) {
+		const requestId = requestIds.get(studioSessionId);
+		if (requestId !== undefined) requestIds.set(studioSessionId, requestId + 1);
+	}
+}
+
+function withoutStudioSessionEntries<T>(
+	current: Record<string, T>,
+	studioSessionIds: ReadonlySet<string>,
+): Record<string, T> {
+	const next = { ...current };
+	for (const studioSessionId of studioSessionIds) delete next[studioSessionId];
+	return next;
+}
+
 function createHolderId(): string {
 	const storageKey = "omp-studio-holder-id";
 	try {
@@ -428,6 +447,7 @@ export function App(): ReactNode {
 	const [workspacePath, setWorkspacePath] = useState("");
 	const [workspacePending, setWorkspacePending] = useState(false);
 	const [workspacePickerPending, setWorkspacePickerPending] = useState(false);
+	const [workspaceRemovalPendingId, setWorkspaceRemovalPendingId] = useState<string | null>(null);
 	const [providers, setProviders] = useState<StudioProvider[]>([]);
 	const [providerError, setProviderError] = useState<string | null>(null);
 	const [providerPending, setProviderPending] = useState<string | null>(null);
@@ -444,6 +464,7 @@ export function App(): ReactNode {
 	const [sessionProviderId, setSessionProviderId] = useState("");
 	const [sessionModelId, setSessionModelId] = useState("");
 	const [sessionPending, setSessionPending] = useState(false);
+	const [sessionConnectPendingId, setSessionConnectPendingId] = useState<string | null>(null);
 	const [selectedSessionId, setSelectedSessionId] = useState<string | null>(loadStoredSessionId);
 	const [contextPanel, setContextPanel] = useState<StudioContextPanel>("overview");
 	const [contextOpen, setContextOpen] = useState(() => !prefersOverlayPanels());
@@ -501,6 +522,9 @@ export function App(): ReactNode {
 	const changeSetRequestIdsRef = useRef(new Map<string, number>());
 	const runHistoryRequestIdsRef = useRef(new Map<string, number>());
 	const usageHistoryRequestIdsRef = useRef(new Map<string, number>());
+	const connectionAttemptedSessionIdsRef = useRef(new Set<string>());
+	const connectedSessionIdsRef = useRef(new Set<string>());
+	const connectionPromisesRef = useRef(new Map<string, Promise<boolean>>());
 	const conversationScrollFrameRef = useRef<number | undefined>(undefined);
 	const shouldAutoScrollConversationRef = useRef(true);
 	const openSetup = useCallback((): void => {
@@ -563,6 +587,66 @@ export function App(): ReactNode {
 			if (sessionListRequestIdRef.current === requestId) {
 				setSessionError(reason instanceof Error ? reason.message : "Studio could not load local sessions.");
 			}
+		}
+	}, []);
+
+	const connectSession = useCallback(async (studioSessionId: string, retry = false): Promise<boolean> => {
+		if (!retry && connectedSessionIdsRef.current.has(studioSessionId)) return true;
+		const existing = connectionPromisesRef.current.get(studioSessionId);
+		if (existing) return await existing;
+		if (!retry && connectionAttemptedSessionIdsRef.current.has(studioSessionId)) return false;
+		connectionAttemptedSessionIdsRef.current.add(studioSessionId);
+		const connection = (async (): Promise<boolean> => {
+			setSessionConnectPendingId(studioSessionId);
+			setSessionError(null);
+			const startingAtMs = Date.now();
+			setSessions(current =>
+				sortSessions(
+					current.map(session =>
+						session.id === studioSessionId
+							? { ...session, status: "starting", updatedAtMs: startingAtMs }
+							: session,
+					),
+				),
+			);
+			try {
+				const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/connect`, {
+					method: "POST",
+					signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
+				});
+				if (!response.ok) throw new Error(await responseError(response));
+				const body = (await response.json()) as StudioSessionResponse;
+				connectedSessionIdsRef.current.add(studioSessionId);
+				sessionSnapshotVersionRef.current += 1;
+				setSessions(current =>
+					sortSessions(current.map(session => (session.id === studioSessionId ? body.session : session))),
+				);
+				return true;
+			} catch (reason) {
+				connectedSessionIdsRef.current.delete(studioSessionId);
+				const failedAtMs = Date.now();
+				setSessions(current =>
+					sortSessions(
+						current.map(session =>
+							session.id === studioSessionId && session.status === "starting"
+								? { ...session, status: "failed", updatedAtMs: failedAtMs }
+								: session,
+						),
+					),
+				);
+				setSessionError(
+					reason instanceof Error ? reason.message : "Studio could not connect this session to OMP. Try again.",
+				);
+				return false;
+			} finally {
+				setSessionConnectPendingId(current => (current === studioSessionId ? null : current));
+			}
+		})();
+		connectionPromisesRef.current.set(studioSessionId, connection);
+		try {
+			return await connection;
+		} finally {
+			connectionPromisesRef.current.delete(studioSessionId);
 		}
 	}, []);
 
@@ -891,6 +975,12 @@ export function App(): ReactNode {
 	}, [selectedSessionId, sessions]);
 
 	useEffect(() => {
+		if (!bootstrap?.features.rpcSupervisor || !selectedSessionId) return;
+		if (!sessions.some(session => session.id === selectedSessionId)) return;
+		void connectSession(selectedSessionId);
+	}, [bootstrap?.features.rpcSupervisor, connectSession, selectedSessionId, sessions]);
+
+	useEffect(() => {
 		if (!setupAutoOpenedRef.current || sessions.length === 0) return;
 		setupAutoOpenedRef.current = false;
 		setSetupOpen(false);
@@ -1095,6 +1185,7 @@ export function App(): ReactNode {
 					if (parseRunState(message)) {
 						const run = message.data;
 						runStateBySessionRef.current.set(message.studioSessionId, run);
+						if (run.status === "interrupted") connectedSessionIdsRef.current.delete(message.studioSessionId);
 						sessionSnapshotVersionRef.current += 1;
 						setRunHistoryBySession(current => ({
 							...current,
@@ -1289,8 +1380,15 @@ export function App(): ReactNode {
 		() => workspaces.find(workspace => workspace.id === selectedSession?.workspaceId) ?? null,
 		[selectedSession?.workspaceId, workspaces],
 	);
+	const selectedSessionConnecting =
+		selectedSession !== null &&
+		(sessionConnectPendingId === selectedSession.id || selectedSession.status === "starting");
 	const composerBlocked =
-		promptPending || cancelPending || controlPendingId !== null || selectedActiveRun !== undefined;
+		promptPending ||
+		cancelPending ||
+		controlPendingId !== null ||
+		selectedSessionConnecting ||
+		selectedActiveRun !== undefined;
 
 	const registerWorkspacePath = async (path: string): Promise<void> => {
 		if (!path || workspacePending) return;
@@ -1344,16 +1442,79 @@ export function App(): ReactNode {
 
 	const removeWorkspace = async (workspaceId: string): Promise<void> => {
 		if (workspacePending) return;
+		const workspace = workspaces.find(current => current.id === workspaceId);
+		if (
+			!window.confirm(
+				`Remove ${workspace?.label ?? "this project"} from Studio? Its local Studio sessions and history will be removed, but project files will stay on disk.`,
+			)
+		) {
+			return;
+		}
 		setWorkspaceError(null);
 		setWorkspacePending(true);
+		setWorkspaceRemovalPendingId(workspaceId);
 		try {
-			const response = await fetch(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}`, { method: "DELETE" });
+			const response = await fetch(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}`, {
+				method: "DELETE",
+				signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
+			});
 			if (!response.ok) throw new Error(await responseError(response));
+			const removedSessionIds = new Set(
+				sessions.filter(session => session.workspaceId === workspaceId).map(session => session.id),
+			);
+			const remainingSessions = sessions.filter(session => !removedSessionIds.has(session.id));
+			const remainingWorkspaceId = workspaces.find(current => current.id !== workspaceId)?.id ?? "";
+			sessionSnapshotVersionRef.current += 1;
+			sessionListRequestIdRef.current += 1;
+			invalidateRemovedSessionRequestIds(transcriptRequestIdsRef.current, removedSessionIds);
+			invalidateRemovedSessionRequestIds(activityRequestIdsRef.current, removedSessionIds);
+			invalidateRemovedSessionRequestIds(toolDisplayRequestIdsRef.current, removedSessionIds);
+			invalidateRemovedSessionRequestIds(planRequestIdsRef.current, removedSessionIds);
+			invalidateRemovedSessionRequestIds(changeSetRequestIdsRef.current, removedSessionIds);
+			invalidateRemovedSessionRequestIds(runHistoryRequestIdsRef.current, removedSessionIds);
+			invalidateRemovedSessionRequestIds(usageHistoryRequestIdsRef.current, removedSessionIds);
+			for (const studioSessionId of removedSessionIds) {
+				connectionAttemptedSessionIdsRef.current.delete(studioSessionId);
+				connectedSessionIdsRef.current.delete(studioSessionId);
+				connectionPromisesRef.current.delete(studioSessionId);
+				runStateBySessionRef.current.delete(studioSessionId);
+			}
 			setWorkspaces(current => current.filter(workspace => workspace.id !== workspaceId));
+			setSessions(current => current.filter(session => !removedSessionIds.has(session.id)));
+			setPromptDrafts(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setTranscriptBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setTranscriptErrorsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setTranscriptLoadingBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setActivityBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setActivityErrorsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setActivityLoadingBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setToolDisplaysBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setToolDisplayErrorsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setToolDisplayLoadingBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setPlansBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setPlanErrorsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setPlanLoadingBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setChangeSetsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setChangeSetErrorsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setChangeSetLoadingBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setRunHistoryBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setRunHistoryErrorsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setRunHistoryLoadingBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setUsageHistoryBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setUsageHistoryErrorsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setUsageHistoryLoadingBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setApprovalsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setSubagentsBySession(current => withoutStudioSessionEntries(current, removedSessionIds));
+			setLeaseExpiresAtMs(current => withoutStudioSessionEntries(current, removedSessionIds));
+			if (selectedSessionId && removedSessionIds.has(selectedSessionId)) {
+				setSelectedSessionId(remainingSessions[0]?.id ?? null);
+			}
+			if (sessionWorkspaceId === workspaceId) setSessionWorkspaceId(remainingWorkspaceId);
 		} catch (reason) {
 			setWorkspaceError(reason instanceof Error ? reason.message : "Studio could not remove the workspace.");
 		} finally {
 			setWorkspacePending(false);
+			setWorkspaceRemovalPendingId(null);
 		}
 	};
 
@@ -1517,6 +1678,7 @@ export function App(): ReactNode {
 			setSelectedSessionId(body.session.id);
 			setSessionName("");
 			setSetupOpen(false);
+			void connectSession(body.session.id);
 		} catch (reason) {
 			setSessionError(reason instanceof Error ? reason.message : "Studio could not start the local OMP session.");
 		} finally {
@@ -1529,12 +1691,15 @@ export function App(): ReactNode {
 		const message = promptText.trim();
 		if (!selectedSession || !message || promptPending) return;
 		const studioSessionId = selectedSession.id;
-		if (!(await acquireControl(studioSessionId, false))) return;
 		setSessionError(null);
 		setPromptPending(true);
-		const optimisticMessageId = `local_${crypto.randomUUID().replaceAll("-", "")}`;
-		const promptedAtMs = Date.now();
+		let optimisticMessageId: string | undefined;
 		try {
+			if (!(await connectSession(studioSessionId, true))) return;
+			if (!(await acquireControl(studioSessionId, false))) return;
+			const optimisticId = `local_${crypto.randomUUID().replaceAll("-", "")}`;
+			optimisticMessageId = optimisticId;
+			const promptedAtMs = Date.now();
 			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/prompts`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
@@ -1556,7 +1721,7 @@ export function App(): ReactNode {
 			setTranscriptBySession(current => ({
 				...current,
 				[studioSessionId]: upsertStudioTranscriptMessage(current[studioSessionId] ?? [], {
-					id: optimisticMessageId,
+					id: optimisticId,
 					studioSessionId,
 					runId: body.run.id,
 					role: "user",
@@ -1572,12 +1737,14 @@ export function App(): ReactNode {
 				return next;
 			});
 		} catch (reason) {
-			setTranscriptBySession(current => ({
-				...current,
-				[studioSessionId]: (current[studioSessionId] ?? []).filter(
-					transcriptMessage => transcriptMessage.id !== optimisticMessageId,
-				),
-			}));
+			if (optimisticMessageId) {
+				setTranscriptBySession(current => ({
+					...current,
+					[studioSessionId]: (current[studioSessionId] ?? []).filter(
+						transcriptMessage => transcriptMessage.id !== optimisticMessageId,
+					),
+				}));
+			}
 			void loadSessions();
 			void loadTranscript(studioSessionId);
 			setSessionError(reason instanceof Error ? reason.message : "Studio could not send the prompt to OMP.");
@@ -1750,6 +1917,7 @@ export function App(): ReactNode {
 					activityEntries={selectedActivity}
 					approvals={selectedApprovals}
 					cancelPending={cancelPending}
+					connectionPending={selectedSessionConnecting}
 					composerBlocked={composerBlocked}
 					controlPending={controlPendingId !== null}
 					draft={promptText}
@@ -1763,6 +1931,9 @@ export function App(): ReactNode {
 					onOpenContext={openContext}
 					onOpenNavigation={openNavigation}
 					onOpenSetup={openSetup}
+					onReconnect={() => {
+						if (selectedSessionId) void connectSession(selectedSessionId, true);
+					}}
 					onScroll={(scrollHeight, scrollTop, clientHeight) => {
 						shouldAutoScrollConversationRef.current = scrollHeight - scrollTop - clientHeight < 40;
 					}}
@@ -1936,7 +2107,7 @@ export function App(): ReactNode {
 												onClick={() => void removeWorkspace(workspace.id)}
 												type="button"
 											>
-												Remove
+												{workspaceRemovalPendingId === workspace.id ? "Removing" : "Remove"}
 											</button>
 										</div>
 									))}

@@ -61,6 +61,15 @@ export type StudioRunStatus =
 	| "interrupted"
 	| "failed";
 
+/** A fixed, browser-safe category for a provider-side terminal failure. */
+export type StudioRunFailureKind =
+	| "authentication"
+	| "rate_limit"
+	| "context_limit"
+	| "connection"
+	| "policy"
+	| "provider";
+
 export interface StudioRun {
 	id: string;
 	studioSessionId: string;
@@ -69,6 +78,7 @@ export interface StudioRun {
 	startedAtMs: number;
 	endedAtMs?: number;
 	interruptedReason?: string;
+	failureKind?: StudioRunFailureKind;
 }
 
 /** A durable Studio session summary safe to return to the local browser. */
@@ -328,6 +338,7 @@ export interface StudioSubagentListResponse {
 /** Browser-safe lifecycle metadata. Native tool names, IDs, paths, arguments, and output are omitted. */
 export interface StudioAgentEvent {
 	type: string;
+	failureKind?: StudioRunFailureKind;
 	isError?: boolean;
 	isTerminal?: boolean;
 }

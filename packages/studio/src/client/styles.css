@@ -1139,6 +1139,16 @@ textarea {
 	line-height: 1.4;
 }
 
+.studio-run-failure-notice {
+	margin: 0;
+	padding: 0.52rem 0.55rem;
+	border-bottom: 1px solid #edcfc4;
+	background: #fff5f1;
+	color: #93452f;
+	font-size: 0.66rem;
+	line-height: 1.4;
+}
+
 .studio-run-history-usage {
 	display: grid;
 	grid-template-columns: repeat(3, minmax(0, 1fr));

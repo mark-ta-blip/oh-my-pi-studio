@@ -361,6 +361,7 @@ function parseStudioSessionId(pathname: string): string | null {
 function parseStudioSessionActionId(
 	pathname: string,
 	action:
+		| "connect"
 		| "lease"
 		| "prompts"
 		| "approvals"
@@ -584,23 +585,28 @@ async function handleWorkspaceCollection(request: Request, runtime: StudioRuntim
 	}
 }
 
-function handleWorkspaceItem(request: Request, workspaceId: string, runtime: StudioRuntime): Response {
+async function handleWorkspaceItem(request: Request, workspaceId: string, runtime: StudioRuntime): Promise<Response> {
 	if (request.method !== "DELETE") {
 		return errorResponse(405, "method_not_allowed", "Studio workspaces support DELETE requests at this path.");
 	}
 	if (!hasAllowedOrigin(request, runtime.origin)) {
 		return errorResponse(403, "origin_not_allowed", "The Studio request origin is not allowed.");
 	}
-	const result = runtime.store.removeWorkspace(workspaceId);
+	let result: "removed" | "not_found" | "active_run";
+	try {
+		result = await runtime.supervisor.removeWorkspace(workspaceId);
+	} catch (error) {
+		logger.warn("Studio could not stop a session during workspace removal", {
+			workspaceId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return errorResponse(502, "workspace_remove_failed", "OMP Studio could not remove this project. Try again.");
+	}
 	if (result === "not_found") {
 		return errorResponse(404, "workspace_not_found", "The requested workspace is not registered.");
 	}
-	if (result === "in_use") {
-		return errorResponse(
-			409,
-			"workspace_in_use",
-			"Remove or archive Studio sessions before removing this workspace.",
-		);
+	if (result === "active_run") {
+		return errorResponse(409, "workspace_run_active", "Stop the active OMP run before removing this project.");
 	}
 	return studioResponse(new Response(null, { status: 204 }));
 }
@@ -632,6 +638,7 @@ function supervisorErrorResponse(error: StudioRpcSupervisorError): Response {
 					error.code === "approval_not_found"
 				? 404
 				: error.code === "run_active" ||
+						error.code === "studio_session_removing" ||
 						error.code === "run_not_active" ||
 						error.code === "studio_session_model_missing" ||
 						error.code === "approval_not_active" ||
@@ -691,8 +698,7 @@ async function handleSessionCollection(request: Request, runtime: StudioRuntime)
 			studioSessionId: created.id,
 			detail: { modelId: requestBody.modelId, provider: requestBody.provider },
 		});
-		const session = await runtime.supervisor.startSession(created.id);
-		const body: StudioSessionResponse = { session };
+		const body: StudioSessionResponse = { session: created };
 		return jsonResponse(body, 201);
 	} catch (error) {
 		if (error instanceof StudioRequestError) return requestErrorResponse(error);
@@ -709,6 +715,27 @@ function handleSessionItem(request: Request, studioSessionId: string, runtime: S
 	if (!session) return errorResponse(404, "studio_session_not_found", "The requested Studio session was not found.");
 	const body: StudioSessionResponse = { session };
 	return jsonResponse(body);
+}
+
+async function handleSessionConnect(
+	request: Request,
+	studioSessionId: string,
+	runtime: StudioRuntime,
+): Promise<Response> {
+	if (request.method !== "POST") {
+		return errorResponse(405, "method_not_allowed", "Studio session connection requires a POST request.");
+	}
+	if (!hasAllowedOrigin(request, runtime.origin)) {
+		return errorResponse(403, "origin_not_allowed", "The Studio request origin is not allowed.");
+	}
+	try {
+		const session = await runtime.supervisor.startSession(studioSessionId);
+		const body: StudioSessionResponse = { session };
+		return jsonResponse(body);
+	} catch (error) {
+		if (error instanceof StudioRpcSupervisorError) return supervisorErrorResponse(error);
+		throw error;
+	}
 }
 
 async function handleSessionApprovals(
@@ -1322,9 +1349,11 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 
 					if (url.pathname === "/api/v1/workspaces") return await handleWorkspaceCollection(request, runtime);
 					const workspaceId = parseWorkspaceId(url.pathname);
-					if (workspaceId !== null) return handleWorkspaceItem(request, workspaceId, runtime);
+					if (workspaceId !== null) return await handleWorkspaceItem(request, workspaceId, runtime);
 
 					if (url.pathname === "/api/v1/sessions") return await handleSessionCollection(request, runtime);
+					const sessionConnectId = parseStudioSessionActionId(url.pathname, "connect");
+					if (sessionConnectId !== null) return await handleSessionConnect(request, sessionConnectId, runtime);
 					const sessionLeaseId = parseStudioSessionActionId(url.pathname, "lease");
 					if (sessionLeaseId !== null) return await handleSessionLease(request, sessionLeaseId, runtime);
 					const sessionPromptId = parseStudioSessionActionId(url.pathname, "prompts");

@@ -19,5 +19,6 @@
 
 ### Fixed
 
+- Fixed Studio session startup and retry feedback, provider-error recovery guidance, and removal of idle projects with their Studio-only history.
 - Fixed Studio chat stalls caused by unbounded transcript updates, stale WebSocket reconnects, and forced scrolling during streaming.
 - Fixed stale run locks and setup overlays that could leave the chat composer unusable after a desktop restart, and added bounded mutation requests with automatic state recovery.

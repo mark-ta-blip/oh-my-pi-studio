@@ -14,6 +14,7 @@ import type {
 	StudioModelSelection,
 	StudioPlanSummary,
 	StudioRun,
+	StudioRunFailureKind,
 	StudioRunStatus,
 	StudioSession,
 	StudioSessionStatus,
@@ -27,7 +28,7 @@ import type {
 	StudioWorkspace,
 } from "../protocol";
 
-const STUDIO_SCHEMA_VERSION = 7;
+const STUDIO_SCHEMA_VERSION = 8;
 const ACTIVE_RUN_STATUSES = ["starting", "running", "cancelling"] as const;
 const MAX_STUDIO_TRANSCRIPT_TEXT_LENGTH = 100_000;
 const MAX_STUDIO_ACTIVITY_ENTRIES_PER_SESSION = 500;
@@ -78,6 +79,16 @@ const STUDIO_TOOL_DISPLAY_KIND_VALUES: readonly StudioToolDisplayKind[] = [
 	"task",
 	"tool",
 ];
+function isStudioRunFailureKind(value: string | null): value is StudioRunFailureKind {
+	return (
+		value === "authentication" ||
+		value === "rate_limit" ||
+		value === "context_limit" ||
+		value === "connection" ||
+		value === "policy" ||
+		value === "provider"
+	);
+}
 
 const STUDIO_MIGRATIONS = [
 	{
@@ -267,6 +278,12 @@ const STUDIO_MIGRATIONS = [
 				ON studio_usage_history(run_id, ordinal DESC);
 		`,
 	},
+	{
+		version: 8,
+		sql: `
+			ALTER TABLE runs ADD COLUMN failure_kind TEXT;
+		`,
+	},
 ] as const;
 
 interface StudioMigrationRow {
@@ -309,6 +326,7 @@ interface StudioRunRow {
 	started_at_ms: number;
 	ended_at_ms: number | null;
 	interrupted_reason: string | null;
+	failure_kind: string | null;
 }
 
 interface LeaseRow {
@@ -410,7 +428,7 @@ export interface RegisterWorkspaceResult {
 	workspace: StudioWorkspace;
 }
 
-export type RemoveWorkspaceResult = "removed" | "not_found" | "in_use";
+export type RemoveWorkspaceResult = "removed" | "not_found" | "active_run";
 
 export interface StudioControlLease {
 	studioSessionId: string;
@@ -550,6 +568,7 @@ function toStudioRun(row: StudioRunRow): StudioRun {
 		...(row.interrupted_reason === null || !AUDIT_REASON_VALUES.has(row.interrupted_reason)
 			? {}
 			: { interruptedReason: row.interrupted_reason }),
+		...(isStudioRunFailureKind(row.failure_kind) ? { failureKind: row.failure_kind } : {}),
 	};
 }
 
@@ -945,13 +964,70 @@ export class StudioStore {
 				.query<WorkspaceRow, [string]>("SELECT * FROM workspaces WHERE id = ?")
 				.get(workspaceId);
 			if (!existing) return "not_found";
-			const linkedSession = this.#db
-				.query<{ id: string }, [string]>("SELECT id FROM studio_sessions WHERE workspace_id = ? LIMIT 1")
+			const activeRun = this.#db
+				.query<{ id: string }, [string]>(
+					`SELECT runs.id
+					 FROM runs
+					 INNER JOIN studio_sessions ON studio_sessions.id = runs.studio_session_id
+					 WHERE studio_sessions.workspace_id = ?
+					   AND runs.status IN ('starting', 'running', 'cancelling')
+					 LIMIT 1`,
+				)
 				.get(workspaceId);
-			if (linkedSession) return "in_use";
+			if (activeRun) return "active_run";
+
+			const workspaceSessionIds = "SELECT id FROM studio_sessions WHERE workspace_id = ?";
+			const workspaceRunIds = `SELECT id FROM runs WHERE studio_session_id IN (${workspaceSessionIds})`;
+			this.#db
+				.query<void, [string, string]>(
+					`DELETE FROM audit_log
+					 WHERE studio_session_id IN (${workspaceSessionIds})
+					    OR run_id IN (${workspaceRunIds})`,
+				)
+				.run(workspaceId, workspaceId);
+			this.#db.query<void, [string]>(`DELETE FROM approvals WHERE run_id IN (${workspaceRunIds})`).run(workspaceId);
+			this.#db
+				.query<void, [string]>(
+					`DELETE FROM transcript_messages WHERE studio_session_id IN (${workspaceSessionIds})`,
+				)
+				.run(workspaceId);
+			this.#db
+				.query<void, [string]>(
+					`DELETE FROM studio_activity_entries WHERE studio_session_id IN (${workspaceSessionIds})`,
+				)
+				.run(workspaceId);
+			this.#db
+				.query<void, [string]>(
+					`DELETE FROM studio_tool_displays WHERE studio_session_id IN (${workspaceSessionIds})`,
+				)
+				.run(workspaceId);
+			this.#db
+				.query<void, [string]>(
+					`DELETE FROM studio_plan_summaries WHERE studio_session_id IN (${workspaceSessionIds})`,
+				)
+				.run(workspaceId);
+			this.#db
+				.query<void, [string]>(
+					`DELETE FROM studio_usage_history WHERE studio_session_id IN (${workspaceSessionIds})`,
+				)
+				.run(workspaceId);
+			this.#db
+				.query<void, [string]>(`DELETE FROM control_leases WHERE studio_session_id IN (${workspaceSessionIds})`)
+				.run(workspaceId);
+			this.#db
+				.query<void, [string]>(`DELETE FROM runs WHERE studio_session_id IN (${workspaceSessionIds})`)
+				.run(workspaceId);
+			this.#db.query<void, [string]>("DELETE FROM studio_sessions WHERE workspace_id = ?").run(workspaceId);
 			this.#db.query<void, [string]>("DELETE FROM workspaces WHERE id = ?").run(workspaceId);
 			return "removed";
 		});
+	}
+
+	listStudioSessionIdsForWorkspace(workspaceId: string): string[] {
+		return this.#db
+			.query<{ id: string }, [string]>("SELECT id FROM studio_sessions WHERE workspace_id = ? ORDER BY id")
+			.all(workspaceId)
+			.map(row => row.id);
 	}
 
 	createStudioSession(input: CreateStudioSessionInput): StudioSession {
@@ -1067,7 +1143,7 @@ export class StudioStore {
 				.query<StudioRunRow, [string, string, StudioRunStatus, number, number]>(
 					`INSERT INTO runs (id, studio_session_id, status, rpc_protocol_version, started_at_ms)
 					 VALUES (?, ?, ?, ?, ?)
-					 RETURNING id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason`,
+					 RETURNING id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason, failure_kind`,
 				)
 				.get(id, studioSessionId, "starting", rpcProtocolVersion, now);
 			if (!row) throw new Error("Studio run insert did not return a row");
@@ -1083,7 +1159,7 @@ export class StudioStore {
 	getStudioRun(runId: string): StudioRun | undefined {
 		const row = this.#db
 			.query<StudioRunRow, [string]>(
-				"SELECT id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason FROM runs WHERE id = ?",
+				"SELECT id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason, failure_kind FROM runs WHERE id = ?",
 			)
 			.get(runId);
 		return row ? toStudioRun(row) : undefined;
@@ -1093,7 +1169,7 @@ export class StudioStore {
 		const boundedLimit = Math.min(Math.max(limit, 1), 100);
 		const rows = this.#db
 			.query<StudioRunRow, [string, number]>(
-				`SELECT id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason
+				`SELECT id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason, failure_kind
 				 FROM runs WHERE studio_session_id = ?
 				 ORDER BY started_at_ms DESC, id DESC LIMIT ?`,
 			)
@@ -1548,15 +1624,16 @@ export class StudioStore {
 		runId: string,
 		status: Exclude<StudioRunStatus, (typeof ACTIVE_RUN_STATUSES)[number]>,
 		reason?: string,
+		failureKind?: StudioRunFailureKind,
 	): StudioRun | undefined {
 		const now = Date.now();
 		const row = this.#db
-			.query<StudioRunRow, [StudioRunStatus, number, string | null, string]>(
-				`UPDATE runs SET status = ?, ended_at_ms = ?, interrupted_reason = ?
+			.query<StudioRunRow, [StudioRunStatus, number, string | null, StudioRunFailureKind | null, string]>(
+				`UPDATE runs SET status = ?, ended_at_ms = ?, interrupted_reason = ?, failure_kind = ?
 				 WHERE id = ? AND status IN ('starting', 'running', 'cancelling')
-				 RETURNING id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason`,
+				 RETURNING id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason, failure_kind`,
 			)
-			.get(status, now, reason ?? null, runId);
+			.get(status, now, reason ?? null, failureKind ?? null, runId);
 		return row ? toStudioRun(row) : this.getStudioRun(runId);
 	}
 
@@ -1700,7 +1777,7 @@ export class StudioStore {
 		const row = this.#db
 			.query<StudioRunRow, [StudioRunStatus, string]>(
 				`UPDATE runs SET status = ? WHERE id = ? AND status IN ('starting', 'running', 'cancelling')
-				 RETURNING id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason`,
+				 RETURNING id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason, failure_kind`,
 			)
 			.get(status, runId);
 		return row ? toStudioRun(row) : this.getStudioRun(runId);
@@ -1772,7 +1849,7 @@ export class StudioStore {
 	#getActiveRunForSession(studioSessionId: string): StudioRun | undefined {
 		const row = this.#db
 			.query<StudioRunRow, [string]>(
-				`SELECT id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason
+				`SELECT id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason, failure_kind
 				 FROM runs WHERE studio_session_id = ? AND status IN ('starting', 'running', 'cancelling')
 				 ORDER BY started_at_ms DESC, id DESC LIMIT 1`,
 			)

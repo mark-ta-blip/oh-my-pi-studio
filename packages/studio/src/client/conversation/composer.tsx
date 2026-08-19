@@ -4,6 +4,7 @@ import type { StudioRun } from "../../protocol";
 interface StudioComposerProps {
 	activeRun?: StudioRun;
 	cancelPending: boolean;
+	connectionPending: boolean;
 	composerBlocked: boolean;
 	controlPending: boolean;
 	draft: string;
@@ -17,6 +18,7 @@ interface StudioComposerProps {
 export function StudioComposer({
 	activeRun,
 	cancelPending,
+	connectionPending,
 	composerBlocked,
 	controlPending,
 	draft,
@@ -40,13 +42,21 @@ export function StudioComposer({
 							event.currentTarget.form?.requestSubmit();
 						}
 					}}
-					placeholder={activeRun ? "OMP is working on the current task" : "Message OMP about the next task"}
+					placeholder={
+						connectionPending
+							? "OMP is starting this session"
+							: activeRun
+								? "OMP is working on the current task"
+								: "Message OMP about the next task"
+					}
 					rows={3}
 					value={draft}
 				/>
 			</label>
 			<div className="studio-composer-footer">
-				<span>{activeRun ? "Run in progress" : "Ctrl+Enter to send"}</span>
+				<span>
+					{connectionPending ? "Connecting to OMP" : activeRun ? "Run in progress" : "Ctrl+Enter to send"}
+				</span>
 				<div>
 					{activeRun && (
 						<button
@@ -59,7 +69,7 @@ export function StudioComposer({
 						</button>
 					)}
 					<button disabled={composerBlocked || !draft.trim()} type="submit">
-						{promptPending ? "Sending" : "Send"}
+						{connectionPending ? "Starting" : promptPending ? "Sending" : "Send"}
 					</button>
 				</div>
 			</div>

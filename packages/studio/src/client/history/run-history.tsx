@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { StudioActivityEntry, StudioRun, StudioUsageHistoryEntry } from "../../protocol";
-import { activityLabel, formatCost, formatCount, formatShortTime } from "../presentation";
+import { activityLabel, formatCost, formatCount, formatShortTime, runFailureMessage } from "../presentation";
 
 const RUN_STATUS_LABELS: Record<StudioRun["status"], string> = {
 	cancelled: "Cancelled",
@@ -105,6 +105,9 @@ export function StudioRunHistory({
 								<p className="studio-recovery-notice">
 									This run was interrupted. Review its timeline before continuing.
 								</p>
+							)}
+							{selectedRun.status === "failed" && (
+								<p className="studio-run-failure-notice">{runFailureMessage(selectedRun)}</p>
 							)}
 							{selectedUsage && (
 								<dl className="studio-run-history-usage">

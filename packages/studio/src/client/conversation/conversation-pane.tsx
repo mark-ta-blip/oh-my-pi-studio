@@ -18,12 +18,14 @@ interface StudioConversationPaneProps {
 	activityEntries: StudioActivityEntry[];
 	approvals: StudioApproval[];
 	cancelPending: boolean;
+	connectionPending: boolean;
 	composerBlocked: boolean;
 	controlPending: boolean;
 	draft: string;
 	hasStreamingAssistant: boolean;
 	plan?: StudioPlanSummary;
 	onCancel(): void;
+	onReconnect(): void;
 	onDraftChange(value: string): void;
 	onOpenContext(panel: StudioContextPanel): void;
 	onOpenNavigation(): void;
@@ -47,12 +49,14 @@ export function StudioConversationPane({
 	activityEntries,
 	approvals,
 	cancelPending,
+	connectionPending,
 	composerBlocked,
 	controlPending,
 	draft,
 	hasStreamingAssistant,
 	plan,
 	onCancel,
+	onReconnect,
 	onDraftChange,
 	onOpenContext,
 	onOpenNavigation,
@@ -103,6 +107,11 @@ export function StudioConversationPane({
 					<span className={`studio-session-status studio-session-status-${selectedSession.status}`}>
 						{selectedActiveRun ? "running" : selectedSession.status}
 					</span>
+					{(connectionPending || selectedSession.status === "failed") && (
+						<button disabled={connectionPending} onClick={onReconnect} type="button">
+							{connectionPending ? "Connecting" : "Reconnect"}
+						</button>
+					)}
 					<button onClick={onOpenSetup} type="button">
 						Configure
 					</button>
@@ -133,6 +142,16 @@ export function StudioConversationPane({
 				}}
 				ref={scrollRef}
 			>
+				{connectionPending && (
+					<p className="studio-conversation-notice" role="status">
+						Starting the OMP session. Your first instruction will be available as soon as the connection is ready.
+					</p>
+				)}
+				{selectedSession.status === "failed" && !connectionPending && (
+					<p className="studio-conversation-recovery" role="status">
+						OMP could not start this session. Reconnect to try again; your project files are unchanged.
+					</p>
+				)}
 				{selectedSession.status === "interrupted" && !selectedActiveRun && (
 					<p className="studio-conversation-recovery">
 						The last run was interrupted. Review the session history before sending the next instruction.
@@ -173,6 +192,7 @@ export function StudioConversationPane({
 			<StudioComposer
 				activeRun={selectedActiveRun}
 				cancelPending={cancelPending}
+				connectionPending={connectionPending}
 				composerBlocked={composerBlocked}
 				controlPending={controlPending}
 				draft={draft}

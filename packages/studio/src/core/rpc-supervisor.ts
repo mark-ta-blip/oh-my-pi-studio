@@ -6,6 +6,7 @@ import type {
 	StudioModelSelection,
 	StudioPlanSummary,
 	StudioRun,
+	StudioRunFailureKind,
 	StudioSession,
 	StudioSubagent,
 	StudioToolDisplay,
@@ -14,7 +15,7 @@ import type {
 	StudioUsage,
 } from "../protocol";
 import { projectStudioActivityEvent, projectStudioToolDisplayKind } from "./activity-projection";
-import type { CreateStudioRunResult, StudioStore } from "./studio-store";
+import type { CreateStudioRunResult, RemoveWorkspaceResult, StudioStore } from "./studio-store";
 
 const APPROVAL_EXPIRY_MS = 5 * 60_000;
 const STUDIO_APPROVAL_REASON = "OMP requires confirmation for this tool.";
@@ -24,6 +25,7 @@ const STUDIO_TRANSCRIPT_UPDATE_INTERVAL_MS = 50;
 export type StudioRpcSupervisorErrorCode =
 	| "rpc_supervisor_unavailable"
 	| "studio_session_not_found"
+	| "studio_session_removing"
 	| "studio_session_model_missing"
 	| "studio_workspace_not_found"
 	| "rpc_start_failed"
@@ -68,6 +70,7 @@ export interface StudioRpcSessionState {
  */
 export interface StudioRpcAgentEvent {
 	type: string;
+	failureKind?: StudioRunFailureKind;
 	isError?: boolean;
 	isTerminal?: boolean;
 	toolCallId?: string;
@@ -188,6 +191,7 @@ function isAgentStart(event: StudioRpcAgentEvent): boolean {
 function toStudioAgentEvent(event: StudioRpcAgentEvent): StudioAgentEvent {
 	return {
 		type: event.type,
+		...(event.failureKind === undefined ? {} : { failureKind: event.failureKind }),
 		...(event.isError === undefined ? {} : { isError: event.isError }),
 		...(event.isTerminal === undefined ? {} : { isTerminal: event.isTerminal }),
 	};
@@ -205,6 +209,7 @@ export class StudioRpcSupervisor {
 	#events: StudioRpcSupervisorEvents;
 	#pendingApprovals = new Map<string, PendingStudioApproval>();
 	#pendingTranscriptUpdates = new Map<string, PendingStudioTranscriptUpdate>();
+	#removingStudioSessions = new Set<string>();
 	#startingSessions = new Map<string, Promise<StudioSession>>();
 	#store: StudioStore;
 	#subagentsBySession = new Map<string, Map<string, StudioSubagent>>();
@@ -224,7 +229,16 @@ export class StudioRpcSupervisor {
 		return this.#transportFactory !== undefined;
 	}
 
+	#assertSessionNotRemoving(studioSessionId: string): void {
+		if (!this.#removingStudioSessions.has(studioSessionId)) return;
+		throw new StudioRpcSupervisorError(
+			"studio_session_removing",
+			"This Studio session is being removed with its project.",
+		);
+	}
+
 	async startSession(studioSessionId: string): Promise<StudioSession> {
+		this.#assertSessionNotRemoving(studioSessionId);
 		if (this.#closed) {
 			throw new StudioRpcSupervisorError(
 				"rpc_start_failed",
@@ -260,11 +274,14 @@ export class StudioRpcSupervisor {
 	}
 
 	async prompt(studioSessionId: string, message: string): Promise<{ run: StudioRun; session: StudioSession }> {
+		this.#assertSessionNotRemoving(studioSessionId);
 		const session = await this.startSession(studioSessionId);
+		this.#assertSessionNotRemoving(studioSessionId);
 		const active = this.#activeSessions.get(studioSessionId);
 		if (!active) {
 			throw new StudioRpcSupervisorError("rpc_start_failed", "OMP Studio could not start the requested session.");
 		}
+		this.#assertSessionNotRemoving(studioSessionId);
 
 		const created = this.#store.createStudioRun(studioSessionId, active.transport.protocolVersion);
 		if (created.kind === "active") {
@@ -331,7 +348,7 @@ export class StudioRpcSupervisor {
 			}
 			const current = this.#store.getStudioRun(created.run.id);
 			if (current && ["starting", "running", "cancelling"].includes(current.status)) {
-				const failed = this.#store.finishStudioRun(created.run.id, "failed", "rpc_prompt_failed");
+				const failed = this.#store.finishStudioRun(created.run.id, "failed", "rpc_prompt_failed", "connection");
 				this.#emitToolDisplayTerminalUpdates(created.run.id, "failed");
 				this.#finishTranscriptMessages(created.run.id, "failed");
 				const readySession = this.#store.updateStudioSessionRuntime(studioSessionId, { status: "ready" });
@@ -344,6 +361,42 @@ export class StudioRpcSupervisor {
 				});
 			}
 			throw new StudioRpcSupervisorError("rpc_prompt_failed", "OMP could not accept the prompt.");
+		}
+	}
+
+	async removeWorkspace(workspaceId: string): Promise<RemoveWorkspaceResult> {
+		const studioSessionIds = this.#store.listStudioSessionIdsForWorkspace(workspaceId);
+		const startingSessions = new Map<string, Promise<StudioSession>>();
+		if (studioSessionIds.some(studioSessionId => this.#store.getStudioSession(studioSessionId)?.activeRun)) {
+			return "active_run";
+		}
+		for (const studioSessionId of studioSessionIds) this.#removingStudioSessions.add(studioSessionId);
+		try {
+			if (studioSessionIds.some(studioSessionId => this.#store.getStudioSession(studioSessionId)?.activeRun)) {
+				return "active_run";
+			}
+			for (const studioSessionId of studioSessionIds) {
+				const starting = this.#startingSessions.get(studioSessionId);
+				// A child can take up to the RPC startup timeout. Let it observe the removal
+				// marker and stop itself instead of making project removal wait for that timeout.
+				if (starting) {
+					startingSessions.set(studioSessionId, starting);
+					void starting.catch(() => undefined);
+				}
+				this.#stopSessionForWorkspaceRemoval(studioSessionId);
+			}
+			return this.#store.removeWorkspace(workspaceId);
+		} finally {
+			for (const studioSessionId of studioSessionIds) {
+				const starting = startingSessions.get(studioSessionId);
+				if (!starting) {
+					this.#removingStudioSessions.delete(studioSessionId);
+					continue;
+				}
+				// A session start that was already in flight must see this marker after
+				// workspace records are gone, otherwise it can attach stale listeners.
+				void starting.catch(() => undefined).finally(() => this.#removingStudioSessions.delete(studioSessionId));
+			}
 		}
 	}
 
@@ -501,6 +554,62 @@ export class StudioRpcSupervisor {
 		this.#store.interruptActiveRuntime("studio_shutdown");
 	}
 
+	#stopSessionForWorkspaceRemoval(studioSessionId: string): void {
+		const active = this.#activeSessions.get(studioSessionId);
+		if (active) {
+			active.onApprovalRequest();
+			active.onEvent();
+			active.onExit();
+			active.onPromptFailure();
+			active.onPromptResult();
+			active.onSubagentState();
+			active.onPlanSummary();
+			active.onTranscriptUpdate();
+			this.#activeSessions.delete(studioSessionId);
+			this.#stopTransportForWorkspaceRemoval(studioSessionId, active.transport);
+		}
+		this.#clearSessionRuntimeState(studioSessionId);
+	}
+
+	#stopTransportForWorkspaceRemoval(studioSessionId: string, transport: StudioRpcTransport): void {
+		try {
+			void transport.stop().catch(error => {
+				logger.warn("Studio transport failed while stopping after workspace removal", {
+					studioSessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		} catch (error) {
+			logger.warn("Studio transport threw while stopping for workspace removal", {
+				studioSessionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	#clearSessionRuntimeState(studioSessionId: string): void {
+		this.#subagentsBySession.delete(studioSessionId);
+		this.#usageRefreshInFlight.delete(studioSessionId);
+		for (const [approvalId, pending] of this.#pendingApprovals) {
+			if (pending.studioSessionId !== studioSessionId) continue;
+			this.#clearApprovalExpiry(approvalId);
+			this.#pendingApprovals.delete(approvalId);
+		}
+		for (const [key, pending] of this.#pendingTranscriptUpdates) {
+			if (pending.studioSessionId === studioSessionId) this.#clearPendingTranscriptUpdate(key);
+		}
+		for (const runId of this.#toolDisplayIdsByRun.keys()) {
+			if (this.#store.getStudioRun(runId)?.studioSessionId === studioSessionId) {
+				this.#toolDisplayIdsByRun.delete(runId);
+			}
+		}
+		for (const runId of this.#transcriptSourceIdsByRun.keys()) {
+			if (this.#store.getStudioRun(runId)?.studioSessionId === studioSessionId) {
+				this.#transcriptSourceIdsByRun.delete(runId);
+			}
+		}
+	}
+
 	async #startSession(studioSessionId: string): Promise<StudioSession> {
 		const factory = this.#transportFactory;
 		if (!factory) {
@@ -531,6 +640,7 @@ export class StudioRpcSupervisor {
 		this.#store.updateStudioSessionRuntime(studioSessionId, { status: "starting" });
 		let transport: StudioRpcTransport | undefined;
 		try {
+			this.#assertSessionNotRemoving(studioSessionId);
 			transport = await factory.start({
 				cwd,
 				model,
@@ -541,8 +651,10 @@ export class StudioRpcSupervisor {
 				await transport.stop();
 				throw new Error("OMP RPC protocol v2 was not negotiated.");
 			}
+			this.#assertSessionNotRemoving(studioSessionId);
 			const runtimeState = await transport.getSessionState();
 			if (!runtimeState.ompSessionId) throw new Error("OMP RPC session state did not include a session ID.");
+			this.#assertSessionNotRemoving(studioSessionId);
 			const active: ActiveStudioRpcSession = {
 				awaitingPromptAcceptance: undefined,
 				onApprovalRequest: () => {},
@@ -591,14 +703,16 @@ export class StudioRpcSupervisor {
 			return session;
 		} catch (error) {
 			if (transport) await transport.stop().catch(() => {});
-			if (this.#store.getStudioSession(studioSessionId)?.status !== "interrupted") {
-				this.#store.updateStudioSessionRuntime(studioSessionId, { status: "failed" });
+			const current = this.#store.getStudioSession(studioSessionId);
+			if (current && !this.#removingStudioSessions.has(studioSessionId)) {
+				if (current.status !== "interrupted")
+					this.#store.updateStudioSessionRuntime(studioSessionId, { status: "failed" });
+				this.#store.appendAuditEntry({
+					action: "session_start_failed",
+					studioSessionId,
+					detail: {},
+				});
 			}
-			this.#store.appendAuditEntry({
-				action: "session_start_failed",
-				studioSessionId,
-				detail: {},
-			});
 			if (error instanceof StudioRpcSupervisorError) throw error;
 			throw new StudioRpcSupervisorError("rpc_start_failed", "OMP Studio could not start the requested session.");
 		}
@@ -622,7 +736,11 @@ export class StudioRpcSupervisor {
 			if (!active.transport.resolveApproval) return;
 			void active.transport.resolveApproval(request.requestId, false).catch(() => {});
 		};
-		if (this.#closed || this.#activeSessions.get(studioSessionId) !== active) {
+		if (
+			this.#closed ||
+			this.#removingStudioSessions.has(studioSessionId) ||
+			this.#activeSessions.get(studioSessionId) !== active
+		) {
 			reject();
 			return;
 		}
@@ -726,7 +844,7 @@ export class StudioRpcSupervisor {
 	}
 
 	#handleSubagentState(studioSessionId: string, subagent: StudioSubagent): void {
-		if (this.#closed) return;
+		if (this.#closed || this.#removingStudioSessions.has(studioSessionId)) return;
 		let subagents = this.#subagentsBySession.get(studioSessionId);
 		if (!subagents) {
 			subagents = new Map();
@@ -737,7 +855,12 @@ export class StudioRpcSupervisor {
 	}
 
 	#handlePlanSummary(studioSessionId: string, active: ActiveStudioRpcSession, summary: StudioRpcPlanSummary): void {
-		if (this.#closed || this.#activeSessions.get(studioSessionId) !== active) return;
+		if (
+			this.#closed ||
+			this.#removingStudioSessions.has(studioSessionId) ||
+			this.#activeSessions.get(studioSessionId) !== active
+		)
+			return;
 		const run = this.#store.getStudioSession(studioSessionId)?.activeRun;
 		if (!run) return;
 		try {
@@ -861,7 +984,12 @@ export class StudioRpcSupervisor {
 	}
 
 	#handlePromptFailure(studioSessionId: string, active: ActiveStudioRpcSession): void {
-		if (this.#closed || this.#activeSessions.get(studioSessionId) !== active) return;
+		if (
+			this.#closed ||
+			this.#removingStudioSessions.has(studioSessionId) ||
+			this.#activeSessions.get(studioSessionId) !== active
+		)
+			return;
 		if (active.awaitingPromptAcceptance) {
 			active.awaitingPromptAcceptance.promptFailure = true;
 			return;
@@ -871,7 +999,7 @@ export class StudioRpcSupervisor {
 		if (!run || run.status === "cancelling") return;
 
 		this.#interruptRunApprovals(run.id, "rpc_prompt_failed");
-		const failed = this.#store.finishStudioRun(run.id, "failed", "rpc_prompt_failed");
+		const failed = this.#store.finishStudioRun(run.id, "failed", "rpc_prompt_failed", "connection");
 		if (!failed) return;
 		this.#emitToolDisplayTerminalUpdates(run.id, "failed");
 		this.#finishTranscriptMessages(run.id, "failed");
@@ -886,7 +1014,13 @@ export class StudioRpcSupervisor {
 	}
 
 	#handlePromptResult(studioSessionId: string, active: ActiveStudioRpcSession, result: StudioRpcPromptResult): void {
-		if (this.#closed || this.#activeSessions.get(studioSessionId) !== active || result.agentInvoked) return;
+		if (
+			this.#closed ||
+			this.#removingStudioSessions.has(studioSessionId) ||
+			this.#activeSessions.get(studioSessionId) !== active ||
+			result.agentInvoked
+		)
+			return;
 		if (active.awaitingPromptAcceptance) {
 			active.awaitingPromptAcceptance.promptResult = result;
 			return;
@@ -915,7 +1049,12 @@ export class StudioRpcSupervisor {
 		active: ActiveStudioRpcSession,
 		update: StudioRpcTranscriptUpdate,
 	): void {
-		if (this.#closed || this.#activeSessions.get(studioSessionId) !== active) return;
+		if (
+			this.#closed ||
+			this.#removingStudioSessions.has(studioSessionId) ||
+			this.#activeSessions.get(studioSessionId) !== active
+		)
+			return;
 		if (active.awaitingPromptAcceptance) {
 			active.awaitingPromptAcceptance.transcriptUpdates.push(update);
 			return;
@@ -926,6 +1065,7 @@ export class StudioRpcSupervisor {
 	}
 
 	#persistTranscriptUpdate(studioSessionId: string, runId: string, update: StudioRpcTranscriptUpdate): void {
+		if (this.#removingStudioSessions.has(studioSessionId)) return;
 		try {
 			const message = this.#store.upsertStudioAssistantTranscriptMessage({
 				studioSessionId,
@@ -978,7 +1118,7 @@ export class StudioRpcSupervisor {
 	}
 
 	#handleAgentEvent(studioSessionId: string, event: StudioRpcAgentEvent): void {
-		if (this.#closed) return;
+		if (this.#closed || this.#removingStudioSessions.has(studioSessionId)) return;
 		const session = this.#store.getStudioSession(studioSessionId);
 		const run = session?.activeRun;
 		if (!session || !run) return;
@@ -1014,7 +1154,12 @@ export class StudioRpcSupervisor {
 		const reason =
 			status === "cancelled" ? "run_cancelled" : status === "failed" ? "rpc_agent_failed" : "run_completed";
 		this.#interruptRunApprovals(run.id, reason);
-		const completed = this.#store.finishStudioRun(run.id, status);
+		const completed = this.#store.finishStudioRun(
+			run.id,
+			status,
+			undefined,
+			status === "failed" ? (event.failureKind ?? "provider") : undefined,
+		);
 		this.#emitToolDisplayTerminalUpdates(run.id, status);
 		this.#finishTranscriptMessages(
 			run.id,
