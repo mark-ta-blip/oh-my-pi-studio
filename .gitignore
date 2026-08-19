@@ -50,8 +50,10 @@ packages/ai/test/.temp-images/
 .opencode/
 .worktrees/
 .worktree/
-compaction-results/
-changes/
+/compaction-results/
+# Scratch agent output at the repo root only; `changes/` unanchored also swallowed
+# source directories such as packages/studio/src/client/changes/.
+/changes/
 __pycache__/
 
 # Scratch files
