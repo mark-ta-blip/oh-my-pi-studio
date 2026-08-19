@@ -1,16 +1,19 @@
-import { Menu, nativeImage, Tray } from "electron";
+import { Menu, type NativeImage, nativeImage, Tray } from "electron";
 import type { WindowManager } from "./window-manager";
 
-function createTrayIcon() {
-	const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect width="16" height="16" rx="3" fill="#183f38"/><path fill="#fff" d="M4 4h2v8H4zm3 0h2v5H7zm3 0h2v8h-2z"/></svg>`;
-	return nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`);
+function createTrayIcon(iconPath: string): NativeImage | undefined {
+	const icon = nativeImage.createFromPath(iconPath);
+	if (!icon.isEmpty()) return icon;
+	return undefined;
 }
 
 export class TrayManager {
-	#tray: Tray;
+	#tray: Tray | undefined;
 
-	constructor(windowManager: WindowManager, quit: () => void) {
-		this.#tray = new Tray(createTrayIcon());
+	constructor(windowManager: WindowManager, quit: () => void, iconPath: string) {
+		const icon = createTrayIcon(iconPath);
+		if (!icon) return;
+		this.#tray = new Tray(icon);
 		this.#tray.setToolTip("OMP Studio");
 		this.#tray.setContextMenu(
 			Menu.buildFromTemplate([
@@ -24,6 +27,6 @@ export class TrayManager {
 	}
 
 	destroy(): void {
-		this.#tray.destroy();
+		this.#tray?.destroy();
 	}
 }

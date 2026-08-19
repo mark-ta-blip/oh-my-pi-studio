@@ -4,6 +4,12 @@
 
 ### Added
 
+- Added a browser-safe, durable run activity timeline for the Studio workbench.
+- Added the responsive Studio workbench with modular navigation, conversation,
+  inspector, composer, tool cards, approval controls, subagent summaries, and
+  plan presentation.
+- Added bounded server-projected change review, session search, durable run and
+  usage history, and interrupted-session recovery without automatic replay.
 - Added the local single-user OMP Studio scaffold.
 - Added SQLite-backed workspace registration, persistent control-lease primitives, and the Phase 2 workspace ledger UI.
 - Added OMP-native provider discovery and OAuth/API-key onboarding with redacted authenticated event progress.

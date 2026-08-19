@@ -3,6 +3,7 @@ import type {
 	StudioRpcAgentEvent,
 	StudioRpcApprovalRequest,
 	StudioRpcLaunch,
+	StudioRpcPlanSummary,
 	StudioRpcPromptResult,
 	StudioRpcSessionState,
 	StudioRpcTranscriptUpdate,
@@ -22,6 +23,8 @@ import { resolveOmpCommandInvocation } from "../task/omp-command";
 const RPC_START_TIMEOUT_MS = 30_000;
 const MAX_TRACKED_TOOL_CALLS = 256;
 const MAX_STUDIO_TRANSCRIPT_TEXT_LENGTH = 64 * 1024;
+const MAX_STUDIO_PLAN_PHASES = 512;
+const MAX_STUDIO_PLAN_TASKS = 4_096;
 const STUDIO_APPROVAL_REASON = "OMP requires confirmation for this tool.";
 
 const SESSION_EVENT_TYPES = new Set([
@@ -200,7 +203,7 @@ function toStudioSubagent(frame: Record<string, unknown>): StudioSubagent | unde
 	};
 }
 
-/** Redact a native OMP event before it crosses into Studio's browser protocol. */
+/** Redact a native OMP event before it leaves coding-agent for Studio's server-side supervisor. */
 export function redactStudioAgentEvent(event: Record<string, unknown>): StudioRpcAgentEvent {
 	const base: StudioRpcAgentEvent = { type: event.type as string };
 	if (typeof event.isTerminal === "boolean") base.isTerminal = event.isTerminal;
@@ -245,6 +248,59 @@ export function studioAssistantMessageKeys(message: Record<string, unknown>): st
 function isAssistantMessageError(frame: Record<string, unknown>): boolean {
 	if (frame.type !== "message_end" || !isRecord(frame.message)) return false;
 	return frame.message.role === "assistant" && frame.message.stopReason === "error";
+}
+
+/** Reduce a native todo result to bounded counters; task descriptions stay server-side. */
+export function extractStudioPlanSummary(event: Record<string, unknown>): StudioRpcPlanSummary | undefined {
+	if (event.type !== "tool_execution_end" || event.toolName !== "todo" || event.isError === true) return undefined;
+	const result = isRecord(event.result) ? event.result : undefined;
+	const details = result && isRecord(result.details) ? result.details : result;
+	const phases = details?.phases;
+	if (!Array.isArray(phases)) return undefined;
+	let totalTaskCount = 0;
+	let pendingTaskCount = 0;
+	let inProgressTaskCount = 0;
+	let completedTaskCount = 0;
+	let blockedTaskCount = 0;
+	let abandonedTaskCount = 0;
+	let inspectedTaskCount = 0;
+	for (const phase of phases.slice(0, MAX_STUDIO_PLAN_PHASES)) {
+		if (!isRecord(phase) || !Array.isArray(phase.tasks)) continue;
+		for (const task of phase.tasks) {
+			if (inspectedTaskCount >= MAX_STUDIO_PLAN_TASKS) break;
+			inspectedTaskCount += 1;
+			if (!isRecord(task) || typeof task.status !== "string") continue;
+			totalTaskCount += 1;
+			switch (task.status) {
+				case "pending":
+					pendingTaskCount += 1;
+					break;
+				case "in_progress":
+					inProgressTaskCount += 1;
+					break;
+				case "completed":
+					completedTaskCount += 1;
+					break;
+				case "blocked":
+					blockedTaskCount += 1;
+					break;
+				case "abandoned":
+					abandonedTaskCount += 1;
+					break;
+				default:
+					totalTaskCount -= 1;
+			}
+		}
+		if (inspectedTaskCount >= MAX_STUDIO_PLAN_TASKS) break;
+	}
+	return {
+		totalTaskCount,
+		pendingTaskCount,
+		inProgressTaskCount,
+		completedTaskCount,
+		blockedTaskCount,
+		abandonedTaskCount,
+	};
 }
 
 function canonicalizeToolArguments(value: unknown, ancestors = new Set<object>()): unknown {
@@ -314,6 +370,7 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 	#nextAssistantSourceId = 0;
 	#pendingApprovals = new Map<string, StudioRpcApprovalRequest>();
 	#pendingPromptResults = new Map<string, StudioRpcPromptResult>();
+	#planListeners = new Set<(summary: StudioRpcPlanSummary) => void>();
 	#pendingRequests = new Map<string, PendingRequest>();
 	#promptFailureListeners = new Set<() => void>();
 	#promptResultListeners = new Set<(result: StudioRpcPromptResult) => void>();
@@ -509,6 +566,11 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 		return () => this.#promptResultListeners.delete(listener);
 	}
 
+	onPlanSummary(listener: (summary: StudioRpcPlanSummary) => void): () => void {
+		this.#planListeners.add(listener);
+		return () => this.#planListeners.delete(listener);
+	}
+
 	onSubagentState(listener: (subagent: StudioSubagent) => void): () => void {
 		this.#subagentListeners.add(listener);
 		return () => this.#subagentListeners.delete(listener);
@@ -639,6 +701,10 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 			this.#trackToolArguments(frame.toolCallId, frame.args);
 		}
 		const event = redactStudioAgentEvent(frame);
+		const planSummary = extractStudioPlanSummary(frame);
+		if (planSummary) {
+			for (const listener of this.#planListeners) listener(planSummary);
+		}
 		if (frame.type === "agent_end" && frame.isTerminal !== false && this.#terminalAssistantError) {
 			event.isError = true;
 		}

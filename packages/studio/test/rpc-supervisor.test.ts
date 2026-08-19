@@ -3,10 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import type { StudioChangeReviewAdapter } from "../src/core/change-review";
 import type {
 	StudioRpcAgentEvent,
 	StudioRpcApprovalRequest,
 	StudioRpcLaunch,
+	StudioRpcPlanSummary,
 	StudioRpcPromptResult,
 	StudioRpcSessionState,
 	StudioRpcTranscriptUpdate,
@@ -16,19 +18,29 @@ import type {
 	StudioRpcUsage,
 } from "../src/core/rpc-supervisor";
 import type {
+	StudioActivityEntry,
+	StudioActivityListResponse,
+	StudioAgentEvent,
 	StudioApproval,
 	StudioApprovalListResponse,
 	StudioAuditListResponse,
+	StudioChangeSetResponse,
 	StudioEventEnvelope,
+	StudioPlanSummary,
+	StudioPlanSummaryResponse,
 	StudioPromptResponse,
 	StudioRun,
+	StudioRunHistoryResponse,
 	StudioSession,
 	StudioSessionResponse,
 	StudioSubagent,
 	StudioSubagentListResponse,
+	StudioToolDisplay,
+	StudioToolDisplayListResponse,
 	StudioTranscriptMessage,
 	StudioTranscriptResponse,
 	StudioUsage,
+	StudioUsageHistoryResponse,
 	StudioWorkspaceResponse,
 } from "../src/protocol";
 import { type StudioServer, startStudioServer } from "../src/server";
@@ -49,6 +61,7 @@ class FakeStudioRpcTransport implements StudioRpcTransport {
 	#exitListeners = new Set<(exit: StudioRpcTransportExit) => void>();
 	#promptFailureListeners = new Set<() => void>();
 	#promptResultListeners = new Set<(result: StudioRpcPromptResult) => void>();
+	#planListeners = new Set<(summary: StudioRpcPlanSummary) => void>();
 	#subagentListeners = new Set<(subagent: StudioSubagent) => void>();
 	#transcriptListeners = new Set<(update: StudioRpcTranscriptUpdate) => void>();
 
@@ -110,6 +123,11 @@ class FakeStudioRpcTransport implements StudioRpcTransport {
 		return () => this.#promptResultListeners.delete(listener);
 	}
 
+	onPlanSummary(listener: (summary: StudioRpcPlanSummary) => void): () => void {
+		this.#planListeners.add(listener);
+		return () => this.#planListeners.delete(listener);
+	}
+
 	onSubagentState(listener: (subagent: StudioSubagent) => void): () => void {
 		this.#subagentListeners.add(listener);
 		return () => this.#subagentListeners.delete(listener);
@@ -154,6 +172,10 @@ class FakeStudioRpcTransport implements StudioRpcTransport {
 		for (const listener of this.#promptResultListeners) listener({ agentInvoked });
 	}
 
+	emitPlan(summary: StudioRpcPlanSummary): void {
+		for (const listener of this.#planListeners) listener(summary);
+	}
+
 	emitSubagent(subagent: StudioSubagent): void {
 		for (const listener of this.#subagentListeners) listener(subagent);
 	}
@@ -189,11 +211,12 @@ interface TestStudio {
 	studio: StudioServer;
 }
 
-async function startTestStudio(): Promise<TestStudio> {
+async function startTestStudio(changeReviewAdapter?: StudioChangeReviewAdapter): Promise<TestStudio> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-studio-rpc-test-"));
 	tempDirs.push(root);
 	const factory = new FakeStudioRpcTransportFactory();
 	const studio = await startStudioServer({
+		changeReviewAdapter,
 		dbPath: path.join(root, "studio.db"),
 		port: 0,
 		rpcTransportFactory: factory,
@@ -391,12 +414,12 @@ describe("Studio RPC session supervision", () => {
 			expect(factory.transports[0].prompts).toEqual(["first prompt"]);
 
 			factory.transports[0].emit({ isTerminal: false, type: "agent_end" });
-			const nonTerminal = await events.waitFor<StudioRpcAgentEvent>(
+			const nonTerminal = await events.waitFor<StudioAgentEvent>(
 				event =>
 					event.type === "agent.event" &&
 					event.runId === prompt.run.id &&
-					(event.data as StudioRpcAgentEvent).type === "agent_end" &&
-					(event.data as StudioRpcAgentEvent).isTerminal === false,
+					(event.data as StudioAgentEvent).type === "agent_end" &&
+					(event.data as StudioAgentEvent).isTerminal === false,
 			);
 			expect(nonTerminal.data).toEqual({ isTerminal: false, type: "agent_end" });
 			const whileContinuing = await fetch(`${studio.origin}/api/v1/sessions/${studioSessionId}`, {
@@ -435,6 +458,68 @@ describe("Studio RPC session supervision", () => {
 					(event.data as StudioRun).status === "cancelled",
 			);
 			expect(cancelled.data).toMatchObject({ id: second.run.id, status: "cancelled" });
+		} finally {
+			events.close();
+		}
+	});
+
+	it("replays durable fixed-enum activity without disclosing a native tool payload", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-activity");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const events = await subscribeStudioEvents(studio, cookie);
+		try {
+			const created = await createSession(studio, cookie, workspace.workspace.id);
+			const promptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+				method: "POST",
+				headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+				body: JSON.stringify({ holderId: HOLDER_A, message: "Inspect the worktree." }),
+			});
+			expect(promptResponse.status).toBe(202);
+			const prompt = (await promptResponse.json()) as StudioPromptResponse;
+			const rawToolEvent = {
+				args: {
+					command: "type C:\\private\\credentials.txt",
+					path: "C:\\private\\credentials.txt",
+				},
+				result: { output: "private command output" },
+				toolCallId: "call_private_tool",
+				toolName: "bash",
+				type: "tool_execution_start",
+			} as unknown as StudioRpcAgentEvent;
+			factory.transports[0].emit(rawToolEvent);
+
+			const live = await events.waitFor<StudioActivityEntry>(
+				event => event.type === "activity.updated" && event.runId === prompt.run.id,
+			);
+			expect(live.data).toMatchObject({
+				id: expect.stringMatching(/^act_[a-f0-9]{32}$/),
+				runId: prompt.run.id,
+				status: "running",
+				studioSessionId: created.session.id,
+				subject: "command",
+			});
+			expect(JSON.stringify(live.data)).not.toContain("bash");
+			expect(JSON.stringify(live.data)).not.toContain("credentials.txt");
+			expect(JSON.stringify(live.data)).not.toContain("private command output");
+			const browserEvent = await events.waitFor<StudioAgentEvent>(
+				event => event.type === "agent.event" && event.runId === prompt.run.id,
+			);
+			expect(browserEvent.data).toEqual({ type: "tool_execution_start" });
+			expect(JSON.stringify(browserEvent.data)).not.toContain("bash");
+			expect(JSON.stringify(browserEvent.data)).not.toContain("call_private_tool");
+
+			const snapshotResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/activity`, {
+				headers: { Cookie: cookie },
+			});
+			expect(snapshotResponse.status).toBe(200);
+			const snapshot = (await snapshotResponse.json()) as StudioActivityListResponse;
+			expect(snapshot.entries).toEqual([live.data]);
+			expect(JSON.stringify(snapshot)).not.toContain("call_private_tool");
+			expect(JSON.stringify(snapshot)).not.toContain("credentials.txt");
+			expect(JSON.stringify(snapshot)).not.toContain("private command output");
 		} finally {
 			events.close();
 		}
@@ -928,6 +1013,22 @@ describe("Studio RPC session supervision", () => {
 				event => event.type === "usage.updated" && event.studioSessionId === created.session.id,
 			);
 			expect(usageEvent.data).toMatchObject({ cost: 0.0123, totalTokens: 65, toolCalls: 2 });
+			const runHistoryResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/runs`, {
+				headers: { Cookie: cookie },
+			});
+			expect(runHistoryResponse.status).toBe(200);
+			const runHistory = (await runHistoryResponse.json()) as StudioRunHistoryResponse;
+			expect(runHistory.runs[0]).toMatchObject({ id: prompt.run.id, status: "running" });
+			const usageHistoryResponse = await fetch(
+				`${studio.origin}/api/v1/sessions/${created.session.id}/usage-history`,
+				{ headers: { Cookie: cookie } },
+			);
+			expect(usageHistoryResponse.status).toBe(200);
+			const usageHistory = (await usageHistoryResponse.json()) as StudioUsageHistoryResponse;
+			expect(usageHistory.entries[0]).toMatchObject({
+				runId: prompt.run.id,
+				usage: { cost: 0.0123, totalTokens: 65 },
+			});
 		} finally {
 			events.close();
 		}
@@ -1018,5 +1119,160 @@ describe("Studio RPC session supervision", () => {
 		expect(factory.transports[1].approvalDecisions).toEqual([
 			{ approved: false, requestId: interruptedRequest.requestId },
 		]);
+	});
+});
+
+describe("Studio browser-safe agent observability", () => {
+	it("resolves a registered workspace server-side and returns only the safe change projection", async () => {
+		const requestedWorkspacePaths: string[] = [];
+		const changeReviewAdapter: StudioChangeReviewAdapter = {
+			async getChangeSet({ workspacePath }) {
+				requestedWorkspacePaths.push(workspacePath);
+				return {
+					additions: 1,
+					deletions: 0,
+					fileCount: 1,
+					files: [
+						{
+							additions: 1,
+							binary: false,
+							deletions: 0,
+							hunks: [
+								{
+									lines: [{ kind: "addition", text: "const visible = true;" }],
+									newLineCount: 1,
+									newStart: 1,
+									oldLineCount: 0,
+									oldStart: 0,
+									truncated: false,
+								},
+							],
+							path: "src/visible.ts",
+							previewOmitted: false,
+							previewTruncated: false,
+							staged: false,
+							status: "modified",
+							untracked: false,
+							unstaged: true,
+						},
+					],
+					generatedAtMs: 123,
+					stagedFileCount: 0,
+					truncated: false,
+					untrackedFileCount: 0,
+					unstagedFileCount: 1,
+				};
+			},
+		};
+		const { root, studio } = await startTestStudio(changeReviewAdapter);
+		const workspacePath = path.join(root, "workspace-change-review");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const created = await createSession(studio, cookie, workspace.workspace.id);
+
+		const response = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/changes`, {
+			headers: { Cookie: cookie },
+		});
+
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as StudioChangeSetResponse;
+		expect(requestedWorkspacePaths).toEqual([workspacePath]);
+		expect(body).toMatchObject({
+			changeSet: {
+				fileCount: 1,
+				files: [{ path: "src/visible.ts" }],
+			},
+		});
+		expect(JSON.stringify(body)).not.toContain(workspacePath);
+		expect(JSON.stringify(body)).not.toContain("omp-session-alpha");
+	});
+
+	it("publishes fixed tool cards and plan totals without raw native tool or todo data", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-observability");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const events = await subscribeStudioEvents(studio, cookie);
+		try {
+			const created = await createSession(studio, cookie, workspace.workspace.id);
+			const promptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+				method: "POST",
+				headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+				body: JSON.stringify({ holderId: HOLDER_A, message: "inspect safe observability" }),
+			});
+			expect(promptResponse.status).toBe(202);
+			const prompt = (await promptResponse.json()) as StudioPromptResponse;
+			const transport = factory.transports[0];
+			const rawToolStart = {
+				args: { command: "type C:\\private\\credentials.txt", path: "C:\\private\\credentials.txt" },
+				toolCallId: "native-tool-call-private",
+				toolName: "write",
+				type: "tool_execution_start",
+			} as unknown as StudioRpcAgentEvent;
+			transport.emit(rawToolStart);
+			const started = await events.waitFor<StudioToolDisplay>(
+				event => event.type === "tool.display_updated" && event.runId === prompt.run.id,
+			);
+			expect(started.data).toMatchObject({ kind: "file_write", status: "running" });
+			expect(Object.keys(started.data).sort().join(",")).toBe(
+				"id,kind,runId,startedAtMs,status,studioSessionId,updatedAtMs",
+			);
+			expect(JSON.stringify(started)).not.toContain("credentials.txt");
+			expect(JSON.stringify(started)).not.toContain("native-tool-call-private");
+
+			transport.emit({
+				isError: true,
+				result: { output: "replace this secret value" },
+				toolCallId: "native-tool-call-private",
+				toolName: "write",
+				type: "tool_execution_end",
+			} as unknown as StudioRpcAgentEvent);
+			const ended = await events.waitFor<StudioToolDisplay>(
+				event =>
+					event.type === "tool.display_updated" &&
+					(event.data as { status?: unknown }).status === "failed" &&
+					event.runId === prompt.run.id,
+			);
+			expect(ended.data).toMatchObject({ id: started.data.id, status: "failed" });
+			expect(JSON.stringify(ended)).not.toContain("replace this secret value");
+
+			const toolCardsResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/tools`, {
+				headers: { Cookie: cookie },
+			});
+			expect(toolCardsResponse.status).toBe(200);
+			const toolCards = (await toolCardsResponse.json()) as StudioToolDisplayListResponse;
+			expect(toolCards.cards).toEqual([ended.data]);
+
+			const unsafePlan = {
+				abandonedTaskCount: 1,
+				blockedTaskCount: 1,
+				completedTaskCount: 4,
+				inProgressTaskCount: 2,
+				pendingTaskCount: 3,
+				taskText: "replace this secret value in C:\\private\\credentials.txt",
+				totalTaskCount: 11,
+			} as unknown as StudioRpcPlanSummary;
+			transport.emitPlan(unsafePlan);
+			const planEvent = await events.waitFor<StudioPlanSummary>(
+				event => event.type === "plan.updated" && event.runId === prompt.run.id,
+			);
+			expect(planEvent.data).toMatchObject({ completedTaskCount: 4, totalTaskCount: 11 });
+			expect(Object.keys(planEvent.data).sort().join(",")).toBe(
+				"abandonedTaskCount,blockedTaskCount,completedTaskCount,inProgressTaskCount,pendingTaskCount,runId,studioSessionId,totalTaskCount,updatedAtMs",
+			);
+			expect(JSON.stringify(planEvent)).not.toContain("credentials.txt");
+			expect(JSON.stringify(planEvent)).not.toContain("replace this secret value");
+
+			const planResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/plan`, {
+				headers: { Cookie: cookie },
+			});
+			expect(planResponse.status).toBe(200);
+			const plan = (await planResponse.json()) as StudioPlanSummaryResponse;
+			expect(plan.plan).toEqual(planEvent.data);
+		} finally {
+			events.close();
+		}
 	});
 });

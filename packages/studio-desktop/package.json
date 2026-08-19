@@ -10,8 +10,9 @@
 	"main": "./dist/main/index.js",
 	"scripts": {
 		"build": "bun run build:app",
-		"build:app": "bun scripts/build.ts",
+		"build:app": "bun run assets:generate && bun scripts/build.ts",
 		"build:server": "bun scripts/build-server.ts",
+		"assets:generate": "bun scripts/generate-assets.ts",
 		"check": "biome check . && bun run check:types",
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"desktop:dev": "bun run build:app && electron .",
@@ -20,6 +21,7 @@
 		"dist:mac": "bun run build:server -- --platform=darwin && bun run build:app && electron-builder --mac",
 		"dist:win": "bun run build:server -- --platform=win32 && bun run build:app && electron-builder --win",
 		"lint": "biome lint .",
+		"test": "bun test",
 		"fmt": "biome format --write ."
 	},
 	"dependencies": {

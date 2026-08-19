@@ -10,6 +10,12 @@ export interface StudioFeatures {
 	approvalControls: boolean;
 	subagentVisibility: boolean;
 	usageSummary: boolean;
+	activityTimeline: boolean;
+	toolCards: boolean;
+	planSummary: boolean;
+	changeReview: boolean;
+	runHistory: boolean;
+	usageHistory: boolean;
 	auditReview: boolean;
 }
 
@@ -117,8 +123,154 @@ export interface StudioTranscriptResponse {
 	messages: StudioTranscriptMessage[];
 }
 
+/** A fixed, browser-safe category for one durable Studio run activity event. */
+export type StudioActivitySubject =
+	| "agent"
+	| "command"
+	| "file_read"
+	| "file_write"
+	| "file_search"
+	| "web"
+	| "task"
+	| "context"
+	| "retry"
+	| "tool"
+	| "system";
+
+/** The rendered outcome of a Studio activity event. */
+export type StudioActivityStatus = "running" | "completed" | "failed" | "cancelled";
+
+/**
+ * Durable browser-safe activity. Native tool names, arguments, output, paths,
+ * provider payloads, and other raw OMP fields never appear in this shape.
+ */
+export interface StudioActivityEntry {
+	id: string;
+	studioSessionId: string;
+	runId: string;
+	subject: StudioActivitySubject;
+	status: StudioActivityStatus;
+	occurredAtMs: number;
+}
+
+export interface StudioActivityListResponse {
+	entries: StudioActivityEntry[];
+}
+
+/** A browser-safe, fixed category for one projected OMP tool operation. */
+export type StudioToolDisplayKind = "command" | "file_read" | "file_write" | "file_search" | "web" | "task" | "tool";
+
+/** Tool-card lifecycle mirrors the only outcomes Studio may disclose. */
+export type StudioToolDisplayStatus = StudioActivityStatus;
+
+interface StudioToolDisplayBase<TKind extends StudioToolDisplayKind> {
+	id: string;
+	studioSessionId: string;
+	runId: string;
+	kind: TKind;
+	status: StudioToolDisplayStatus;
+	startedAtMs: number;
+	updatedAtMs: number;
+}
+
+/**
+ * A server-projected tool card. The discriminant carries a fixed operation
+ * family only; native tool names, arguments, output, and paths are absent.
+ */
+export type StudioToolDisplay =
+	| StudioToolDisplayBase<"command">
+	| StudioToolDisplayBase<"file_read">
+	| StudioToolDisplayBase<"file_write">
+	| StudioToolDisplayBase<"file_search">
+	| StudioToolDisplayBase<"web">
+	| StudioToolDisplayBase<"task">
+	| StudioToolDisplayBase<"tool">;
+
+export interface StudioToolDisplayListResponse {
+	cards: StudioToolDisplay[];
+}
+
+/**
+ * Aggregate plan progress. Task descriptions and blockers remain inside the
+ * OMP session, while fixed counters let the workbench show current progress.
+ */
+export interface StudioPlanSummary {
+	studioSessionId: string;
+	runId: string;
+	totalTaskCount: number;
+	pendingTaskCount: number;
+	inProgressTaskCount: number;
+	completedTaskCount: number;
+	blockedTaskCount: number;
+	abandonedTaskCount: number;
+	updatedAtMs: number;
+}
+
+export interface StudioPlanSummaryResponse {
+	plan?: StudioPlanSummary;
+}
+
+/** The only Git change states that may be rendered by the Studio browser. */
+export type StudioChangeStatus = "added" | "modified" | "deleted" | "renamed" | "untracked" | "conflicted";
+
+/** A bounded line in a server-projected diff preview. */
+export interface StudioChangePreviewLine {
+	kind: "context" | "addition" | "deletion";
+	text: string;
+}
+
+/** Numeric hunk coordinates plus a bounded, redacted preview. */
+export interface StudioChangePreviewHunk {
+	oldStart: number;
+	oldLineCount: number;
+	newStart: number;
+	newLineCount: number;
+	lines: StudioChangePreviewLine[];
+	truncated: boolean;
+}
+
+/**
+ * A project-relative file change. Absolute paths, raw Git output, and
+ * unrestricted file content never cross this browser boundary.
+ */
+export interface StudioChangeFile {
+	path: string;
+	status: StudioChangeStatus;
+	staged: boolean;
+	unstaged: boolean;
+	untracked: boolean;
+	binary: boolean;
+	additions: number;
+	deletions: number;
+	previewOmitted: boolean;
+	previewTruncated: boolean;
+	hunks: StudioChangePreviewHunk[];
+}
+
+/** A fresh, non-persisted review snapshot for one registered workspace. */
+export interface StudioChangeSet {
+	generatedAtMs: number;
+	fileCount: number;
+	stagedFileCount: number;
+	unstagedFileCount: number;
+	untrackedFileCount: number;
+	additions: number;
+	deletions: number;
+	truncated: boolean;
+	files: StudioChangeFile[];
+}
+
+export interface StudioChangeSetResponse {
+	changeSet: StudioChangeSet;
+}
+
 export interface StudioRunResponse {
 	run: StudioRun;
+}
+
+/** Bounded durable run history for one Studio session. */
+export interface StudioRunHistoryResponse {
+	runs: StudioRun[];
 }
 
 /** Last known token and cost totals for a Studio session, sourced from OMP RPC. */
@@ -141,6 +293,18 @@ export interface StudioUsageResponse {
 	usage?: StudioUsage;
 }
 
+/** A bounded usage sample associated with one browser-safe Studio run. */
+export interface StudioUsageHistoryEntry {
+	id: string;
+	studioSessionId: string;
+	runId: string;
+	usage: StudioUsage;
+}
+
+export interface StudioUsageHistoryResponse {
+	entries: StudioUsageHistoryEntry[];
+}
+
 /** Browser-safe summary of a subagent. Session-file paths and raw tool arguments stay server-side. */
 export interface StudioSubagent {
 	id: string;
@@ -161,13 +325,11 @@ export interface StudioSubagentListResponse {
 	subagents: StudioSubagent[];
 }
 
-/** Redacted event shape sent to the browser. Raw messages, paths, arguments, and tool output are omitted. */
+/** Browser-safe lifecycle metadata. Native tool names, IDs, paths, arguments, and output are omitted. */
 export interface StudioAgentEvent {
 	type: string;
 	isError?: boolean;
 	isTerminal?: boolean;
-	toolCallId?: string;
-	toolName?: string;
 }
 
 export type StudioApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "interrupted";
@@ -345,6 +507,9 @@ export type StudioEventType =
 	| "studio.error"
 	| "run.state"
 	| "transcript.updated"
+	| "activity.updated"
+	| "tool.display_updated"
+	| "plan.updated"
 	| "agent.event"
 	| "approval.requested"
 	| "approval.resolved"

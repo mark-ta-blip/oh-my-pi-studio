@@ -1,11 +1,12 @@
 import * as path from "node:path";
 import { app, dialog, ipcMain, Notification, type OpenDialogOptions } from "electron";
-import { createDesktopPaths } from "./paths";
-import { type StudioServerProcess, startStudioServer } from "./studio-server";
+import { createDesktopPaths, resolveTrayIconPath } from "./paths";
+import { type StudioServerProcess, smokeTestStudioSidecar, startStudioServer } from "./studio-server";
 import { TrayManager } from "./tray-manager";
 import { WindowManager } from "./window-manager";
 
-const hasLock = app.requestSingleInstanceLock();
+const smokeTest = process.argv.includes("--smoke-test");
+const hasLock = smokeTest || app.requestSingleInstanceLock();
 if (!hasLock) {
 	app.quit();
 } else {
@@ -62,6 +63,12 @@ if (!hasLock) {
 		app.exit(1);
 	}
 
+	function failSmokeTest(error: unknown): void {
+		const message = error instanceof Error ? error.message : String(error);
+		process.stderr.write(`OMP Studio desktop smoke failed: ${message}\n`);
+		app.exit(1);
+	}
+
 	app.on("second-instance", () => windowManager?.show());
 	app.on("before-quit", event => {
 		if (shutdownStarted) return;
@@ -73,13 +80,26 @@ if (!hasLock) {
 		.then(async () => {
 			if (shutdownStarted) return;
 			const paths = createDesktopPaths(app.getPath("userData"), process.resourcesPath, packageRoot);
+			if (smokeTest) {
+				try {
+					await smokeTestStudioSidecar({
+						paths,
+						packaged: app.isPackaged,
+						command: app.isPackaged ? undefined : process.env.OMP_STUDIO_OMP_EXECUTABLE,
+					});
+					app.exit(0);
+				} catch (error) {
+					failSmokeTest(error);
+				}
+				return;
+			}
 			windowManager = new WindowManager(paths);
 			installIpc();
 			studioServerStartupAbort = new AbortController();
 			studioServerStartup = startStudioServer({
 				paths,
 				packaged: app.isPackaged,
-				command: process.env.OMP_STUDIO_OMP_EXECUTABLE,
+				command: app.isPackaged ? undefined : process.env.OMP_STUDIO_OMP_EXECUTABLE,
 				signal: studioServerStartupAbort.signal,
 			});
 			try {
@@ -90,7 +110,11 @@ if (!hasLock) {
 				studioServerStartup = undefined;
 				studioServerStartupAbort = undefined;
 			}
-			trayManager = new TrayManager(windowManager, () => void app.quit());
+			trayManager = new TrayManager(
+				windowManager,
+				() => void app.quit(),
+				resolveTrayIconPath(paths, app.isPackaged),
+			);
 		})
 		.catch(error => {
 			if (!shutdownStarted) void failStartup(error);

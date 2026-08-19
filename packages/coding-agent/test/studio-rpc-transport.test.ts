@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	createStudioApprovalRequest,
 	extractStudioAssistantTranscriptText,
+	extractStudioPlanSummary,
 	redactStudioAgentEvent,
 	studioAssistantMessageKeys,
 } from "../src/cli/studio-rpc-transport";
@@ -42,7 +43,7 @@ describe("Studio RPC transport redaction", () => {
 		).not.toBe(approval.argumentsDigest);
 	});
 
-	it("removes native tool output and arguments from browser agent events", () => {
+	it("removes native tool output and arguments while retaining server-side tool classification", () => {
 		const nativeEvent = {
 			args: { path: "C:\\private\\credentials.txt", replacement: "replace this secret value" },
 			isError: true,
@@ -88,6 +89,54 @@ describe("Studio RPC transport redaction", () => {
 				type: "message_end",
 			}),
 		).toBeUndefined();
+	});
+
+	it("reduces completed todo results to bounded counters without task text or tool output", () => {
+		const summary = extractStudioPlanSummary({
+			isError: false,
+			result: {
+				details: {
+					phases: [
+						{
+							tasks: [
+								{ status: "pending", text: "read C:\\private\\credentials.txt" },
+								{ status: "in_progress", text: "replace this secret value" },
+								{ output: "private result", status: "completed" },
+								{ reason: "blocked by secret", status: "blocked" },
+								{ status: "abandoned", text: "discard private attempt" },
+								{ status: "unknown", text: "must not count" },
+							],
+						},
+					],
+				},
+			},
+			toolName: "todo",
+			type: "tool_execution_end",
+		});
+
+		expect(summary).toEqual({
+			abandonedTaskCount: 1,
+			blockedTaskCount: 1,
+			completedTaskCount: 1,
+			inProgressTaskCount: 1,
+			pendingTaskCount: 1,
+			totalTaskCount: 5,
+		});
+		expect(JSON.stringify(summary)).not.toContain("credentials.txt");
+		expect(JSON.stringify(summary)).not.toContain("replace this secret value");
+		expect(JSON.stringify(summary)).not.toContain("private result");
+	});
+
+	it("caps todo inspection before a malformed tool result can monopolize the transport", () => {
+		const summary = extractStudioPlanSummary({
+			result: {
+				phases: [{ tasks: Array.from({ length: 4_097 }, () => ({ status: "completed" })) }],
+			},
+			toolName: "todo",
+			type: "tool_execution_end",
+		});
+
+		expect(summary).toMatchObject({ completedTaskCount: 4_096, totalTaskCount: 4_096 });
 	});
 
 	it("keeps a streaming assistant reply attached to its timestamp when the final response adds an ID", () => {

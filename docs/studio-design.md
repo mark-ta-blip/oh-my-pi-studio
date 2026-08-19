@@ -14,7 +14,8 @@ supervised OMP RPC session/run lifecycle. The session UI can create a
 model-backed local session, acquire a tab-scoped lease, submit a prompt, cancel
 an active run, resolve redacted tool approvals, observe subagents and usage,
 reconnect with a bounded event cursor, and review a bounded local audit ledger.
-All six MVP phases are implemented.
+All six MVP phases are implemented. The follow-on desktop workbench plan lives
+in [Studio Workbench Plan](./studio-workbench-plan.md).
 
 ## Goals and Non-Goals
 
@@ -35,7 +36,8 @@ All six MVP phases are implemented.
 - Multi-user accounts, LAN exposure, cloud hosting, or remote workers.
 - A Studio-managed provider account, credential vault, or model catalog.
 - Workflow canvases, Kanban boards, cron jobs, remote file browsing, browser
-  terminals, chat channels, voice, or an Electron wrapper.
+  terminals, chat channels, or voice. The Electron wrapper was implemented
+  after the original MVP and is covered by the Studio Workbench Plan.
 - Reimplementing provider OAuth flows or copying Hermes code, assets, or
   branding.
 

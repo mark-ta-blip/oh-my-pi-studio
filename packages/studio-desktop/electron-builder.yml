@@ -1,10 +1,12 @@
 appId: sh.omp.studio
 productName: OMP Studio
 artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+copyright: Copyright (c) 2026 Can Boluk
 asar: true
 compression: maximum
 directories:
   output: release
+  buildResources: resources
 files:
   - dist/**/*
   - package.json
@@ -12,15 +14,21 @@ extraResources:
   - from: resources
     to: omp-server
     filter:
-      - omp*
+      - omp
+      - omp.exe
+  - from: resources/tray-icon.png
+    to: tray-icon.png
 win:
+  icon: resources/icon.ico
   target:
     - nsis
 mac:
+  icon: resources/icon.icns
   target:
     - dmg
     - zip
 linux:
+  icon: resources/icon.png
   target:
     - AppImage
     - deb

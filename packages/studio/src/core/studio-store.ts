@@ -4,24 +4,35 @@ import * as path from "node:path";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { getStudioDbPath } from "@oh-my-pi/pi-utils/dirs";
 import type {
+	StudioActivityEntry,
+	StudioActivityStatus,
+	StudioActivitySubject,
 	StudioApproval,
 	StudioApprovalStatus,
 	StudioAuditDetail,
 	StudioAuditEntry,
 	StudioModelSelection,
+	StudioPlanSummary,
 	StudioRun,
 	StudioRunStatus,
 	StudioSession,
 	StudioSessionStatus,
+	StudioToolDisplay,
+	StudioToolDisplayKind,
+	StudioToolDisplayStatus,
 	StudioTranscriptMessage,
 	StudioTranscriptMessageStatus,
 	StudioUsage,
+	StudioUsageHistoryEntry,
 	StudioWorkspace,
 } from "../protocol";
 
-const STUDIO_SCHEMA_VERSION = 4;
+const STUDIO_SCHEMA_VERSION = 7;
 const ACTIVE_RUN_STATUSES = ["starting", "running", "cancelling"] as const;
 const MAX_STUDIO_TRANSCRIPT_TEXT_LENGTH = 100_000;
+const MAX_STUDIO_ACTIVITY_ENTRIES_PER_SESSION = 500;
+const MAX_STUDIO_TOOL_DISPLAYS_PER_SESSION = 200;
+const MAX_STUDIO_USAGE_HISTORY_ENTRIES_PER_SESSION = 120;
 const MAX_AUDIT_ENTRIES = 2_000;
 const MAX_AUDIT_DETAIL_TEXT_LENGTH = 240;
 const AUDIT_DETAIL_KEYS = [
@@ -44,6 +55,29 @@ const AUDIT_REASON_VALUES = new Set([
 	"studio_restart",
 	"studio_shutdown",
 ]);
+const STUDIO_ACTIVITY_SUBJECT_VALUES: readonly StudioActivitySubject[] = [
+	"agent",
+	"command",
+	"file_read",
+	"file_write",
+	"file_search",
+	"web",
+	"task",
+	"context",
+	"retry",
+	"tool",
+	"system",
+];
+const STUDIO_ACTIVITY_STATUS_VALUES: readonly StudioActivityStatus[] = ["running", "completed", "failed", "cancelled"];
+const STUDIO_TOOL_DISPLAY_KIND_VALUES: readonly StudioToolDisplayKind[] = [
+	"command",
+	"file_read",
+	"file_write",
+	"file_search",
+	"web",
+	"task",
+	"tool",
+];
 
 const STUDIO_MIGRATIONS = [
 	{
@@ -164,6 +198,75 @@ const STUDIO_MIGRATIONS = [
 			CREATE INDEX transcript_messages_run_status_idx ON transcript_messages(run_id, status);
 		`,
 	},
+	{
+		version: 5,
+		sql: `
+			CREATE TABLE studio_activity_entries (
+				ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+				id TEXT NOT NULL UNIQUE,
+				studio_session_id TEXT NOT NULL REFERENCES studio_sessions(id),
+				run_id TEXT NOT NULL REFERENCES runs(id),
+				subject TEXT NOT NULL CHECK(subject IN (
+					'agent', 'command', 'file_read', 'file_write', 'file_search', 'web', 'task', 'context', 'retry', 'tool', 'system'
+				)),
+				status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'cancelled')),
+				occurred_at_ms INTEGER NOT NULL
+			);
+			CREATE INDEX studio_activity_entries_session_ordinal_idx
+				ON studio_activity_entries(studio_session_id, ordinal DESC);
+			CREATE INDEX studio_activity_entries_run_ordinal_idx
+				ON studio_activity_entries(run_id, ordinal DESC);
+		`,
+	},
+	{
+		version: 6,
+		sql: `
+			CREATE TABLE studio_tool_displays (
+				ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+				id TEXT NOT NULL UNIQUE,
+				studio_session_id TEXT NOT NULL REFERENCES studio_sessions(id),
+				run_id TEXT NOT NULL REFERENCES runs(id),
+				kind TEXT NOT NULL CHECK(kind IN ('command', 'file_read', 'file_write', 'file_search', 'web', 'task', 'tool')),
+				status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'cancelled')),
+				started_at_ms INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL
+			);
+			CREATE INDEX studio_tool_displays_session_ordinal_idx
+				ON studio_tool_displays(studio_session_id, ordinal DESC);
+			CREATE INDEX studio_tool_displays_run_status_idx
+				ON studio_tool_displays(run_id, status, ordinal DESC);
+
+			CREATE TABLE studio_plan_summaries (
+				studio_session_id TEXT PRIMARY KEY REFERENCES studio_sessions(id),
+				run_id TEXT NOT NULL REFERENCES runs(id),
+				total_task_count INTEGER NOT NULL CHECK(total_task_count >= 0),
+				pending_task_count INTEGER NOT NULL CHECK(pending_task_count >= 0),
+				in_progress_task_count INTEGER NOT NULL CHECK(in_progress_task_count >= 0),
+				completed_task_count INTEGER NOT NULL CHECK(completed_task_count >= 0),
+				blocked_task_count INTEGER NOT NULL CHECK(blocked_task_count >= 0),
+				abandoned_task_count INTEGER NOT NULL CHECK(abandoned_task_count >= 0),
+				updated_at_ms INTEGER NOT NULL
+			);
+		`,
+	},
+	{
+		version: 7,
+		sql: `
+			CREATE TABLE studio_usage_history (
+				ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+				id TEXT NOT NULL UNIQUE,
+				studio_session_id TEXT NOT NULL REFERENCES studio_sessions(id),
+				run_id TEXT NOT NULL REFERENCES runs(id),
+				usage_json TEXT NOT NULL,
+				occurred_at_ms INTEGER NOT NULL,
+				UNIQUE(run_id, usage_json)
+			);
+			CREATE INDEX studio_usage_history_session_ordinal_idx
+				ON studio_usage_history(studio_session_id, ordinal DESC);
+			CREATE INDEX studio_usage_history_run_ordinal_idx
+				ON studio_usage_history(run_id, ordinal DESC);
+		`,
+	},
 ] as const;
 
 interface StudioMigrationRow {
@@ -252,6 +355,45 @@ interface StudioTranscriptMessageRow {
 
 interface StudioTranscriptTimestampRow {
 	latest_created_at_ms: number | null;
+}
+
+interface StudioActivityEntryRow {
+	id: string;
+	studio_session_id: string;
+	run_id: string;
+	subject: string;
+	status: string;
+	occurred_at_ms: number;
+}
+
+interface StudioToolDisplayRow {
+	id: string;
+	studio_session_id: string;
+	run_id: string;
+	kind: string;
+	status: string;
+	started_at_ms: number;
+	updated_at_ms: number;
+}
+
+interface StudioPlanSummaryRow {
+	studio_session_id: string;
+	run_id: string;
+	total_task_count: number;
+	pending_task_count: number;
+	in_progress_task_count: number;
+	completed_task_count: number;
+	blocked_task_count: number;
+	abandoned_task_count: number;
+	updated_at_ms: number;
+}
+
+interface StudioUsageHistoryRow {
+	id: string;
+	studio_session_id: string;
+	run_id: string;
+	usage_json: string;
+	occurred_at_ms: number;
 }
 
 export interface StudioStoreOptions {
@@ -343,6 +485,36 @@ export interface UpsertStudioAssistantTranscriptMessageInput {
 	status: Extract<StudioTranscriptMessageStatus, "streaming" | "completed" | "failed">;
 }
 
+export interface AppendStudioActivityEntryInput {
+	studioSessionId: string;
+	runId: string;
+	subject: StudioActivitySubject;
+	status: StudioActivityStatus;
+}
+
+export interface AppendStudioToolDisplayInput {
+	studioSessionId: string;
+	runId: string;
+	kind: StudioToolDisplayKind;
+}
+
+export interface UpdateStudioPlanSummaryInput {
+	studioSessionId: string;
+	runId: string;
+	totalTaskCount: number;
+	pendingTaskCount: number;
+	inProgressTaskCount: number;
+	completedTaskCount: number;
+	blockedTaskCount: number;
+	abandonedTaskCount: number;
+}
+
+export interface AppendStudioUsageHistoryInput {
+	studioSessionId: string;
+	runId: string;
+	usage: Omit<StudioUsage, "updatedAtMs">;
+}
+
 export type ResolveStudioApprovalResult =
 	| { kind: "resolved"; approval: StudioApproval }
 	| { kind: "not_found" }
@@ -375,7 +547,9 @@ function toStudioRun(row: StudioRunRow): StudioRun {
 		...(row.rpc_protocol_version === null ? {} : { rpcProtocolVersion: row.rpc_protocol_version }),
 		startedAtMs: row.started_at_ms,
 		...(row.ended_at_ms === null ? {} : { endedAtMs: row.ended_at_ms }),
-		...(row.interrupted_reason === null ? {} : { interruptedReason: row.interrupted_reason }),
+		...(row.interrupted_reason === null || !AUDIT_REASON_VALUES.has(row.interrupted_reason)
+			? {}
+			: { interruptedReason: row.interrupted_reason }),
 	};
 }
 
@@ -388,6 +562,80 @@ function toStudioTranscriptMessage(row: StudioTranscriptMessageRow): StudioTrans
 		text: row.text,
 		status: row.status,
 		createdAtMs: row.created_at_ms,
+		updatedAtMs: row.updated_at_ms,
+	};
+}
+
+function isStudioActivitySubject(value: string): value is StudioActivitySubject {
+	return STUDIO_ACTIVITY_SUBJECT_VALUES.includes(value as StudioActivitySubject);
+}
+
+function isStudioActivityStatus(value: string): value is StudioActivityStatus {
+	return STUDIO_ACTIVITY_STATUS_VALUES.includes(value as StudioActivityStatus);
+}
+
+function toStudioActivityEntry(row: StudioActivityEntryRow): StudioActivityEntry | undefined {
+	if (!isStudioActivitySubject(row.subject) || !isStudioActivityStatus(row.status)) return undefined;
+	if (!Number.isSafeInteger(row.occurred_at_ms) || row.occurred_at_ms < 0) return undefined;
+	return {
+		id: row.id,
+		studioSessionId: row.studio_session_id,
+		runId: row.run_id,
+		subject: row.subject,
+		status: row.status,
+		occurredAtMs: row.occurred_at_ms,
+	};
+}
+
+function isStudioToolDisplayKind(value: string): value is StudioToolDisplayKind {
+	return STUDIO_TOOL_DISPLAY_KIND_VALUES.includes(value as StudioToolDisplayKind);
+}
+
+function isStudioToolDisplayStatus(value: string): value is StudioToolDisplayStatus {
+	return STUDIO_ACTIVITY_STATUS_VALUES.includes(value as StudioToolDisplayStatus);
+}
+
+function toStudioToolDisplay(row: StudioToolDisplayRow): StudioToolDisplay | undefined {
+	if (!isStudioToolDisplayKind(row.kind) || !isStudioToolDisplayStatus(row.status)) return undefined;
+	if (
+		!Number.isSafeInteger(row.started_at_ms) ||
+		row.started_at_ms < 0 ||
+		!Number.isSafeInteger(row.updated_at_ms) ||
+		row.updated_at_ms < 0
+	) {
+		return undefined;
+	}
+	return {
+		id: row.id,
+		studioSessionId: row.studio_session_id,
+		runId: row.run_id,
+		kind: row.kind,
+		status: row.status,
+		startedAtMs: row.started_at_ms,
+		updatedAtMs: row.updated_at_ms,
+	};
+}
+
+function toStudioPlanSummary(row: StudioPlanSummaryRow): StudioPlanSummary | undefined {
+	const counts = [
+		row.total_task_count,
+		row.pending_task_count,
+		row.in_progress_task_count,
+		row.completed_task_count,
+		row.blocked_task_count,
+		row.abandoned_task_count,
+	];
+	if (counts.some(value => !Number.isSafeInteger(value) || value < 0)) return undefined;
+	if (!Number.isSafeInteger(row.updated_at_ms) || row.updated_at_ms < 0) return undefined;
+	return {
+		studioSessionId: row.studio_session_id,
+		runId: row.run_id,
+		totalTaskCount: row.total_task_count,
+		pendingTaskCount: row.pending_task_count,
+		inProgressTaskCount: row.in_progress_task_count,
+		completedTaskCount: row.completed_task_count,
+		blockedTaskCount: row.blocked_task_count,
+		abandonedTaskCount: row.abandoned_task_count,
 		updatedAtMs: row.updated_at_ms,
 	};
 }
@@ -409,10 +657,10 @@ function numberField(value: Record<string, unknown>, field: string): number | un
 	return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined;
 }
 
-function toStudioUsage(row: StudioSessionRow): StudioUsage | undefined {
-	if (row.usage_json === null || row.usage_updated_at_ms === null) return undefined;
+function toStudioUsageValue(value: unknown, updatedAtMs: number): StudioUsage | undefined {
+	if (!Number.isSafeInteger(updatedAtMs) || updatedAtMs < 0) return undefined;
 	try {
-		const parsed: unknown = JSON.parse(row.usage_json);
+		const parsed: unknown = typeof value === "string" ? JSON.parse(value) : value;
 		if (!isRecord(parsed)) return undefined;
 		const inputTokens = numberField(parsed, "inputTokens");
 		const outputTokens = numberField(parsed, "outputTokens");
@@ -450,11 +698,45 @@ function toStudioUsage(row: StudioSessionRow): StudioUsage | undefined {
 			toolCalls,
 			...(contextTokens === undefined ? {} : { contextTokens }),
 			...(contextWindow === undefined ? {} : { contextWindow }),
-			updatedAtMs: row.usage_updated_at_ms,
+			updatedAtMs,
 		};
 	} catch {
 		return undefined;
 	}
+}
+
+function toStudioUsage(row: StudioSessionRow): StudioUsage | undefined {
+	if (row.usage_json === null || row.usage_updated_at_ms === null) return undefined;
+	return toStudioUsageValue(row.usage_json, row.usage_updated_at_ms);
+}
+
+function encodeStudioUsage(usage: Omit<StudioUsage, "updatedAtMs">): string {
+	const stored = {
+		cacheReadTokens: usage.cacheReadTokens,
+		cacheWriteTokens: usage.cacheWriteTokens,
+		cost: usage.cost,
+		inputTokens: usage.inputTokens,
+		outputTokens: usage.outputTokens,
+		premiumRequests: usage.premiumRequests,
+		reasoningTokens: usage.reasoningTokens,
+		totalTokens: usage.totalTokens,
+		toolCalls: usage.toolCalls,
+		...(usage.contextTokens === undefined ? {} : { contextTokens: usage.contextTokens }),
+		...(usage.contextWindow === undefined ? {} : { contextWindow: usage.contextWindow }),
+	};
+	if (!toStudioUsageValue(stored, 0)) throw new Error("Studio usage contains invalid values.");
+	return JSON.stringify(stored);
+}
+
+function toStudioUsageHistoryEntry(row: StudioUsageHistoryRow): StudioUsageHistoryEntry | undefined {
+	const usage = toStudioUsageValue(row.usage_json, row.occurred_at_ms);
+	if (!usage) return undefined;
+	return {
+		id: row.id,
+		studioSessionId: row.studio_session_id,
+		runId: row.run_id,
+		usage,
+	};
 }
 
 function toStudioApproval(row: StudioApprovalRow): StudioApproval {
@@ -758,6 +1040,7 @@ export class StudioStore {
 		usage: Omit<StudioUsage, "updatedAtMs">,
 		now = Date.now(),
 	): StudioSession | undefined {
+		const usageJson = encodeStudioUsage(usage);
 		const row = this.#db
 			.query<StudioSessionRow, [string, number, number, number, string]>(
 				`UPDATE studio_sessions SET
@@ -769,7 +1052,7 @@ export class StudioStore {
 				 RETURNING id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id,
 					status, created_at_ms, updated_at_ms, last_activity_at_ms, usage_json, usage_updated_at_ms`,
 			)
-			.get(JSON.stringify(usage), now, now, now, studioSessionId);
+			.get(usageJson, now, now, now, studioSessionId);
 		return row ? toStudioSession(row, this.#getActiveRunForSession(studioSessionId)) : undefined;
 	}
 
@@ -804,6 +1087,56 @@ export class StudioStore {
 			)
 			.get(runId);
 		return row ? toStudioRun(row) : undefined;
+	}
+
+	listStudioRuns(studioSessionId: string, limit = 60): StudioRun[] {
+		const boundedLimit = Math.min(Math.max(limit, 1), 100);
+		const rows = this.#db
+			.query<StudioRunRow, [string, number]>(
+				`SELECT id, studio_session_id, status, rpc_protocol_version, started_at_ms, ended_at_ms, interrupted_reason
+				 FROM runs WHERE studio_session_id = ?
+				 ORDER BY started_at_ms DESC, id DESC LIMIT ?`,
+			)
+			.all(studioSessionId, boundedLimit);
+		return rows.map(toStudioRun);
+	}
+
+	appendStudioUsageHistory(
+		input: AppendStudioUsageHistoryInput,
+		now = Date.now(),
+	): StudioUsageHistoryEntry | undefined {
+		if (!Number.isSafeInteger(now) || now < 0) throw new Error("Studio usage history timestamp is invalid.");
+		const run = this.getStudioRun(input.runId);
+		if (!run || run.studioSessionId !== input.studioSessionId) return undefined;
+		const id = `ush_${crypto.randomUUID().replaceAll("-", "")}`;
+		const row = this.#db
+			.query<StudioUsageHistoryRow, [string, string, string, string, number]>(
+				`INSERT OR IGNORE INTO studio_usage_history (
+					id, studio_session_id, run_id, usage_json, occurred_at_ms
+				 ) VALUES (?, ?, ?, ?, ?)
+				 RETURNING id, studio_session_id, run_id, usage_json, occurred_at_ms`,
+			)
+			.get(id, input.studioSessionId, input.runId, encodeStudioUsage(input.usage), now);
+		const entry = row ? toStudioUsageHistoryEntry(row) : undefined;
+		if (entry) this.#pruneStudioUsageHistoryEntries(input.studioSessionId);
+		return entry;
+	}
+
+	listStudioUsageHistory(studioSessionId: string, limit = 60): StudioUsageHistoryEntry[] {
+		const boundedLimit = Math.min(Math.max(limit, 1), MAX_STUDIO_USAGE_HISTORY_ENTRIES_PER_SESSION);
+		const rows = this.#db
+			.query<StudioUsageHistoryRow, [string, number]>(
+				`SELECT id, studio_session_id, run_id, usage_json, occurred_at_ms
+				 FROM studio_usage_history WHERE studio_session_id = ?
+				 ORDER BY ordinal DESC LIMIT ?`,
+			)
+			.all(studioSessionId, boundedLimit);
+		const entries: StudioUsageHistoryEntry[] = [];
+		for (const row of rows) {
+			const entry = toStudioUsageHistoryEntry(row);
+			if (entry) entries.push(entry);
+		}
+		return entries;
 	}
 
 	createStudioUserTranscriptMessage(
@@ -894,6 +1227,187 @@ export class StudioStore {
 			)
 			.all(studioSessionId);
 		return rows.map(toStudioTranscriptMessage);
+	}
+
+	appendStudioActivityEntry(input: AppendStudioActivityEntryInput, now = Date.now()): StudioActivityEntry | undefined {
+		if (!isStudioActivitySubject(input.subject) || !isStudioActivityStatus(input.status)) {
+			throw new Error("Studio activity has an invalid subject or status.");
+		}
+		if (!Number.isSafeInteger(now) || now < 0) throw new Error("Studio activity timestamp is invalid.");
+		return this.#transaction(() => {
+			const id = `act_${crypto.randomUUID().replaceAll("-", "")}`;
+			const row = this.#db
+				.query<
+					StudioActivityEntryRow,
+					[string, string, string, StudioActivitySubject, StudioActivityStatus, number, string, string]
+				>(
+					`INSERT INTO studio_activity_entries (
+						id, studio_session_id, run_id, subject, status, occurred_at_ms
+					 )
+					 SELECT ?, ?, ?, ?, ?, ?
+					 WHERE EXISTS (
+						SELECT 1 FROM runs WHERE id = ? AND studio_session_id = ?
+					 )
+					 RETURNING id, studio_session_id, run_id, subject, status, occurred_at_ms`,
+				)
+				.get(
+					id,
+					input.studioSessionId,
+					input.runId,
+					input.subject,
+					input.status,
+					now,
+					input.runId,
+					input.studioSessionId,
+				);
+			const entry = row ? toStudioActivityEntry(row) : undefined;
+			if (!entry) return undefined;
+			this.#pruneStudioActivityEntries(input.studioSessionId);
+			return entry;
+		});
+	}
+
+	listStudioActivityEntries(studioSessionId: string): StudioActivityEntry[] {
+		const rows = this.#db
+			.query<StudioActivityEntryRow, [string, number]>(
+				`SELECT id, studio_session_id, run_id, subject, status, occurred_at_ms
+				 FROM studio_activity_entries
+				 WHERE studio_session_id = ?
+				 ORDER BY ordinal DESC
+				 LIMIT ?`,
+			)
+			.all(studioSessionId, MAX_STUDIO_ACTIVITY_ENTRIES_PER_SESSION);
+		const entries: StudioActivityEntry[] = [];
+		for (const row of rows) {
+			const entry = toStudioActivityEntry(row);
+			if (entry) entries.push(entry);
+		}
+		return entries;
+	}
+
+	appendStudioToolDisplay(input: AppendStudioToolDisplayInput, now = Date.now()): StudioToolDisplay | undefined {
+		if (!isStudioToolDisplayKind(input.kind)) throw new Error("Studio tool display has an invalid kind.");
+		if (!Number.isSafeInteger(now) || now < 0) throw new Error("Studio tool display timestamp is invalid.");
+		const id = `tcd_${crypto.randomUUID().replaceAll("-", "")}`;
+		const row = this.#db
+			.query<StudioToolDisplayRow, [string, string, string, StudioToolDisplayKind, number, number, string, string]>(
+				`INSERT INTO studio_tool_displays (
+					id, studio_session_id, run_id, kind, status, started_at_ms, updated_at_ms
+				 )
+				 SELECT ?, ?, ?, ?, 'running', ?, ?
+				 WHERE EXISTS (
+					SELECT 1 FROM runs WHERE id = ? AND studio_session_id = ?
+				 )
+				 RETURNING id, studio_session_id, run_id, kind, status, started_at_ms, updated_at_ms`,
+			)
+			.get(id, input.studioSessionId, input.runId, input.kind, now, now, input.runId, input.studioSessionId);
+		const display = row ? toStudioToolDisplay(row) : undefined;
+		if (display) this.#pruneStudioToolDisplays(input.studioSessionId);
+		return display;
+	}
+
+	updateStudioToolDisplay(
+		id: string,
+		status: StudioToolDisplayStatus,
+		now = Date.now(),
+	): StudioToolDisplay | undefined {
+		if (!isStudioToolDisplayStatus(status)) throw new Error("Studio tool display has an invalid status.");
+		const row = this.#db
+			.query<StudioToolDisplayRow, [StudioToolDisplayStatus, number, string]>(
+				`UPDATE studio_tool_displays SET status = ?, updated_at_ms = MAX(?, started_at_ms, updated_at_ms)
+				 WHERE id = ?
+				 RETURNING id, studio_session_id, run_id, kind, status, started_at_ms, updated_at_ms`,
+			)
+			.get(status, now, id);
+		return row ? toStudioToolDisplay(row) : undefined;
+	}
+
+	listStudioToolDisplays(studioSessionId: string): StudioToolDisplay[] {
+		const rows = this.#db
+			.query<StudioToolDisplayRow, [string, number]>(
+				`SELECT id, studio_session_id, run_id, kind, status, started_at_ms, updated_at_ms
+				 FROM studio_tool_displays WHERE studio_session_id = ? ORDER BY ordinal DESC LIMIT ?`,
+			)
+			.all(studioSessionId, MAX_STUDIO_TOOL_DISPLAYS_PER_SESSION);
+		return rows.map(toStudioToolDisplay).filter((entry): entry is StudioToolDisplay => entry !== undefined);
+	}
+
+	finishStudioRunToolDisplays(
+		runId: string,
+		status: Extract<StudioToolDisplayStatus, "completed" | "failed" | "cancelled">,
+		now = Date.now(),
+	): StudioToolDisplay[] {
+		const rows = this.#db
+			.query<StudioToolDisplayRow, [StudioToolDisplayStatus, number, string]>(
+				`UPDATE studio_tool_displays SET status = ?, updated_at_ms = MAX(?, started_at_ms, updated_at_ms)
+				 WHERE run_id = ? AND status = 'running'
+				 RETURNING id, studio_session_id, run_id, kind, status, started_at_ms, updated_at_ms`,
+			)
+			.all(status, now, runId);
+		return rows.map(toStudioToolDisplay).filter((entry): entry is StudioToolDisplay => entry !== undefined);
+	}
+
+	upsertStudioPlanSummary(input: UpdateStudioPlanSummaryInput, now = Date.now()): StudioPlanSummary | undefined {
+		const counts = [
+			input.totalTaskCount,
+			input.pendingTaskCount,
+			input.inProgressTaskCount,
+			input.completedTaskCount,
+			input.blockedTaskCount,
+			input.abandonedTaskCount,
+		];
+		if (counts.some(value => !Number.isSafeInteger(value) || value < 0)) {
+			throw new Error("Studio plan summary counts are invalid.");
+		}
+		if (!Number.isSafeInteger(now) || now < 0) throw new Error("Studio plan summary timestamp is invalid.");
+		const row = this.#db
+			.query<
+				StudioPlanSummaryRow,
+				[string, string, number, number, number, number, number, number, number, string, string]
+			>(
+				`INSERT INTO studio_plan_summaries (
+					studio_session_id, run_id, total_task_count, pending_task_count, in_progress_task_count,
+					completed_task_count, blocked_task_count, abandoned_task_count, updated_at_ms
+				 )
+				 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+				 WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND studio_session_id = ?)
+				 ON CONFLICT(studio_session_id) DO UPDATE SET
+					run_id = excluded.run_id,
+					total_task_count = excluded.total_task_count,
+					pending_task_count = excluded.pending_task_count,
+					in_progress_task_count = excluded.in_progress_task_count,
+					completed_task_count = excluded.completed_task_count,
+					blocked_task_count = excluded.blocked_task_count,
+					abandoned_task_count = excluded.abandoned_task_count,
+					updated_at_ms = MAX(excluded.updated_at_ms, studio_plan_summaries.updated_at_ms)
+				 RETURNING studio_session_id, run_id, total_task_count, pending_task_count, in_progress_task_count,
+					completed_task_count, blocked_task_count, abandoned_task_count, updated_at_ms`,
+			)
+			.get(
+				input.studioSessionId,
+				input.runId,
+				input.totalTaskCount,
+				input.pendingTaskCount,
+				input.inProgressTaskCount,
+				input.completedTaskCount,
+				input.blockedTaskCount,
+				input.abandonedTaskCount,
+				now,
+				input.runId,
+				input.studioSessionId,
+			);
+		return row ? toStudioPlanSummary(row) : undefined;
+	}
+
+	getStudioPlanSummary(studioSessionId: string): StudioPlanSummary | undefined {
+		const row = this.#db
+			.query<StudioPlanSummaryRow, [string]>(
+				`SELECT studio_session_id, run_id, total_task_count, pending_task_count, in_progress_task_count,
+					completed_task_count, blocked_task_count, abandoned_task_count, updated_at_ms
+				 FROM studio_plan_summaries WHERE studio_session_id = ?`,
+			)
+			.get(studioSessionId);
+		return row ? toStudioPlanSummary(row) : undefined;
 	}
 
 	#nextTranscriptCreatedAtMs(studioSessionId: string, now: number): number {
@@ -1065,6 +1579,14 @@ export class StudioStore {
 				)
 				.run("interrupted", now);
 			this.#db
+				.query<void, [number]>(
+					`UPDATE studio_tool_displays SET status = 'cancelled', updated_at_ms = MAX(?, started_at_ms, updated_at_ms)
+					 WHERE status = 'running' AND run_id IN (
+						SELECT id FROM runs WHERE status IN ('starting', 'running', 'cancelling')
+					 )`,
+				)
+				.run(now);
+			this.#db
 				.query<void, [StudioSessionStatus, number, number]>(
 					`UPDATE studio_sessions SET status = ?, updated_at_ms = ?, last_activity_at_ms = ?
 					 WHERE id IN (
@@ -1200,6 +1722,51 @@ export class StudioStore {
 				 WHERE id <= COALESCE((SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET ?), -1)`,
 			)
 			.run(MAX_AUDIT_ENTRIES);
+	}
+
+	#pruneStudioActivityEntries(studioSessionId: string): void {
+		this.#db
+			.query<void, [string, string, number]>(
+				`DELETE FROM studio_activity_entries
+				 WHERE studio_session_id = ?
+					AND ordinal <= COALESCE((
+						SELECT ordinal FROM studio_activity_entries
+						WHERE studio_session_id = ?
+						ORDER BY ordinal DESC
+						LIMIT 1 OFFSET ?
+					), -1)`,
+			)
+			.run(studioSessionId, studioSessionId, MAX_STUDIO_ACTIVITY_ENTRIES_PER_SESSION);
+	}
+
+	#pruneStudioToolDisplays(studioSessionId: string): void {
+		this.#db
+			.query<void, [string, string, number]>(
+				`DELETE FROM studio_tool_displays
+				 WHERE studio_session_id = ?
+					AND ordinal <= COALESCE((
+						SELECT ordinal FROM studio_tool_displays
+						WHERE studio_session_id = ?
+						ORDER BY ordinal DESC
+						LIMIT 1 OFFSET ?
+					), -1)`,
+			)
+			.run(studioSessionId, studioSessionId, MAX_STUDIO_TOOL_DISPLAYS_PER_SESSION);
+	}
+
+	#pruneStudioUsageHistoryEntries(studioSessionId: string): void {
+		this.#db
+			.query<void, [string, string, number]>(
+				`DELETE FROM studio_usage_history
+				 WHERE studio_session_id = ?
+					AND ordinal <= COALESCE((
+						SELECT ordinal FROM studio_usage_history
+						WHERE studio_session_id = ?
+						ORDER BY ordinal DESC
+						LIMIT 1 OFFSET ?
+					), -1)`,
+			)
+			.run(studioSessionId, studioSessionId, MAX_STUDIO_USAGE_HISTORY_ENTRIES_PER_SESSION);
 	}
 
 	#getActiveRunForSession(studioSessionId: string): StudioRun | undefined {

@@ -8,6 +8,8 @@
 - Added OMP-native provider, model, OAuth, and API-key bridge support to `omp studio`.
 - Added the OMP RPC child transport used by Studio to negotiate protocol v2, run model-backed sessions, stream agent events, and cancel active runs.
 - Added `rpc-ui` Studio transport support for redacted tool approvals, optional subagent events, and session usage summaries while keeping raw arguments and tool output server-only.
+- Added ephemeral Studio control-plane storage for the packaged Desktop smoke path,
+  so release verification does not alter persistent Studio session state.
 
 ## [17.3.6] - 2026-08-17
 

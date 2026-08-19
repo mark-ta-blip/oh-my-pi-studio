@@ -1,14 +1,19 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import type {
+	StudioActivityEntry,
 	StudioAgentEvent,
 	StudioApproval,
 	StudioModelSelection,
+	StudioPlanSummary,
 	StudioRun,
 	StudioSession,
 	StudioSubagent,
+	StudioToolDisplay,
+	StudioToolDisplayStatus,
 	StudioTranscriptMessage,
 	StudioUsage,
 } from "../protocol";
+import { projectStudioActivityEvent, projectStudioToolDisplayKind } from "./activity-projection";
 import type { CreateStudioRunResult, StudioStore } from "./studio-store";
 
 const APPROVAL_EXPIRY_MS = 5 * 60_000;
@@ -57,7 +62,17 @@ export interface StudioRpcSessionState {
 	ompSessionRef?: string;
 }
 
-export type StudioRpcAgentEvent = StudioAgentEvent;
+/**
+ * Server-only OMP event metadata retained long enough to project a fixed
+ * activity subject. It must never be returned through the browser protocol.
+ */
+export interface StudioRpcAgentEvent {
+	type: string;
+	isError?: boolean;
+	isTerminal?: boolean;
+	toolCallId?: string;
+	toolName?: string;
+}
 
 /** One native OMP approval request waiting for a Studio browser decision. */
 export interface StudioRpcApprovalRequest {
@@ -69,6 +84,9 @@ export interface StudioRpcApprovalRequest {
 }
 
 export type StudioRpcUsage = Omit<StudioUsage, "updatedAtMs">;
+
+/** Server-only aggregate extracted from a native todo result. Task text never reaches this shape. */
+export type StudioRpcPlanSummary = Omit<StudioPlanSummary, "studioSessionId" | "runId" | "updatedAtMs">;
 
 export interface StudioRpcTransportExit {
 	expected: boolean;
@@ -101,6 +119,7 @@ export interface StudioRpcTransport {
 	onPromptFailure?(listener: () => void): () => void;
 	onPromptResult?(listener: (result: StudioRpcPromptResult) => void): () => void;
 	onSubagentState?(listener: (subagent: StudioSubagent) => void): () => void;
+	onPlanSummary?(listener: (summary: StudioRpcPlanSummary) => void): () => void;
 	onTranscriptUpdate?(listener: (update: StudioRpcTranscriptUpdate) => void): () => void;
 	prompt(message: string): Promise<void>;
 	resolveApproval?(requestId: string, approved: boolean): Promise<void>;
@@ -112,11 +131,14 @@ export interface StudioRpcTransportFactory {
 }
 
 export interface StudioRpcSupervisorEvents {
-	onAgentEvent(studioSessionId: string, runId: string, event: StudioRpcAgentEvent): void;
+	onActivityUpdated(studioSessionId: string, entry: StudioActivityEntry): void;
+	onAgentEvent(studioSessionId: string, runId: string, event: StudioAgentEvent): void;
+	onPlanSummaryUpdated(studioSessionId: string, plan: StudioPlanSummary): void;
 	onApprovalRequested(studioSessionId: string, approval: StudioApproval): void;
 	onApprovalResolved(studioSessionId: string, approval: StudioApproval): void;
 	onRunState(session: StudioSession, run: StudioRun): void;
 	onSubagentState(studioSessionId: string, subagent: StudioSubagent): void;
+	onToolDisplayUpdated(studioSessionId: string, display: StudioToolDisplay): void;
 	onTranscriptUpdated(studioSessionId: string, message: StudioTranscriptMessage): void;
 	onUsageUpdated(session: StudioSession, usage: StudioUsage): void;
 }
@@ -129,6 +151,7 @@ interface ActiveStudioRpcSession {
 	onPromptFailure: () => void;
 	onPromptResult: () => void;
 	onSubagentState: () => void;
+	onPlanSummary: () => void;
 	onTranscriptUpdate: () => void;
 	transport: StudioRpcTransport;
 }
@@ -162,6 +185,14 @@ function isAgentStart(event: StudioRpcAgentEvent): boolean {
 	return event.type === "agent_start";
 }
 
+function toStudioAgentEvent(event: StudioRpcAgentEvent): StudioAgentEvent {
+	return {
+		type: event.type,
+		...(event.isError === undefined ? {} : { isError: event.isError }),
+		...(event.isTerminal === undefined ? {} : { isTerminal: event.isTerminal }),
+	};
+}
+
 /**
  * Coordinates persistent Studio session/run state with one OMP RPC child per
  * active Studio session. It has no coding-agent dependency so its transport can
@@ -177,6 +208,7 @@ export class StudioRpcSupervisor {
 	#startingSessions = new Map<string, Promise<StudioSession>>();
 	#store: StudioStore;
 	#subagentsBySession = new Map<string, Map<string, StudioSubagent>>();
+	#toolDisplayIdsByRun = new Map<string, Map<string, string>>();
 	#transcriptSourceIdsByRun = new Map<string, Map<string, string>>();
 	#transcriptUpdateTimers = new Map<string, Timer>();
 	#transportFactory: StudioRpcTransportFactory | undefined;
@@ -300,6 +332,7 @@ export class StudioRpcSupervisor {
 			const current = this.#store.getStudioRun(created.run.id);
 			if (current && ["starting", "running", "cancelling"].includes(current.status)) {
 				const failed = this.#store.finishStudioRun(created.run.id, "failed", "rpc_prompt_failed");
+				this.#emitToolDisplayTerminalUpdates(created.run.id, "failed");
 				this.#finishTranscriptMessages(created.run.id, "failed");
 				const readySession = this.#store.updateStudioSessionRuntime(studioSessionId, { status: "ready" });
 				if (failed && readySession) this.#events.onRunState(readySession, failed);
@@ -455,6 +488,7 @@ export class StudioRpcSupervisor {
 			active.onPromptFailure();
 			active.onPromptResult();
 			active.onSubagentState();
+			active.onPlanSummary();
 			active.onTranscriptUpdate();
 			this.#activeSessions.delete(studioSessionId);
 			void active.transport.stop();
@@ -462,6 +496,7 @@ export class StudioRpcSupervisor {
 		this.#pendingApprovals.clear();
 		this.#clearApprovalExpiryTimers();
 		this.#subagentsBySession.clear();
+		this.#toolDisplayIdsByRun.clear();
 		this.#transcriptSourceIdsByRun.clear();
 		this.#store.interruptActiveRuntime("studio_shutdown");
 	}
@@ -516,6 +551,7 @@ export class StudioRpcSupervisor {
 				onPromptFailure: () => {},
 				onPromptResult: () => {},
 				onSubagentState: () => {},
+				onPlanSummary: () => {},
 				onTranscriptUpdate: () => {},
 				transport,
 			};
@@ -532,6 +568,9 @@ export class StudioRpcSupervisor {
 				(() => {});
 			active.onSubagentState =
 				transport.onSubagentState?.(subagent => this.#handleSubagentState(studioSessionId, subagent)) ?? (() => {});
+			active.onPlanSummary =
+				transport.onPlanSummary?.(summary => this.#handlePlanSummary(studioSessionId, active, summary)) ??
+				(() => {});
 			active.onTranscriptUpdate =
 				transport.onTranscriptUpdate?.(update => this.#handleTranscriptUpdate(studioSessionId, active, update)) ??
 				(() => {});
@@ -697,12 +736,45 @@ export class StudioRpcSupervisor {
 		this.#events.onSubagentState(studioSessionId, subagent);
 	}
 
+	#handlePlanSummary(studioSessionId: string, active: ActiveStudioRpcSession, summary: StudioRpcPlanSummary): void {
+		if (this.#closed || this.#activeSessions.get(studioSessionId) !== active) return;
+		const run = this.#store.getStudioSession(studioSessionId)?.activeRun;
+		if (!run) return;
+		try {
+			const plan = this.#store.upsertStudioPlanSummary({
+				studioSessionId,
+				runId: run.id,
+				...summary,
+			});
+			if (plan) this.#events.onPlanSummaryUpdated(studioSessionId, plan);
+		} catch {
+			logger.warn("Studio rejected an OMP plan summary", { studioSessionId });
+		}
+	}
+
+	#emitToolDisplayTerminalUpdates(
+		runId: string,
+		status: Extract<StudioToolDisplayStatus, "completed" | "failed" | "cancelled">,
+	): void {
+		for (const display of this.#store.finishStudioRunToolDisplays(runId, status)) {
+			this.#events.onToolDisplayUpdated(display.studioSessionId, display);
+		}
+		this.#toolDisplayIdsByRun.delete(runId);
+	}
+
 	async #refreshUsage(studioSessionId: string, transport: StudioRpcTransport): Promise<void> {
 		if (!transport.getUsage || this.#usageRefreshInFlight.has(studioSessionId)) return;
 		this.#usageRefreshInFlight.add(studioSessionId);
 		try {
 			const usage = await transport.getUsage();
 			const session = this.#store.updateStudioSessionUsage(studioSessionId, usage);
+			if (session?.activeRun) {
+				this.#store.appendStudioUsageHistory({
+					runId: session.activeRun.id,
+					studioSessionId,
+					usage,
+				});
+			}
 			if (session?.usage) this.#events.onUsageUpdated(session, session.usage);
 		} catch (error) {
 			logger.debug("Studio could not refresh OMP session usage", {
@@ -801,6 +873,7 @@ export class StudioRpcSupervisor {
 		this.#interruptRunApprovals(run.id, "rpc_prompt_failed");
 		const failed = this.#store.finishStudioRun(run.id, "failed", "rpc_prompt_failed");
 		if (!failed) return;
+		this.#emitToolDisplayTerminalUpdates(run.id, "failed");
 		this.#finishTranscriptMessages(run.id, "failed");
 		const readySession = this.#store.updateStudioSessionRuntime(studioSessionId, { status: "ready" });
 		if (readySession) this.#events.onRunState(readySession, failed);
@@ -825,6 +898,7 @@ export class StudioRpcSupervisor {
 		this.#interruptRunApprovals(run.id, "run_completed");
 		const completed = this.#store.finishStudioRun(run.id, "completed");
 		if (!completed) return;
+		this.#emitToolDisplayTerminalUpdates(run.id, "completed");
 		this.#finishTranscriptMessages(run.id, "completed");
 		const readySession = this.#store.updateStudioSessionRuntime(studioSessionId, { status: "ready" });
 		if (readySession) this.#events.onRunState(readySession, completed);
@@ -866,13 +940,68 @@ export class StudioRpcSupervisor {
 		}
 	}
 
+	#handleToolDisplayEvent(studioSessionId: string, run: StudioRun, event: StudioRpcAgentEvent): void {
+		if (event.type === "tool_execution_start" && event.toolCallId) {
+			try {
+				const display = this.#store.appendStudioToolDisplay({
+					studioSessionId,
+					runId: run.id,
+					kind: projectStudioToolDisplayKind(event.toolName),
+				});
+				if (!display) return;
+				let displays = this.#toolDisplayIdsByRun.get(run.id);
+				if (!displays) {
+					displays = new Map();
+					this.#toolDisplayIdsByRun.set(run.id, displays);
+				}
+				displays.set(event.toolCallId, display.id);
+				this.#events.onToolDisplayUpdated(studioSessionId, display);
+			} catch {
+				logger.warn("Studio rejected an OMP tool card", { studioSessionId });
+			}
+			return;
+		}
+		if (event.type !== "tool_execution_end" || !event.toolCallId) return;
+		const displays = this.#toolDisplayIdsByRun.get(run.id);
+		const displayId = displays?.get(event.toolCallId);
+		if (!displayId) return;
+		const status: StudioToolDisplayStatus =
+			run.status === "cancelling" ? "cancelled" : event.isError ? "failed" : "completed";
+		try {
+			const display = this.#store.updateStudioToolDisplay(displayId, status);
+			if (!display) return;
+			displays?.delete(event.toolCallId);
+			this.#events.onToolDisplayUpdated(studioSessionId, display);
+		} catch {
+			logger.warn("Studio could not settle an OMP tool card", { studioSessionId });
+		}
+	}
+
 	#handleAgentEvent(studioSessionId: string, event: StudioRpcAgentEvent): void {
 		if (this.#closed) return;
 		const session = this.#store.getStudioSession(studioSessionId);
 		const run = session?.activeRun;
 		if (!session || !run) return;
+		this.#handleToolDisplayEvent(studioSessionId, run, event);
 
-		if (event.type !== "message_update") this.#events.onAgentEvent(studioSessionId, run.id, event);
+		const projection = projectStudioActivityEvent(event, { runCancelling: run.status === "cancelling" });
+		if (projection) {
+			try {
+				const entry = this.#store.appendStudioActivityEntry({
+					runId: run.id,
+					status: projection.status,
+					studioSessionId,
+					subject: projection.subject,
+				});
+				if (entry) this.#events.onActivityUpdated(studioSessionId, entry);
+			} catch {
+				logger.warn("Studio rejected an OMP activity event", { studioSessionId });
+			}
+		}
+
+		if (event.type !== "message_update") {
+			this.#events.onAgentEvent(studioSessionId, run.id, toStudioAgentEvent(event));
+		}
 		const active = this.#activeSessions.get(studioSessionId);
 		if (event.type === "message_end" && active) void this.#refreshUsage(studioSessionId, active.transport);
 		if (isAgentStart(event) && run.status === "starting") {
@@ -886,6 +1015,7 @@ export class StudioRpcSupervisor {
 			status === "cancelled" ? "run_cancelled" : status === "failed" ? "rpc_agent_failed" : "run_completed";
 		this.#interruptRunApprovals(run.id, reason);
 		const completed = this.#store.finishStudioRun(run.id, status);
+		this.#emitToolDisplayTerminalUpdates(run.id, status);
 		this.#finishTranscriptMessages(
 			run.id,
 			status === "cancelled" ? "interrupted" : status === "failed" ? "failed" : "completed",
@@ -909,6 +1039,7 @@ export class StudioRpcSupervisor {
 		active.onPromptFailure();
 		active.onPromptResult();
 		active.onSubagentState();
+		active.onPlanSummary();
 		active.onTranscriptUpdate();
 		this.#activeSessions.delete(studioSessionId);
 		this.#subagentsBySession.delete(studioSessionId);
@@ -919,6 +1050,7 @@ export class StudioRpcSupervisor {
 		const interrupted = activeRun
 			? this.#store.finishStudioRun(activeRun.id, "interrupted", "rpc_child_exited")
 			: undefined;
+		if (activeRun) this.#emitToolDisplayTerminalUpdates(activeRun.id, "cancelled");
 		if (activeRun) this.#interruptRunApprovals(activeRun.id, "rpc_child_exited");
 		if (activeRun) this.#finishTranscriptMessages(activeRun.id, "interrupted");
 		const interruptedSession = this.#store.updateStudioSessionRuntime(studioSessionId, { status: "interrupted" });

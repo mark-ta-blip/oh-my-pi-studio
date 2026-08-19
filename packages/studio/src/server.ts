@@ -7,6 +7,7 @@ import { isEnoent } from "@oh-my-pi/pi-utils/fs-error";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { ensureStudioClientBuild, STUDIO_CLIENT_DIST_DIR } from "./build-client";
 import { type StudioAuthBridge, StudioAuthBridgeError, StudioAuthFlowCoordinator } from "./core/auth-bridge";
+import { type StudioChangeReviewAdapter, StudioChangeReviewError } from "./core/change-review";
 import {
 	StudioRpcSupervisor,
 	StudioRpcSupervisorError,
@@ -18,6 +19,7 @@ import { resolveWorkspaceRegistration, WorkspaceRegistrationError } from "./core
 import embeddedClientArchiveTxt from "./embedded-client.generated.txt";
 import {
 	STUDIO_API_VERSION,
+	type StudioActivityListResponse,
 	type StudioApprovalListResponse,
 	type StudioApprovalResolutionRequest,
 	type StudioApprovalResponse,
@@ -26,6 +28,7 @@ import {
 	type StudioAuthContinueResponse,
 	type StudioAuthProgress,
 	type StudioBootstrap,
+	type StudioChangeSetResponse,
 	type StudioControlLeaseRequest,
 	type StudioControlLeaseResponse,
 	type StudioErrorResponse,
@@ -33,17 +36,21 @@ import {
 	type StudioEventResyncRequired,
 	type StudioEventType,
 	type StudioFeatures,
+	type StudioPlanSummaryResponse,
 	type StudioPromptRequest,
 	type StudioPromptResponse,
 	type StudioProviderListResponse,
 	type StudioProviderLoginResponse,
 	type StudioRunCancelRequest,
+	type StudioRunHistoryResponse,
 	type StudioRunResponse,
 	type StudioSessionCreateRequest,
 	type StudioSessionListResponse,
 	type StudioSessionResponse,
 	type StudioSubagentListResponse,
+	type StudioToolDisplayListResponse,
 	type StudioTranscriptResponse,
+	type StudioUsageHistoryResponse,
 	type StudioWorkspaceListResponse,
 	type StudioWorkspaceResponse,
 } from "./protocol";
@@ -57,6 +64,7 @@ const STUDIO_EVENT_REPLAY_LIMIT = 256;
 const STUDIO_CONTROL_LEASE_DEFAULT_TTL_MS = 45_000;
 const STUDIO_CONTROL_LEASE_MAX_TTL_MS = 300_000;
 const STUDIO_CONTROL_LEASE_MIN_TTL_MS = 5_000;
+const STUDIO_CHANGE_REVIEW_TIMEOUT_MS = 10_000;
 const STUDIO_MAX_PROMPT_LENGTH = 100_000;
 const STUDIO_MAX_SESSION_NAME_LENGTH = 120;
 const EMBEDDED_CLIENT_ARCHIVE = decodeEmbeddedArchive(embeddedClientArchiveTxt);
@@ -76,6 +84,7 @@ let embeddedClientDirPromise: Promise<string> | null = null;
 
 interface StudioRuntime {
 	auth: StudioAuthFlowCoordinator;
+	changeReviewAdapter: StudioChangeReviewAdapter | undefined;
 	eventHistory: StudioEventEnvelope<unknown>[];
 	localUrlToken: string;
 	localUrlTokenConsumed: boolean;
@@ -103,6 +112,7 @@ const BunWebSocket = WebSocket as unknown as BunWebSocketConstructor;
 
 export interface StudioServerOptions {
 	authBridge?: StudioAuthBridge;
+	changeReviewAdapter?: StudioChangeReviewAdapter;
 	dbPath?: string;
 	port?: number;
 	rpcTransportFactory?: StudioRpcTransportFactory;
@@ -122,7 +132,12 @@ function createAccessToken(): string {
 	return Buffer.from(bytes).toString("base64url");
 }
 
-function getBootstrap(profile: string, providerOnboarding: boolean, rpcSupervisor: boolean): StudioBootstrap {
+function getBootstrap(
+	profile: string,
+	providerOnboarding: boolean,
+	rpcSupervisor: boolean,
+	changeReview: boolean,
+): StudioBootstrap {
 	const features: StudioFeatures = {
 		localAccess: true,
 		webSocketEvents: true,
@@ -133,6 +148,12 @@ function getBootstrap(profile: string, providerOnboarding: boolean, rpcSuperviso
 		approvalControls: rpcSupervisor,
 		subagentVisibility: rpcSupervisor,
 		usageSummary: rpcSupervisor,
+		activityTimeline: rpcSupervisor,
+		toolCards: rpcSupervisor,
+		planSummary: rpcSupervisor,
+		changeReview,
+		runHistory: rpcSupervisor,
+		usageHistory: rpcSupervisor,
 		auditReview: true,
 	};
 	return {
@@ -339,7 +360,18 @@ function parseStudioSessionId(pathname: string): string | null {
 
 function parseStudioSessionActionId(
 	pathname: string,
-	action: "lease" | "prompts" | "approvals" | "subagents" | "transcript",
+	action:
+		| "lease"
+		| "prompts"
+		| "approvals"
+		| "subagents"
+		| "transcript"
+		| "activity"
+		| "tools"
+		| "plan"
+		| "changes"
+		| "runs"
+		| "usage-history",
 ): string | null {
 	return decodePathId(pathname, new RegExp(`^/api/v1/sessions/([^/]+)/${action}$`), /^sts_[a-f0-9]{32}$/);
 }
@@ -719,6 +751,101 @@ function handleSessionTranscript(request: Request, studioSessionId: string, runt
 	return jsonResponse(body);
 }
 
+function handleSessionActivity(request: Request, studioSessionId: string, runtime: StudioRuntime): Response {
+	if (request.method !== "GET") {
+		return errorResponse(405, "method_not_allowed", "Studio session activity supports GET requests.");
+	}
+	if (!runtime.store.getStudioSession(studioSessionId)) {
+		return errorResponse(404, "studio_session_not_found", "The requested Studio session was not found.");
+	}
+	const body: StudioActivityListResponse = {
+		entries: runtime.store.listStudioActivityEntries(studioSessionId),
+	};
+	return jsonResponse(body);
+}
+
+function handleSessionRunHistory(request: Request, studioSessionId: string, runtime: StudioRuntime): Response {
+	if (request.method !== "GET") {
+		return errorResponse(405, "method_not_allowed", "Studio session run history supports GET requests.");
+	}
+	if (!runtime.store.getStudioSession(studioSessionId)) {
+		return errorResponse(404, "studio_session_not_found", "The requested Studio session was not found.");
+	}
+	const body: StudioRunHistoryResponse = { runs: runtime.store.listStudioRuns(studioSessionId) };
+	return jsonResponse(body);
+}
+
+function handleSessionUsageHistory(request: Request, studioSessionId: string, runtime: StudioRuntime): Response {
+	if (request.method !== "GET") {
+		return errorResponse(405, "method_not_allowed", "Studio session usage history supports GET requests.");
+	}
+	if (!runtime.store.getStudioSession(studioSessionId)) {
+		return errorResponse(404, "studio_session_not_found", "The requested Studio session was not found.");
+	}
+	const body: StudioUsageHistoryResponse = { entries: runtime.store.listStudioUsageHistory(studioSessionId) };
+	return jsonResponse(body);
+}
+
+function handleSessionToolDisplays(request: Request, studioSessionId: string, runtime: StudioRuntime): Response {
+	if (request.method !== "GET") {
+		return errorResponse(405, "method_not_allowed", "Studio session tool cards support GET requests.");
+	}
+	if (!runtime.store.getStudioSession(studioSessionId)) {
+		return errorResponse(404, "studio_session_not_found", "The requested Studio session was not found.");
+	}
+	const body: StudioToolDisplayListResponse = {
+		cards: runtime.store.listStudioToolDisplays(studioSessionId),
+	};
+	return jsonResponse(body);
+}
+
+function handleSessionPlanSummary(request: Request, studioSessionId: string, runtime: StudioRuntime): Response {
+	if (request.method !== "GET") {
+		return errorResponse(405, "method_not_allowed", "Studio session plan summaries support GET requests.");
+	}
+	if (!runtime.store.getStudioSession(studioSessionId)) {
+		return errorResponse(404, "studio_session_not_found", "The requested Studio session was not found.");
+	}
+	const plan = runtime.store.getStudioPlanSummary(studioSessionId);
+	const body: StudioPlanSummaryResponse = plan ? { plan } : {};
+	return jsonResponse(body);
+}
+
+async function handleSessionChanges(
+	request: Request,
+	studioSessionId: string,
+	runtime: StudioRuntime,
+): Promise<Response> {
+	if (request.method !== "GET") {
+		return errorResponse(405, "method_not_allowed", "Studio session changes support GET requests.");
+	}
+	const session = runtime.store.getStudioSession(studioSessionId);
+	if (!session) return errorResponse(404, "studio_session_not_found", "The requested Studio session was not found.");
+	const adapter = runtime.changeReviewAdapter;
+	if (!adapter) {
+		return errorResponse(501, "change_review_unavailable", "Change review is unavailable in this Studio host.");
+	}
+	const workspacePath = runtime.store.getWorkspaceCanonicalPath(session.workspaceId);
+	if (!workspacePath) {
+		return errorResponse(404, "studio_workspace_not_found", "The requested Studio workspace was not found.");
+	}
+	try {
+		const body: StudioChangeSetResponse = {
+			changeSet: await adapter.getChangeSet({
+				signal: AbortSignal.timeout(STUDIO_CHANGE_REVIEW_TIMEOUT_MS),
+				workspacePath,
+			}),
+		};
+		return jsonResponse(body);
+	} catch (error) {
+		if (error instanceof StudioChangeReviewError && error.code === "not_repository") {
+			return errorResponse(409, "change_review_not_repository", "The registered project is not a Git repository.");
+		}
+		logger.warn("Studio could not load a workspace change set", { studioSessionId });
+		return errorResponse(503, "change_review_unavailable", "Studio could not load this project's change set.");
+	}
+}
+
 async function handleSessionLease(
 	request: Request,
 	studioSessionId: string,
@@ -916,7 +1043,12 @@ function sendConnectionEvents(
 		createConnectionEvent(
 			runtime,
 			"studio.ready",
-			getBootstrap(runtime.profile, runtime.auth.enabled, runtime.supervisor.enabled),
+			getBootstrap(
+				runtime.profile,
+				runtime.auth.enabled,
+				runtime.supervisor.enabled,
+				runtime.changeReviewAdapter !== undefined,
+			),
 		),
 	);
 	if (afterSequence === undefined) return;
@@ -1108,8 +1240,14 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 	const auth = new StudioAuthFlowCoordinator(options.authBridge, progress => publishAuthProgress(progress));
 	let runtime: StudioRuntime;
 	const supervisorEvents: StudioRpcSupervisorEvents = {
+		onActivityUpdated: (studioSessionId, entry) => {
+			broadcastEvent(runtime, "activity.updated", entry, { studioSessionId, runId: entry.runId });
+		},
 		onAgentEvent: (studioSessionId, runId, event) => {
 			broadcastEvent(runtime, "agent.event", event, { studioSessionId, runId });
+		},
+		onPlanSummaryUpdated: (studioSessionId, plan) => {
+			broadcastEvent(runtime, "plan.updated", plan, { studioSessionId, runId: plan.runId });
 		},
 		onApprovalRequested: (studioSessionId, approval) => {
 			broadcastEvent(runtime, "approval.requested", approval, { studioSessionId, runId: approval.runId });
@@ -1123,6 +1261,9 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 		onSubagentState: (studioSessionId, subagent) => {
 			broadcastEvent(runtime, "subagent.state", subagent, { studioSessionId });
 		},
+		onToolDisplayUpdated: (studioSessionId, display) => {
+			broadcastEvent(runtime, "tool.display_updated", display, { studioSessionId, runId: display.runId });
+		},
 		onTranscriptUpdated: (studioSessionId, message) => {
 			broadcastEvent(runtime, "transcript.updated", message, { studioSessionId, runId: message.runId });
 		},
@@ -1134,6 +1275,7 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 
 	runtime = {
 		auth,
+		changeReviewAdapter: options.changeReviewAdapter,
 		eventHistory: [],
 		localUrlToken: createAccessToken(),
 		localUrlTokenConsumed: false,
@@ -1161,7 +1303,14 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 					}
 
 					if (url.pathname === "/api/v1/bootstrap" && request.method === "GET") {
-						return jsonResponse(getBootstrap(runtime.profile, runtime.auth.enabled, runtime.supervisor.enabled));
+						return jsonResponse(
+							getBootstrap(
+								runtime.profile,
+								runtime.auth.enabled,
+								runtime.supervisor.enabled,
+								runtime.changeReviewAdapter !== undefined,
+							),
+						);
 					}
 					if (url.pathname === "/api/v1/audit") return handleAuditCollection(request, url, runtime);
 
@@ -1186,6 +1335,21 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 					if (sessionSubagentId !== null) return handleSessionSubagents(request, sessionSubagentId, runtime);
 					const sessionTranscriptId = parseStudioSessionActionId(url.pathname, "transcript");
 					if (sessionTranscriptId !== null) return handleSessionTranscript(request, sessionTranscriptId, runtime);
+					const sessionActivityId = parseStudioSessionActionId(url.pathname, "activity");
+					if (sessionActivityId !== null) return handleSessionActivity(request, sessionActivityId, runtime);
+					const sessionRunHistoryId = parseStudioSessionActionId(url.pathname, "runs");
+					if (sessionRunHistoryId !== null) return handleSessionRunHistory(request, sessionRunHistoryId, runtime);
+					const sessionUsageHistoryId = parseStudioSessionActionId(url.pathname, "usage-history");
+					if (sessionUsageHistoryId !== null)
+						return handleSessionUsageHistory(request, sessionUsageHistoryId, runtime);
+					const sessionToolDisplayId = parseStudioSessionActionId(url.pathname, "tools");
+					if (sessionToolDisplayId !== null)
+						return handleSessionToolDisplays(request, sessionToolDisplayId, runtime);
+					const sessionPlanSummaryId = parseStudioSessionActionId(url.pathname, "plan");
+					if (sessionPlanSummaryId !== null)
+						return handleSessionPlanSummary(request, sessionPlanSummaryId, runtime);
+					const sessionChangesId = parseStudioSessionActionId(url.pathname, "changes");
+					if (sessionChangesId !== null) return await handleSessionChanges(request, sessionChangesId, runtime);
 					const studioSessionId = parseStudioSessionId(url.pathname);
 					if (studioSessionId !== null) return handleSessionItem(request, studioSessionId, runtime);
 					const runCancelId = parseStudioRunCancelId(url.pathname);

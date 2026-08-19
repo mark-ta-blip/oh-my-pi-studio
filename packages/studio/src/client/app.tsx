@@ -1,5 +1,7 @@
 import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+	StudioActivityEntry,
+	StudioActivityListResponse,
 	StudioApproval,
 	StudioApprovalListResponse,
 	StudioApprovalResponse,
@@ -7,46 +9,52 @@ import type {
 	StudioAuthContinueResponse,
 	StudioAuthProgress,
 	StudioBootstrap,
+	StudioChangeSet,
+	StudioChangeSetResponse,
 	StudioControlLeaseResponse,
 	StudioEventEnvelope,
 	StudioEventResyncRequired,
+	StudioPlanSummary,
+	StudioPlanSummaryResponse,
 	StudioPromptResponse,
 	StudioProvider,
 	StudioProviderListResponse,
 	StudioProviderLoginResponse,
 	StudioRun,
+	StudioRunHistoryResponse,
 	StudioRunResponse,
 	StudioSession,
 	StudioSessionListResponse,
 	StudioSessionResponse,
 	StudioSubagent,
 	StudioSubagentListResponse,
+	StudioToolDisplay,
+	StudioToolDisplayListResponse,
 	StudioTranscriptMessage,
 	StudioTranscriptResponse,
 	StudioUsage,
+	StudioUsageHistoryEntry,
+	StudioUsageHistoryResponse,
 	StudioWorkspace,
 	StudioWorkspaceListResponse,
 	StudioWorkspaceResponse,
 } from "../protocol";
+import { mergeStudioActivitySnapshot, upsertStudioActivityEntry } from "./activity-state";
 import { mergeStudioAuthProgress } from "./auth-flow";
+import type { StudioContextPanel } from "./context-panel";
+import { StudioConversationPane } from "./conversation/conversation-pane";
+import { mergeStudioRunHistorySnapshot, upsertStudioRunHistory } from "./history/run-history-state";
+import { StudioSessionInspector } from "./inspector/session-inspector";
+import { StudioSessionRail } from "./navigation/session-rail";
+import { mergeStudioPlanSummary } from "./plan-state";
 import { isActiveRun, isTerminalRunStatus, mergeStudioSessionSnapshot, reconcileStudioSession } from "./session-state";
+import { type StudioConnectionState, StudioTitlebar } from "./shell/titlebar";
+import { mergeStudioToolDisplaySnapshot, upsertStudioToolDisplay } from "./tool-display-state";
 import { mergeStudioTranscriptSnapshot, upsertStudioTranscriptMessage } from "./transcript-state";
 
-type ConnectionState = "connecting" | "ready" | "offline";
+type ConnectionState = StudioConnectionState;
 
 const STUDIO_MUTATION_TIMEOUT_MS = 30_000;
-
-interface StudioAgentEventItem {
-	emittedAtMs: number;
-	runId: string;
-	sequence: number;
-	studioSessionId: string;
-	summary: string;
-	toolName?: string;
-	type: string;
-}
-
-type StudioAgentEventData = Record<string, unknown> & { type: string };
 
 function parseStudioReady(message: unknown): message is StudioEventEnvelope<StudioBootstrap> {
 	if (!message || typeof message !== "object") return false;
@@ -81,21 +89,6 @@ function parseRunState(message: unknown): message is StudioEventEnvelope<StudioR
 		typeof data.id === "string" &&
 		typeof data.status === "string" &&
 		typeof data.studioSessionId === "string"
-	);
-}
-
-function parseAgentEvent(message: unknown): message is StudioEventEnvelope<StudioAgentEventData> & {
-	runId: string;
-	studioSessionId: string;
-} {
-	if (!message || typeof message !== "object") return false;
-	const event = message as Record<string, unknown>;
-	return (
-		event.type === "agent.event" &&
-		typeof event.runId === "string" &&
-		typeof event.studioSessionId === "string" &&
-		isRecord(event.data) &&
-		typeof event.data.type === "string"
 	);
 }
 
@@ -236,6 +229,10 @@ function upsertSubagent(subagents: StudioSubagent[], subagent: StudioSubagent): 
 	);
 }
 
+function invalidateSessionRequestIds(requestIds: Map<string, number>): void {
+	for (const [studioSessionId, requestId] of requestIds) requestIds.set(studioSessionId, requestId + 1);
+}
+
 function createHolderId(): string {
 	const storageKey = "omp-studio-holder-id";
 	try {
@@ -247,17 +244,6 @@ function createHolderId(): string {
 	} catch {
 		return `tab_${crypto.randomUUID().replaceAll("-", "")}`;
 	}
-}
-
-function summarizeAgentEvent(event: Record<string, unknown>): string {
-	const type = typeof event.type === "string" ? event.type : "agent event";
-	const toolName = typeof event.toolName === "string" ? event.toolName : "a tool";
-	if (type === "message_update") return "Assistant response is streaming.";
-	if (type === "tool_execution_start") return `OMP started ${toolName}.`;
-	if (type === "tool_execution_end") return `OMP finished ${toolName}.`;
-	if (type === "agent_end" && event.isTerminal === false) return "OMP will continue this run.";
-	if (type === "agent_end") return "OMP reached the end of this run.";
-	return type.replaceAll("_", " ");
 }
 
 function providerState(provider: StudioProvider): string {
@@ -274,19 +260,8 @@ function isActiveAuthFlow(progress: StudioAuthProgress): boolean {
 	return progress.phase === "authorization" || progress.phase === "progress" || progress.phase === "prompt";
 }
 
-function formatWorkspaceDate(timestamp: number): string {
-	return new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", year: "numeric" }).format(timestamp);
-}
-
-function formatCount(value: number): string {
-	return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
-}
-
-function formatCost(value: number): string {
-	return new Intl.NumberFormat(undefined, {
-		maximumFractionDigits: 4,
-		minimumFractionDigits: value > 0 ? 2 : 0,
-	}).format(value);
+function prefersOverlayPanels(): boolean {
+	return typeof window !== "undefined" && window.matchMedia("(max-width: 860px)").matches;
 }
 
 const selectedSessionStorageKey = "omp-studio-selected-session";
@@ -336,20 +311,111 @@ function parseTranscriptUpdated(
 	);
 }
 
-function sessionTitle(session: StudioSession): string {
-	return session.name ?? `Session ${session.id.slice(4, 12)}`;
+function isStudioActivityEntry(value: unknown): value is StudioActivityEntry {
+	if (!isRecord(value)) return false;
+	return (
+		typeof value.id === "string" &&
+		typeof value.studioSessionId === "string" &&
+		typeof value.runId === "string" &&
+		typeof value.occurredAtMs === "number" &&
+		Number.isSafeInteger(value.occurredAtMs) &&
+		value.occurredAtMs >= 0 &&
+		typeof value.subject === "string" &&
+		[
+			"agent",
+			"command",
+			"file_read",
+			"file_write",
+			"file_search",
+			"web",
+			"task",
+			"context",
+			"retry",
+			"tool",
+			"system",
+		].includes(value.subject) &&
+		typeof value.status === "string" &&
+		["running", "completed", "failed", "cancelled"].includes(value.status)
+	);
 }
 
-function formatShortTime(timestamp: number): string {
-	return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(timestamp);
+function parseActivityUpdated(
+	message: unknown,
+): message is StudioEventEnvelope<StudioActivityEntry> & { runId: string; studioSessionId: string } {
+	if (!isRecord(message)) return false;
+	return (
+		message.type === "activity.updated" &&
+		typeof message.runId === "string" &&
+		typeof message.studioSessionId === "string" &&
+		isStudioActivityEntry(message.data) &&
+		message.data.runId === message.runId &&
+		message.data.studioSessionId === message.studioSessionId
+	);
 }
 
-function transcriptDisplayText(message: StudioTranscriptMessage): string {
-	if (message.text) return message.text;
-	if (message.role !== "assistant") return "";
-	if (message.status === "failed") return "OMP could not complete this response.";
-	if (message.status === "interrupted") return "OMP stopped this response.";
-	return "";
+function isStudioToolDisplay(value: unknown): value is StudioToolDisplay {
+	if (!isRecord(value)) return false;
+	return (
+		typeof value.id === "string" &&
+		typeof value.studioSessionId === "string" &&
+		typeof value.runId === "string" &&
+		typeof value.kind === "string" &&
+		["command", "file_read", "file_write", "file_search", "web", "task", "tool"].includes(value.kind) &&
+		typeof value.status === "string" &&
+		["running", "completed", "failed", "cancelled"].includes(value.status) &&
+		typeof value.startedAtMs === "number" &&
+		Number.isSafeInteger(value.startedAtMs) &&
+		value.startedAtMs >= 0 &&
+		typeof value.updatedAtMs === "number" &&
+		Number.isSafeInteger(value.updatedAtMs) &&
+		value.updatedAtMs >= value.startedAtMs
+	);
+}
+
+function parseToolDisplayUpdated(
+	message: unknown,
+): message is StudioEventEnvelope<StudioToolDisplay> & { runId: string; studioSessionId: string } {
+	if (!isRecord(message)) return false;
+	return (
+		message.type === "tool.display_updated" &&
+		typeof message.runId === "string" &&
+		typeof message.studioSessionId === "string" &&
+		isStudioToolDisplay(message.data) &&
+		message.data.runId === message.runId &&
+		message.data.studioSessionId === message.studioSessionId
+	);
+}
+
+function isStudioPlanSummary(value: unknown): value is StudioPlanSummary {
+	if (!isRecord(value)) return false;
+	if (typeof value.studioSessionId !== "string" || typeof value.runId !== "string") return false;
+	const countKeys = [
+		"totalTaskCount",
+		"pendingTaskCount",
+		"inProgressTaskCount",
+		"completedTaskCount",
+		"blockedTaskCount",
+		"abandonedTaskCount",
+		"updatedAtMs",
+	];
+	return countKeys.every(key => {
+		const count = value[key];
+		return typeof count === "number" && Number.isSafeInteger(count) && count >= 0;
+	});
+}
+
+function parsePlanUpdated(
+	message: unknown,
+): message is StudioEventEnvelope<StudioPlanSummary> & { runId: string; studioSessionId: string } {
+	if (!isRecord(message)) return false;
+	return (
+		message.type === "plan.updated" &&
+		typeof message.runId === "string" &&
+		typeof message.studioSessionId === "string" &&
+		isStudioPlanSummary(message.data) &&
+		message.data.runId === message.runId &&
+		message.data.studioSessionId === message.studioSessionId
+	);
 }
 
 export function App(): ReactNode {
@@ -379,12 +445,33 @@ export function App(): ReactNode {
 	const [sessionModelId, setSessionModelId] = useState("");
 	const [sessionPending, setSessionPending] = useState(false);
 	const [selectedSessionId, setSelectedSessionId] = useState<string | null>(loadStoredSessionId);
+	const [contextPanel, setContextPanel] = useState<StudioContextPanel>("overview");
+	const [contextOpen, setContextOpen] = useState(() => !prefersOverlayPanels());
+	const [navigationOpen, setNavigationOpen] = useState(false);
 	const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>({});
 	const [promptPending, setPromptPending] = useState(false);
 	const [cancelPending, setCancelPending] = useState(false);
 	const [transcriptBySession, setTranscriptBySession] = useState<Record<string, StudioTranscriptMessage[]>>({});
 	const [transcriptErrorsBySession, setTranscriptErrorsBySession] = useState<Record<string, string>>({});
 	const [transcriptLoadingBySession, setTranscriptLoadingBySession] = useState<Record<string, boolean>>({});
+	const [activityBySession, setActivityBySession] = useState<Record<string, StudioActivityEntry[]>>({});
+	const [activityErrorsBySession, setActivityErrorsBySession] = useState<Record<string, string>>({});
+	const [activityLoadingBySession, setActivityLoadingBySession] = useState<Record<string, boolean>>({});
+	const [toolDisplaysBySession, setToolDisplaysBySession] = useState<Record<string, StudioToolDisplay[]>>({});
+	const [toolDisplayErrorsBySession, setToolDisplayErrorsBySession] = useState<Record<string, string>>({});
+	const [toolDisplayLoadingBySession, setToolDisplayLoadingBySession] = useState<Record<string, boolean>>({});
+	const [plansBySession, setPlansBySession] = useState<Record<string, StudioPlanSummary | undefined>>({});
+	const [planErrorsBySession, setPlanErrorsBySession] = useState<Record<string, string>>({});
+	const [planLoadingBySession, setPlanLoadingBySession] = useState<Record<string, boolean>>({});
+	const [changeSetsBySession, setChangeSetsBySession] = useState<Record<string, StudioChangeSet | undefined>>({});
+	const [changeSetErrorsBySession, setChangeSetErrorsBySession] = useState<Record<string, string>>({});
+	const [changeSetLoadingBySession, setChangeSetLoadingBySession] = useState<Record<string, boolean>>({});
+	const [runHistoryBySession, setRunHistoryBySession] = useState<Record<string, StudioRun[]>>({});
+	const [runHistoryErrorsBySession, setRunHistoryErrorsBySession] = useState<Record<string, string>>({});
+	const [runHistoryLoadingBySession, setRunHistoryLoadingBySession] = useState<Record<string, boolean>>({});
+	const [usageHistoryBySession, setUsageHistoryBySession] = useState<Record<string, StudioUsageHistoryEntry[]>>({});
+	const [usageHistoryErrorsBySession, setUsageHistoryErrorsBySession] = useState<Record<string, string>>({});
+	const [usageHistoryLoadingBySession, setUsageHistoryLoadingBySession] = useState<Record<string, boolean>>({});
 	const setupAutoOpenedRef = useRef(false);
 	const [setupOpen, setSetupOpen] = useState(() => {
 		const shouldOpen = loadStoredSessionId() === null;
@@ -393,7 +480,6 @@ export function App(): ReactNode {
 	});
 	const [controlPendingId, setControlPendingId] = useState<string | null>(null);
 	const [leaseExpiresAtMs, setLeaseExpiresAtMs] = useState<Record<string, number>>({});
-	const [agentEventsBySession, setAgentEventsBySession] = useState<Record<string, StudioAgentEventItem[]>>({});
 	const [approvalPendingId, setApprovalPendingId] = useState<string | null>(null);
 	const [approvalsBySession, setApprovalsBySession] = useState<Record<string, StudioApproval[]>>({});
 	const [subagentsBySession, setSubagentsBySession] = useState<Record<string, StudioSubagent[]>>({});
@@ -407,12 +493,31 @@ export function App(): ReactNode {
 	const notifiedRunIdsRef = useRef(new Set<string>());
 	const runStateBySessionRef = useRef(new Map<string, StudioRun>());
 	const sessionSnapshotVersionRef = useRef(0);
+	const sessionListRequestIdRef = useRef(0);
 	const transcriptRequestIdsRef = useRef(new Map<string, number>());
+	const activityRequestIdsRef = useRef(new Map<string, number>());
+	const toolDisplayRequestIdsRef = useRef(new Map<string, number>());
+	const planRequestIdsRef = useRef(new Map<string, number>());
+	const changeSetRequestIdsRef = useRef(new Map<string, number>());
+	const runHistoryRequestIdsRef = useRef(new Map<string, number>());
+	const usageHistoryRequestIdsRef = useRef(new Map<string, number>());
 	const conversationScrollFrameRef = useRef<number | undefined>(undefined);
 	const shouldAutoScrollConversationRef = useRef(true);
 	const openSetup = useCallback((): void => {
 		setupAutoOpenedRef.current = false;
 		setSetupOpen(true);
+	}, []);
+	const openNavigation = useCallback((): void => {
+		setContextOpen(false);
+		setNavigationOpen(true);
+	}, []);
+	const openContext = useCallback((panel: StudioContextPanel): void => {
+		setContextPanel(panel);
+		setNavigationOpen(false);
+		setContextOpen(true);
+	}, []);
+	const closeContext = useCallback((): void => {
+		setContextOpen(false);
 	}, []);
 
 	const loadProviders = useCallback(async (): Promise<void> => {
@@ -428,12 +533,15 @@ export function App(): ReactNode {
 	}, []);
 
 	const loadSessions = useCallback(async (): Promise<void> => {
+		const requestId = sessionListRequestIdRef.current + 1;
+		sessionListRequestIdRef.current = requestId;
 		const snapshotVersion = sessionSnapshotVersionRef.current;
 		setSessionError(null);
 		try {
 			const response = await fetch("/api/v1/sessions");
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioSessionListResponse;
+			if (sessionListRequestIdRef.current !== requestId) return;
 			const snapshot = body.sessions.map(session => {
 				const reconciled = reconcileStudioSession(session, undefined, runStateBySessionRef.current.get(session.id));
 				if (reconciled.run) runStateBySessionRef.current.set(session.id, reconciled.run);
@@ -452,7 +560,9 @@ export function App(): ReactNode {
 				return sortSessions([...merged, ...snapshotById.values()]);
 			});
 		} catch (reason) {
-			setSessionError(reason instanceof Error ? reason.message : "Studio could not load local sessions.");
+			if (sessionListRequestIdRef.current === requestId) {
+				setSessionError(reason instanceof Error ? reason.message : "Studio could not load local sessions.");
+			}
 		}
 	}, []);
 
@@ -489,6 +599,222 @@ export function App(): ReactNode {
 		} finally {
 			if (transcriptRequestIdsRef.current.get(studioSessionId) === requestId) {
 				setTranscriptLoadingBySession(current => ({ ...current, [studioSessionId]: false }));
+			}
+		}
+	}, []);
+
+	const loadActivity = useCallback(async (studioSessionId: string): Promise<void> => {
+		const requestId = (activityRequestIdsRef.current.get(studioSessionId) ?? 0) + 1;
+		activityRequestIdsRef.current.set(studioSessionId, requestId);
+		setActivityErrorsBySession(current => {
+			const next = { ...current };
+			delete next[studioSessionId];
+			return next;
+		});
+		setActivityLoadingBySession(current => ({ ...current, [studioSessionId]: true }));
+		try {
+			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/activity`);
+			if (activityRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			if (response.status === 404) {
+				setActivityBySession(current => ({ ...current, [studioSessionId]: current[studioSessionId] ?? [] }));
+				return;
+			}
+			if (!response.ok) throw new Error(await responseError(response));
+			const body = (await response.json()) as StudioActivityListResponse;
+			if (activityRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			setActivityBySession(current => ({
+				...current,
+				[studioSessionId]: mergeStudioActivitySnapshot(current[studioSessionId] ?? [], body.entries),
+			}));
+		} catch (reason) {
+			if (activityRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setActivityErrorsBySession(current => ({
+					...current,
+					[studioSessionId]: reason instanceof Error ? reason.message : "Studio could not load run activity.",
+				}));
+			}
+		} finally {
+			if (activityRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setActivityLoadingBySession(current => ({ ...current, [studioSessionId]: false }));
+			}
+		}
+	}, []);
+
+	const loadToolDisplays = useCallback(async (studioSessionId: string): Promise<void> => {
+		const requestId = (toolDisplayRequestIdsRef.current.get(studioSessionId) ?? 0) + 1;
+		toolDisplayRequestIdsRef.current.set(studioSessionId, requestId);
+		setToolDisplayErrorsBySession(current => {
+			const next = { ...current };
+			delete next[studioSessionId];
+			return next;
+		});
+		setToolDisplayLoadingBySession(current => ({ ...current, [studioSessionId]: true }));
+		try {
+			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/tools`);
+			if (toolDisplayRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			if (response.status === 404) {
+				setToolDisplaysBySession(current => ({ ...current, [studioSessionId]: current[studioSessionId] ?? [] }));
+				return;
+			}
+			if (!response.ok) throw new Error(await responseError(response));
+			const body = (await response.json()) as StudioToolDisplayListResponse;
+			if (toolDisplayRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			setToolDisplaysBySession(current => ({
+				...current,
+				[studioSessionId]: mergeStudioToolDisplaySnapshot(current[studioSessionId] ?? [], body.cards),
+			}));
+		} catch (reason) {
+			if (toolDisplayRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setToolDisplayErrorsBySession(current => ({
+					...current,
+					[studioSessionId]: reason instanceof Error ? reason.message : "Studio could not load tool cards.",
+				}));
+			}
+		} finally {
+			if (toolDisplayRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setToolDisplayLoadingBySession(current => ({ ...current, [studioSessionId]: false }));
+			}
+		}
+	}, []);
+
+	const loadPlanSummary = useCallback(async (studioSessionId: string): Promise<void> => {
+		const requestId = (planRequestIdsRef.current.get(studioSessionId) ?? 0) + 1;
+		planRequestIdsRef.current.set(studioSessionId, requestId);
+		setPlanErrorsBySession(current => {
+			const next = { ...current };
+			delete next[studioSessionId];
+			return next;
+		});
+		setPlanLoadingBySession(current => ({ ...current, [studioSessionId]: true }));
+		try {
+			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/plan`);
+			if (planRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			if (response.status === 404) {
+				setPlansBySession(current => ({ ...current, [studioSessionId]: current[studioSessionId] }));
+				return;
+			}
+			if (!response.ok) throw new Error(await responseError(response));
+			const body = (await response.json()) as StudioPlanSummaryResponse;
+			if (planRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			setPlansBySession(current => ({
+				...current,
+				[studioSessionId]: mergeStudioPlanSummary(current[studioSessionId], body.plan),
+			}));
+		} catch (reason) {
+			if (planRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setPlanErrorsBySession(current => ({
+					...current,
+					[studioSessionId]: reason instanceof Error ? reason.message : "Studio could not load plan progress.",
+				}));
+			}
+		} finally {
+			if (planRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setPlanLoadingBySession(current => ({ ...current, [studioSessionId]: false }));
+			}
+		}
+	}, []);
+
+	const loadChangeSet = useCallback(async (studioSessionId: string): Promise<void> => {
+		const requestId = (changeSetRequestIdsRef.current.get(studioSessionId) ?? 0) + 1;
+		changeSetRequestIdsRef.current.set(studioSessionId, requestId);
+		setChangeSetErrorsBySession(current => {
+			const next = { ...current };
+			delete next[studioSessionId];
+			return next;
+		});
+		setChangeSetLoadingBySession(current => ({ ...current, [studioSessionId]: true }));
+		try {
+			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/changes`);
+			if (changeSetRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			if (response.status === 404) {
+				setChangeSetsBySession(current => ({ ...current, [studioSessionId]: current[studioSessionId] }));
+				return;
+			}
+			if (!response.ok) throw new Error(await responseError(response));
+			const body = (await response.json()) as StudioChangeSetResponse;
+			if (changeSetRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			setChangeSetsBySession(current => ({ ...current, [studioSessionId]: body.changeSet }));
+		} catch (reason) {
+			if (changeSetRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setChangeSetErrorsBySession(current => ({
+					...current,
+					[studioSessionId]: reason instanceof Error ? reason.message : "Studio could not load project changes.",
+				}));
+			}
+		} finally {
+			if (changeSetRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setChangeSetLoadingBySession(current => ({ ...current, [studioSessionId]: false }));
+			}
+		}
+	}, []);
+
+	const loadRunHistory = useCallback(async (studioSessionId: string): Promise<void> => {
+		const requestId = (runHistoryRequestIdsRef.current.get(studioSessionId) ?? 0) + 1;
+		runHistoryRequestIdsRef.current.set(studioSessionId, requestId);
+		setRunHistoryErrorsBySession(current => {
+			const next = { ...current };
+			delete next[studioSessionId];
+			return next;
+		});
+		setRunHistoryLoadingBySession(current => ({ ...current, [studioSessionId]: true }));
+		try {
+			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/runs`);
+			if (runHistoryRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			if (response.status === 404) {
+				setRunHistoryBySession(current => ({ ...current, [studioSessionId]: current[studioSessionId] ?? [] }));
+				return;
+			}
+			if (!response.ok) throw new Error(await responseError(response));
+			const body = (await response.json()) as StudioRunHistoryResponse;
+			if (runHistoryRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			setRunHistoryBySession(current => ({
+				...current,
+				[studioSessionId]: mergeStudioRunHistorySnapshot(current[studioSessionId] ?? [], body.runs),
+			}));
+		} catch (reason) {
+			if (runHistoryRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setRunHistoryErrorsBySession(current => ({
+					...current,
+					[studioSessionId]: reason instanceof Error ? reason.message : "Studio could not load run history.",
+				}));
+			}
+		} finally {
+			if (runHistoryRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setRunHistoryLoadingBySession(current => ({ ...current, [studioSessionId]: false }));
+			}
+		}
+	}, []);
+
+	const loadUsageHistory = useCallback(async (studioSessionId: string): Promise<void> => {
+		const requestId = (usageHistoryRequestIdsRef.current.get(studioSessionId) ?? 0) + 1;
+		usageHistoryRequestIdsRef.current.set(studioSessionId, requestId);
+		setUsageHistoryErrorsBySession(current => {
+			const next = { ...current };
+			delete next[studioSessionId];
+			return next;
+		});
+		setUsageHistoryLoadingBySession(current => ({ ...current, [studioSessionId]: true }));
+		try {
+			const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/usage-history`);
+			if (usageHistoryRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			if (response.status === 404) {
+				setUsageHistoryBySession(current => ({ ...current, [studioSessionId]: current[studioSessionId] ?? [] }));
+				return;
+			}
+			if (!response.ok) throw new Error(await responseError(response));
+			const body = (await response.json()) as StudioUsageHistoryResponse;
+			if (usageHistoryRequestIdsRef.current.get(studioSessionId) !== requestId) return;
+			setUsageHistoryBySession(current => ({ ...current, [studioSessionId]: body.entries }));
+		} catch (reason) {
+			if (usageHistoryRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setUsageHistoryErrorsBySession(current => ({
+					...current,
+					[studioSessionId]: reason instanceof Error ? reason.message : "Studio could not load usage history.",
+				}));
+			}
+		} finally {
+			if (usageHistoryRequestIdsRef.current.get(studioSessionId) === requestId) {
+				setUsageHistoryLoadingBySession(current => ({ ...current, [studioSessionId]: false }));
 			}
 		}
 	}, []);
@@ -580,6 +906,36 @@ export function App(): ReactNode {
 		}
 		void loadTranscript(selectedSessionId);
 	}, [loadTranscript, resyncRevision, selectedSessionId]);
+
+	useEffect(() => {
+		if (!selectedSessionId || !bootstrap?.features.activityTimeline) return;
+		void loadActivity(selectedSessionId);
+	}, [bootstrap?.features.activityTimeline, loadActivity, resyncRevision, selectedSessionId]);
+
+	useEffect(() => {
+		if (!selectedSessionId || !bootstrap?.features.toolCards) return;
+		void loadToolDisplays(selectedSessionId);
+	}, [bootstrap?.features.toolCards, loadToolDisplays, resyncRevision, selectedSessionId]);
+
+	useEffect(() => {
+		if (!selectedSessionId || !bootstrap?.features.planSummary) return;
+		void loadPlanSummary(selectedSessionId);
+	}, [bootstrap?.features.planSummary, loadPlanSummary, resyncRevision, selectedSessionId]);
+
+	useEffect(() => {
+		if (!selectedSessionId || !bootstrap?.features.changeReview) return;
+		void loadChangeSet(selectedSessionId);
+	}, [bootstrap?.features.changeReview, loadChangeSet, resyncRevision, selectedSessionId]);
+
+	useEffect(() => {
+		if (!selectedSessionId || !bootstrap?.features.runHistory) return;
+		void loadRunHistory(selectedSessionId);
+	}, [bootstrap?.features.runHistory, loadRunHistory, resyncRevision, selectedSessionId]);
+
+	useEffect(() => {
+		if (!selectedSessionId || !bootstrap?.features.usageHistory) return;
+		void loadUsageHistory(selectedSessionId);
+	}, [bootstrap?.features.usageHistory, loadUsageHistory, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
 		if (!selectedSessionId || !bootstrap?.features.approvalControls) return;
@@ -682,12 +1038,37 @@ export function App(): ReactNode {
 							sequence,
 							message.data.latestSequence,
 						);
-						setAgentEventsBySession({});
+						setActivityBySession({});
+						setActivityErrorsBySession({});
+						setActivityLoadingBySession({});
+						setToolDisplaysBySession({});
+						setToolDisplayErrorsBySession({});
+						setToolDisplayLoadingBySession({});
+						setPlansBySession({});
+						setPlanErrorsBySession({});
+						setPlanLoadingBySession({});
+						setChangeSetsBySession({});
+						setChangeSetErrorsBySession({});
+						setChangeSetLoadingBySession({});
+						setRunHistoryBySession({});
+						setRunHistoryErrorsBySession({});
+						setRunHistoryLoadingBySession({});
+						setUsageHistoryBySession({});
+						setUsageHistoryErrorsBySession({});
+						setUsageHistoryLoadingBySession({});
 						setApprovalsBySession({});
 						setSubagentsBySession({});
 						setTranscriptBySession({});
 						setTranscriptErrorsBySession({});
 						setTranscriptLoadingBySession({});
+						sessionListRequestIdRef.current += 1;
+						invalidateSessionRequestIds(transcriptRequestIdsRef.current);
+						invalidateSessionRequestIds(activityRequestIdsRef.current);
+						invalidateSessionRequestIds(toolDisplayRequestIdsRef.current);
+						invalidateSessionRequestIds(planRequestIdsRef.current);
+						invalidateSessionRequestIds(changeSetRequestIdsRef.current);
+						invalidateSessionRequestIds(runHistoryRequestIdsRef.current);
+						invalidateSessionRequestIds(usageHistoryRequestIdsRef.current);
 						runStateBySessionRef.current.clear();
 						setResyncRevision(current => current + 1);
 						return;
@@ -715,6 +1096,10 @@ export function App(): ReactNode {
 						const run = message.data;
 						runStateBySessionRef.current.set(message.studioSessionId, run);
 						sessionSnapshotVersionRef.current += 1;
+						setRunHistoryBySession(current => ({
+							...current,
+							[message.studioSessionId]: upsertStudioRunHistory(current[message.studioSessionId] ?? [], run),
+						}));
 						if (isTerminalRunStatus(run.status) && !notifiedRunIdsRef.current.has(run.id)) {
 							notifiedRunIdsRef.current.add(run.id);
 							const title = run.status === "failed" ? "OMP run needs attention" : "OMP run finished";
@@ -723,6 +1108,10 @@ export function App(): ReactNode {
 									? "Open Studio to review the run state."
 									: "Your session is ready for the next prompt.";
 							void window.ompStudio?.notify(title, body).catch(() => undefined);
+						}
+						if (isTerminalRunStatus(run.status)) {
+							void loadRunHistory(message.studioSessionId);
+							void loadUsageHistory(message.studioSessionId);
 						}
 						setSessions(current =>
 							sortSessions(
@@ -760,6 +1149,7 @@ export function App(): ReactNode {
 								),
 							),
 						);
+						void loadUsageHistory(message.studioSessionId);
 						return;
 					}
 					if (parseTranscriptUpdated(message)) {
@@ -772,22 +1162,30 @@ export function App(): ReactNode {
 						}));
 						return;
 					}
-					if (parseAgentEvent(message)) {
-						const payload = message.data;
-						setAgentEventsBySession(current => ({
+					if (parseActivityUpdated(message)) {
+						setActivityBySession(current => ({
 							...current,
-							[message.studioSessionId]: [
-								{
-									emittedAtMs: message.emittedAtMs,
-									runId: message.runId,
-									sequence,
-									studioSessionId: message.studioSessionId,
-									summary: summarizeAgentEvent(payload),
-									...(typeof payload.toolName === "string" ? { toolName: payload.toolName } : {}),
-									type: payload.type,
-								},
-								...(current[message.studioSessionId] ?? []),
-							].slice(0, 40),
+							[message.studioSessionId]: upsertStudioActivityEntry(
+								current[message.studioSessionId] ?? [],
+								message.data,
+							),
+						}));
+						return;
+					}
+					if (parseToolDisplayUpdated(message)) {
+						setToolDisplaysBySession(current => ({
+							...current,
+							[message.studioSessionId]: upsertStudioToolDisplay(
+								current[message.studioSessionId] ?? [],
+								message.data,
+							),
+						}));
+						return;
+					}
+					if (parsePlanUpdated(message)) {
+						setPlansBySession(current => ({
+							...current,
+							[message.studioSessionId]: mergeStudioPlanSummary(current[message.studioSessionId], message.data),
 						}));
 					}
 				} catch {
@@ -816,7 +1214,7 @@ export function App(): ReactNode {
 			activeSocket = undefined;
 			if (socket) closeSocket(socket);
 		};
-	}, [loadProviders]);
+	}, [loadProviders, loadRunHistory, loadUsageHistory]);
 
 	const profile = bootstrap?.profile ?? "loading";
 	const providerOnboarding = bootstrap?.features.providerOnboarding === true;
@@ -824,6 +1222,12 @@ export function App(): ReactNode {
 	const approvalControls = bootstrap?.features.approvalControls === true;
 	const subagentVisibility = bootstrap?.features.subagentVisibility === true;
 	const usageSummary = bootstrap?.features.usageSummary === true;
+	const activityTimeline = bootstrap?.features.activityTimeline === true;
+	const toolCards = bootstrap?.features.toolCards === true;
+	const planSummary = bootstrap?.features.planSummary === true;
+	const changeReview = bootstrap?.features.changeReview === true;
+	const runHistory = bootstrap?.features.runHistory === true;
+	const usageHistory = bootstrap?.features.usageHistory === true;
 	const selectedSession = useMemo(
 		() => sessions.find(session => session.id === selectedSessionId) ?? null,
 		[sessions, selectedSessionId],
@@ -848,14 +1252,28 @@ export function App(): ReactNode {
 			: !sessionProviderId || !sessionModelId
 				? "connect model"
 				: "start session";
-	const selectedSessionEvents = useMemo(
-		() => (selectedSessionId ? (agentEventsBySession[selectedSessionId] ?? []) : []),
-		[agentEventsBySession, selectedSessionId],
-	);
+	const selectedActivity = selectedSessionId ? (activityBySession[selectedSessionId] ?? []) : [];
 	const selectedTranscript = selectedSessionId ? (transcriptBySession[selectedSessionId] ?? []) : [];
 	const promptText = selectedSessionId ? (promptDrafts[selectedSessionId] ?? "") : "";
 	const transcriptError = selectedSessionId ? (transcriptErrorsBySession[selectedSessionId] ?? null) : null;
 	const transcriptLoading = selectedSessionId ? transcriptLoadingBySession[selectedSessionId] === true : false;
+	const activityError = selectedSessionId ? (activityErrorsBySession[selectedSessionId] ?? null) : null;
+	const activityLoading = selectedSessionId ? activityLoadingBySession[selectedSessionId] === true : false;
+	const selectedToolDisplays = selectedSessionId ? (toolDisplaysBySession[selectedSessionId] ?? []) : [];
+	const toolDisplayError = selectedSessionId ? (toolDisplayErrorsBySession[selectedSessionId] ?? null) : null;
+	const toolDisplayLoading = selectedSessionId ? toolDisplayLoadingBySession[selectedSessionId] === true : false;
+	const selectedPlan = selectedSessionId ? plansBySession[selectedSessionId] : undefined;
+	const planError = selectedSessionId ? (planErrorsBySession[selectedSessionId] ?? null) : null;
+	const planLoading = selectedSessionId ? planLoadingBySession[selectedSessionId] === true : false;
+	const selectedChangeSet = selectedSessionId ? changeSetsBySession[selectedSessionId] : undefined;
+	const changeSetError = selectedSessionId ? (changeSetErrorsBySession[selectedSessionId] ?? null) : null;
+	const changeSetLoading = selectedSessionId ? changeSetLoadingBySession[selectedSessionId] === true : false;
+	const selectedRunHistory = selectedSessionId ? (runHistoryBySession[selectedSessionId] ?? []) : [];
+	const runHistoryError = selectedSessionId ? (runHistoryErrorsBySession[selectedSessionId] ?? null) : null;
+	const runHistoryLoading = selectedSessionId ? runHistoryLoadingBySession[selectedSessionId] === true : false;
+	const selectedUsageHistory = selectedSessionId ? (usageHistoryBySession[selectedSessionId] ?? []) : [];
+	const usageHistoryError = selectedSessionId ? (usageHistoryErrorsBySession[selectedSessionId] ?? null) : null;
+	const usageHistoryLoading = selectedSessionId ? usageHistoryLoadingBySession[selectedSessionId] === true : false;
 	const { displayedTranscript, hasStreamingAssistant } = useMemo(() => {
 		let hasStreamingAssistant = false;
 		const displayedTranscript = selectedTranscript.filter(message => {
@@ -871,7 +1289,6 @@ export function App(): ReactNode {
 		() => workspaces.find(workspace => workspace.id === selectedSession?.workspaceId) ?? null,
 		[selectedSession?.workspaceId, workspaces],
 	);
-	const pendingApprovalCount = selectedApprovals.filter(approval => approval.status === "pending").length;
 	const composerBlocked =
 		promptPending || cancelPending || controlPendingId !== null || selectedActiveRun !== undefined;
 
@@ -1235,6 +1652,11 @@ export function App(): ReactNode {
 	}, [selectedSessionId]);
 
 	useEffect(() => {
+		setNavigationOpen(false);
+		if (selectedSessionId && !prefersOverlayPanels()) setContextOpen(true);
+	}, [selectedSessionId]);
+
+	useEffect(() => {
 		if (!selectedSessionId || !shouldAutoScrollConversationRef.current) return;
 		if (conversationScrollFrameRef.current !== undefined) return;
 		conversationScrollFrameRef.current = window.requestAnimationFrame(() => {
@@ -1281,437 +1703,144 @@ export function App(): ReactNode {
 
 	return (
 		<div className="studio-shell studio-desktop-shell">
-			<header className="studio-titlebar">
-				<a className="studio-mark" href="/" aria-label="OMP Studio home">
-					<span className="studio-mark-kicker">OMP</span>
-					<span>Studio</span>
-				</a>
-				<div className="studio-titlebar-context">
-					<span>{selectedSession ? sessionTitle(selectedSession) : "Local workspace"}</span>
-					<span className="studio-titlebar-profile">{profile}</span>
-				</div>
-				<div className="studio-titlebar-actions">
-					<div className={`studio-connection studio-connection-${connection}`}>
-						<span className="studio-connection-dot" />
-						{connection === "ready" ? "connected" : connection === "offline" ? "reconnecting" : "connecting"}
+			<StudioTitlebar
+				connection={connection}
+				onOpenContext={() => openContext(contextPanel)}
+				onOpenNavigation={openNavigation}
+				onOpenSetup={openSetup}
+				profile={profile}
+				selectedSession={selectedSession ?? undefined}
+			/>
+
+			<div
+				className={`studio-workspace-layout${navigationOpen ? " studio-workspace-layout-navigation-open" : ""}${contextOpen ? " studio-workspace-layout-context-open" : ""}`}
+			>
+				{navigationOpen && (
+					<button
+						aria-label="Close session navigation"
+						className="studio-mobile-scrim studio-navigation-scrim"
+						onClick={() => setNavigationOpen(false)}
+						type="button"
+					/>
+				)}
+				<StudioSessionRail
+					controlPendingId={controlPendingId}
+					leaseExpiresAtMs={leaseExpiresAtMs}
+					onAcquireControl={studioSessionId => void acquireControl(studioSessionId)}
+					onAddProject={() => {
+						openSetup();
+						window.requestAnimationFrame(() => workspacePathRef.current?.focus());
+					}}
+					onOpenSetup={openSetup}
+					onSelectSession={sessionId => {
+						setSelectedSessionId(sessionId);
+						setNavigationOpen(false);
+					}}
+					onSelectWorkspace={workspaceId => {
+						setSessionWorkspaceId(workspaceId);
+						openSetup();
+					}}
+					selectedSessionId={selectedSessionId}
+					sessionWorkspaceId={sessionWorkspaceId}
+					sessions={sessions}
+					workspaces={workspaces}
+				/>
+
+				<StudioConversationPane
+					activityEntries={selectedActivity}
+					approvals={selectedApprovals}
+					cancelPending={cancelPending}
+					composerBlocked={composerBlocked}
+					controlPending={controlPendingId !== null}
+					draft={promptText}
+					hasStreamingAssistant={hasStreamingAssistant}
+					plan={selectedPlan}
+					onCancel={() => void cancelActiveRun()}
+					onDraftChange={value => {
+						if (!selectedSessionId) return;
+						setPromptDrafts(current => ({ ...current, [selectedSessionId]: value }));
+					}}
+					onOpenContext={openContext}
+					onOpenNavigation={openNavigation}
+					onOpenSetup={openSetup}
+					onScroll={(scrollHeight, scrollTop, clientHeight) => {
+						shouldAutoScrollConversationRef.current = scrollHeight - scrollTop - clientHeight < 40;
+					}}
+					onSubmit={submitPrompt}
+					promptPending={promptPending}
+					selectedActiveRun={selectedActiveRun}
+					selectedSession={selectedSession ?? undefined}
+					selectedWorkspace={selectedWorkspace ?? undefined}
+					scrollRef={conversationScrollRef}
+					sessionError={sessionError}
+					toolCards={selectedToolDisplays}
+					textareaRef={composerTextareaRef}
+					transcript={displayedTranscript}
+					transcriptError={transcriptError}
+					transcriptLoading={transcriptLoading}
+				/>
+
+				{contextOpen && (
+					<button
+						aria-label="Close run context"
+						className="studio-mobile-scrim studio-context-scrim"
+						onClick={closeContext}
+						type="button"
+					/>
+				)}
+
+				{contextOpen && (
+					<div className="studio-context-host">
+						<StudioSessionInspector
+							activePanel={contextPanel}
+							activityEnabled={activityTimeline}
+							activityEntries={selectedActivity}
+							activityError={activityError}
+							activityLoading={activityLoading}
+							changeReviewEnabled={changeReview}
+							changeSet={selectedChangeSet}
+							changeSetError={changeSetError}
+							changeSetLoading={changeSetLoading}
+							plan={selectedPlan}
+							planEnabled={planSummary}
+							planError={planError}
+							planLoading={planLoading}
+							runHistory={selectedRunHistory}
+							runHistoryEnabled={runHistory}
+							runHistoryError={runHistoryError ?? usageHistoryError}
+							runHistoryLoading={runHistoryLoading || usageHistoryLoading}
+							approvalEnabled={approvalControls}
+							approvalPendingId={approvalPendingId}
+							approvals={selectedApprovals}
+							controlPendingId={controlPendingId}
+							leaseExpiresAtMs={selectedSession ? (leaseExpiresAtMs[selectedSession.id] ?? 0) : 0}
+							onAcquireControl={studioSessionId => void acquireControl(studioSessionId)}
+							onClose={closeContext}
+							onPanelChange={openContext}
+							onOpenSetup={openSetup}
+							onRefreshChanges={() => {
+								if (selectedSessionId) void loadChangeSet(selectedSessionId);
+							}}
+							onRefreshHistory={() => {
+								if (!selectedSessionId) return;
+								if (runHistory) void loadRunHistory(selectedSessionId);
+								if (usageHistory) void loadUsageHistory(selectedSessionId);
+							}}
+							onResolveApproval={(approval, decision) => void resolveToolApproval(approval, decision)}
+							selectedActiveRun={selectedActiveRun}
+							selectedSession={selectedSession ?? undefined}
+							selectedWorkspace={selectedWorkspace ?? undefined}
+							subagentEnabled={subagentVisibility}
+							subagents={selectedSubagents}
+							toolCards={selectedToolDisplays}
+							toolCardsEnabled={toolCards}
+							toolCardsError={toolDisplayError}
+							toolCardsLoading={toolDisplayLoading}
+							usageEnabled={usageSummary}
+							usageHistory={selectedUsageHistory}
+						/>
 					</div>
-					<button className="studio-titlebar-button" onClick={openSetup} type="button">
-						Setup
-					</button>
-				</div>
-			</header>
-
-			<div className="studio-workspace-layout">
-				<aside className="studio-sidebar" aria-label="Projects and sessions">
-					<div className="studio-sidebar-actions">
-						<button className="studio-new-session" onClick={openSetup} type="button">
-							+ New session
-						</button>
-						<button className="studio-sidebar-button" onClick={openSetup} type="button">
-							Settings
-						</button>
-					</div>
-
-					<section className="studio-sidebar-section" aria-labelledby="studio-projects-heading">
-						<div className="studio-sidebar-heading">
-							<h2 id="studio-projects-heading">Projects</h2>
-							<button
-								aria-label="Add project"
-								onClick={() => {
-									openSetup();
-									window.requestAnimationFrame(() => workspacePathRef.current?.focus());
-								}}
-								type="button"
-							>
-								+
-							</button>
-						</div>
-						<div className="studio-project-list">
-							{workspaces.length === 0 ? (
-								<p className="studio-sidebar-empty">No project folder yet.</p>
-							) : (
-								workspaces.map(workspace => (
-									<button
-										className={
-											workspace.id === sessionWorkspaceId
-												? "studio-project-row studio-project-row-selected"
-												: "studio-project-row"
-										}
-										key={workspace.id}
-										onClick={() => {
-											setSessionWorkspaceId(workspace.id);
-											openSetup();
-										}}
-										type="button"
-									>
-										<span>{workspace.label}</span>
-										<small>{formatWorkspaceDate(workspace.updatedAtMs)}</small>
-									</button>
-								))
-							)}
-						</div>
-					</section>
-
-					<section
-						className="studio-sidebar-section studio-sidebar-sessions"
-						aria-labelledby="studio-sessions-heading"
-					>
-						<div className="studio-sidebar-heading">
-							<h2 id="studio-sessions-heading">Sessions</h2>
-							<span>{sessions.length}</span>
-						</div>
-						<div className="studio-session-list">
-							{sessions.length === 0 ? (
-								<p className="studio-sidebar-empty">Start a session to begin a conversation.</p>
-							) : (
-								sessions.map(session => {
-									const hasLease = (leaseExpiresAtMs[session.id] ?? 0) > Date.now();
-									return (
-										<article
-											className={
-												session.id === selectedSessionId
-													? "studio-session-row studio-session-row-selected"
-													: "studio-session-row"
-											}
-											key={session.id}
-										>
-											<button
-												className="studio-session-select"
-												onClick={() => setSelectedSessionId(session.id)}
-												type="button"
-											>
-												<span className="studio-session-name">{sessionTitle(session)}</span>
-												<span className="studio-session-meta">
-													{session.model ? session.model.id : "model unavailable"}
-												</span>
-											</button>
-											<button
-												aria-label={
-													hasLease
-														? `Renew control for ${sessionTitle(session)}`
-														: `Take control of ${sessionTitle(session)}`
-												}
-												className={
-													hasLease
-														? "studio-session-control studio-session-control-active"
-														: "studio-session-control"
-												}
-												disabled={controlPendingId !== null}
-												onClick={() => void acquireControl(session.id)}
-												type="button"
-											>
-												{controlPendingId === session.id ? "..." : hasLease ? "Control" : "Take"}
-											</button>
-										</article>
-									);
-								})
-							)}
-						</div>
-					</section>
-
-					<div className="studio-sidebar-footer">
-						<span>OMP Studio</span>
-						<span>Local only</span>
-					</div>
-				</aside>
-
-				<main className="studio-conversation-pane" aria-label="Conversation">
-					{selectedSession ? (
-						<>
-							<header className="studio-conversation-header">
-								<div>
-									<div className="studio-conversation-breadcrumb">
-										<span>{selectedWorkspace?.label ?? "Project"}</span>
-										<span>/</span>
-										<span>{selectedSession.model?.provider ?? "OMP"}</span>
-									</div>
-									<h1>{sessionTitle(selectedSession)}</h1>
-								</div>
-								<div className="studio-conversation-header-actions">
-									<span className={`studio-session-status studio-session-status-${selectedSession.status}`}>
-										{selectedActiveRun ? "running" : selectedSession.status}
-									</span>
-									<button onClick={openSetup} type="button">
-										Configure
-									</button>
-								</div>
-							</header>
-
-							<section
-								aria-live="polite"
-								className="studio-conversation-scroll"
-								onScroll={event => {
-									const conversation = event.currentTarget;
-									shouldAutoScrollConversationRef.current =
-										conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight < 40;
-								}}
-								ref={conversationScrollRef}
-							>
-								{transcriptLoading && displayedTranscript.length === 0 && (
-									<p className="studio-conversation-notice">Loading conversation...</p>
-								)}
-								{!transcriptLoading && displayedTranscript.length === 0 && !hasStreamingAssistant && (
-									<div className="studio-empty-conversation">
-										<span className="studio-empty-conversation-mark">OMP</span>
-										<h2>Start the conversation</h2>
-										<p>
-											Send a task to this session. Replies and live updates stay here as the work progresses.
-										</p>
-									</div>
-								)}
-								{displayedTranscript.map(message => (
-									<article className={`studio-message studio-message-${message.role}`} key={message.id}>
-										<div className="studio-message-meta">
-											<span>{message.role === "user" ? "You" : "OMP"}</span>
-											<time dateTime={new Date(message.createdAtMs).toISOString()}>
-												{formatShortTime(message.createdAtMs)}
-											</time>
-											{message.status === "streaming" && (
-												<span className="studio-message-streaming">Streaming</span>
-											)}
-											{message.status === "failed" && <span className="studio-message-failed">Stopped</span>}
-										</div>
-										<p>{transcriptDisplayText(message)}</p>
-									</article>
-								))}
-								{selectedActiveRun && hasStreamingAssistant && (
-									<div className="studio-run-indicator">
-										<span />
-										OMP is working
-									</div>
-								)}
-							</section>
-
-							<form className="studio-composer" onSubmit={submitPrompt}>
-								<label className="studio-composer-input">
-									<span className="studio-sr-only">Message OMP</span>
-									<textarea
-										ref={composerTextareaRef}
-										disabled={composerBlocked}
-										onChange={event => {
-											if (!selectedSessionId) return;
-											setPromptDrafts(current => ({ ...current, [selectedSessionId]: event.target.value }));
-										}}
-										onKeyDown={event => {
-											if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-												event.preventDefault();
-												event.currentTarget.form?.requestSubmit();
-											}
-										}}
-										placeholder={
-											selectedActiveRun
-												? "OMP is working on the current task"
-												: "Message OMP about the next task"
-										}
-										rows={3}
-										value={promptText}
-									/>
-								</label>
-								<div className="studio-composer-footer">
-									<span>{selectedActiveRun ? "Run in progress" : "Ctrl+Enter to send"}</span>
-									<div>
-										{selectedActiveRun && (
-											<button
-												className="studio-cancel-button"
-												disabled={cancelPending || controlPendingId !== null}
-												onClick={() => void cancelActiveRun()}
-												type="button"
-											>
-												{cancelPending ? "Stopping" : "Stop"}
-											</button>
-										)}
-										<button disabled={composerBlocked || !promptText.trim()} type="submit">
-											{promptPending ? "Sending" : "Send"}
-										</button>
-									</div>
-								</div>
-							</form>
-							{transcriptError && <p className="studio-inline-error">{transcriptError}</p>}
-							{sessionError && <p className="studio-inline-error">{sessionError}</p>}
-						</>
-					) : (
-						<section className="studio-no-session">
-							<span className="studio-empty-conversation-mark">OMP</span>
-							<h1>Open a focused session</h1>
-							<p>Choose a local project and provider once, then work in a persistent conversation.</p>
-							<button onClick={openSetup} type="button">
-								New session
-							</button>
-							{sessionError && <p className="studio-inline-error">{sessionError}</p>}
-						</section>
-					)}
-				</main>
-
-				<aside className="studio-inspector" aria-label="Session inspector">
-					<div className="studio-inspector-topline">
-						<span>Inspector</span>
-						<button onClick={openSetup} type="button">
-							Setup
-						</button>
-					</div>
-
-					{selectedSession ? (
-						<>
-							<section className="studio-inspector-section">
-								<div className="studio-inspector-heading">
-									<h2>Session</h2>
-									<span className={`studio-session-status studio-session-status-${selectedSession.status}`}>
-										{selectedActiveRun ? "active" : selectedSession.status}
-									</span>
-								</div>
-								<dl className="studio-inspector-facts">
-									<div>
-										<dt>Project</dt>
-										<dd>{selectedWorkspace?.label ?? "Unavailable"}</dd>
-									</div>
-									<div>
-										<dt>Model</dt>
-										<dd>
-											{selectedSession.model
-												? `${selectedSession.model.provider}/${selectedSession.model.id}`
-												: "Unavailable"}
-										</dd>
-									</div>
-									<div>
-										<dt>Control</dt>
-										<dd>
-											{(leaseExpiresAtMs[selectedSession.id] ?? 0) > Date.now()
-												? "Held by this window"
-												: "Not held"}
-										</dd>
-									</div>
-								</dl>
-								<button
-									className="studio-inspector-control"
-									disabled={controlPendingId !== null}
-									onClick={() => void acquireControl(selectedSession.id)}
-									type="button"
-								>
-									{controlPendingId === selectedSession.id
-										? "Claiming control"
-										: (leaseExpiresAtMs[selectedSession.id] ?? 0) > Date.now()
-											? "Renew control"
-											: "Take control"}
-								</button>
-							</section>
-
-							{usageSummary && (
-								<section className="studio-inspector-section">
-									<div className="studio-inspector-heading">
-										<h2>Usage</h2>
-										<span>{selectedSession.usage ? "Latest" : "Waiting"}</span>
-									</div>
-									{selectedSession.usage ? (
-										<dl className="studio-usage-grid">
-											<div>
-												<dt>Tokens</dt>
-												<dd>{formatCount(selectedSession.usage.totalTokens)}</dd>
-											</div>
-											<div>
-												<dt>Tools</dt>
-												<dd>{formatCount(selectedSession.usage.toolCalls)}</dd>
-											</div>
-											<div>
-												<dt>Cost</dt>
-												<dd>${formatCost(selectedSession.usage.cost)}</dd>
-											</div>
-										</dl>
-									) : (
-										<p className="studio-inspector-empty">Usage appears after the first response.</p>
-									)}
-								</section>
-							)}
-
-							{approvalControls && (
-								<section className="studio-inspector-section" aria-live="polite">
-									<div className="studio-inspector-heading">
-										<h2>Approvals</h2>
-										<span>{pendingApprovalCount} waiting</span>
-									</div>
-									{selectedApprovals.length === 0 ? (
-										<p className="studio-inspector-empty">No tool decision is waiting.</p>
-									) : (
-										<div className="studio-approval-list">
-											{selectedApprovals.map(approval => (
-												<article
-													className={`studio-approval-card studio-approval-card-${approval.status}`}
-													key={approval.id}
-												>
-													<div>
-														<strong>{approval.toolName}</strong>
-														<span>{approval.status}</span>
-													</div>
-													{approval.reason && <p>{approval.reason}</p>}
-													{approval.status === "pending" && (
-														<div className="studio-approval-actions">
-															<button
-																disabled={approvalPendingId !== null || controlPendingId !== null}
-																onClick={() => void resolveToolApproval(approval, "approve")}
-																type="button"
-															>
-																Approve
-															</button>
-															<button
-																className="studio-approval-reject"
-																disabled={approvalPendingId !== null || controlPendingId !== null}
-																onClick={() => void resolveToolApproval(approval, "reject")}
-																type="button"
-															>
-																Reject
-															</button>
-														</div>
-													)}
-												</article>
-											))}
-										</div>
-									)}
-								</section>
-							)}
-
-							<section className="studio-inspector-section studio-activity-section">
-								<div className="studio-inspector-heading">
-									<h2>Activity</h2>
-									<span>{selectedSessionEvents.length}</span>
-								</div>
-								{selectedSessionEvents.length === 0 ? (
-									<p className="studio-inspector-empty">Run activity will appear here.</p>
-								) : (
-									<ol className="studio-agent-stream">
-										{selectedSessionEvents.map(event => (
-											<li key={event.sequence}>
-												<time>{formatShortTime(event.emittedAtMs)}</time>
-												<span>
-													{event.toolName ? `${event.toolName}: ${event.summary}` : event.summary}
-												</span>
-											</li>
-										))}
-									</ol>
-								)}
-							</section>
-
-							{subagentVisibility && selectedSubagents.length > 0 && (
-								<section className="studio-inspector-section">
-									<div className="studio-inspector-heading">
-										<h2>Subagents</h2>
-										<span>{selectedSubagents.length}</span>
-									</div>
-									<div className="studio-subagent-list">
-										{selectedSubagents.map(subagent => (
-											<div className="studio-subagent-row" key={subagent.id}>
-												<strong>{subagent.agent}</strong>
-												<span>{subagent.status}</span>
-											</div>
-										))}
-									</div>
-								</section>
-							)}
-						</>
-					) : (
-						<p className="studio-inspector-empty studio-inspector-start">
-							Select or start a session to inspect its activity.
-						</p>
-					)}
-				</aside>
+				)}
 			</div>
 
 			{setupOpen && (

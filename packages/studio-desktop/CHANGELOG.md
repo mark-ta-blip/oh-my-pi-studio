@@ -5,6 +5,9 @@
 ### Added
 
 - Added the initial Electron desktop shell for OMP Studio with a supervised OMP sidecar, secure preload bridge, tray controls, window state persistence, and platform build targets.
+- Added deterministic app and tray assets, Windows NSIS packaging validation,
+  and a packaged sidecar smoke test that verifies local token exchange and
+  authenticated bootstrap before shutdown.
 
 ### Fixed
 

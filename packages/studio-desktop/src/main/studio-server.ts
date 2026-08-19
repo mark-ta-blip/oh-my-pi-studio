@@ -7,6 +7,7 @@ import { type DesktopPaths, resolveDevelopmentServerScript } from "./paths";
 const READY_LINE = /^OMP Studio available at: (https?:\/\/127\.0\.0\.1:\d+\/\?token=[^\s]+)$/;
 const STUDIO_SERVER_READY_TIMEOUT_MS = 30_000;
 const STUDIO_SERVER_STOP_GRACE_MS = 2_000;
+const STUDIO_BOOTSTRAP_API_VERSION = 1;
 
 export interface StudioServerProcess {
 	url: string;
@@ -16,9 +17,11 @@ export interface StudioServerProcess {
 export interface StudioServerLaunchOptions {
 	paths: DesktopPaths;
 	packaged: boolean;
+	/** Development-only explicit OMP executable. Packaged apps always use their bundled sidecar. */
 	command?: string;
 	readyTimeoutMs?: number;
 	signal?: AbortSignal;
+	smoke?: boolean;
 }
 
 type StudioSidecar = childProcess.ChildProcessByStdio<null, Readable, Readable>;
@@ -27,12 +30,20 @@ function serverExecutable(paths: DesktopPaths): string {
 	return path.join(paths.serverResourceDir, process.platform === "win32" ? "omp.exe" : "omp");
 }
 
+function studioServerEnvironment(options: StudioServerLaunchOptions): NodeJS.ProcessEnv {
+	return {
+		...process.env,
+		OMP_STUDIO_DESKTOP: "1",
+		...(options.smoke ? { OMP_STUDIO_DESKTOP_SMOKE: "1" } : {}),
+	};
+}
+
 function spawnServer(options: StudioServerLaunchOptions): StudioSidecar {
-	const configuredCommand = options.command ?? process.env.OMP_STUDIO_OMP_EXECUTABLE;
+	const configuredCommand = options.packaged ? undefined : options.command;
 	if (configuredCommand) {
 		return childProcess.spawn(configuredCommand, ["studio", "--no-open", "--port", "0"], {
 			cwd: options.paths.packageRoot,
-			env: { ...process.env, OMP_STUDIO_DESKTOP: "1" },
+			env: studioServerEnvironment(options),
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 	}
@@ -40,7 +51,7 @@ function spawnServer(options: StudioServerLaunchOptions): StudioSidecar {
 	if (options.packaged) {
 		return childProcess.spawn(serverExecutable(options.paths), ["studio", "--no-open", "--port", "0"], {
 			cwd: options.paths.userDataDir,
-			env: { ...process.env, OMP_STUDIO_DESKTOP: "1" },
+			env: studioServerEnvironment(options),
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 	}
@@ -50,10 +61,53 @@ function spawnServer(options: StudioServerLaunchOptions): StudioSidecar {
 		[resolveDevelopmentServerScript(options.paths.packageRoot), "studio", "--no-open", "--port", "0"],
 		{
 			cwd: options.paths.packageRoot,
-			env: { ...process.env, OMP_STUDIO_DESKTOP: "1" },
+			env: studioServerEnvironment(options),
 			stdio: ["ignore", "pipe", "pipe"],
 		},
 	);
+}
+
+function isStudioBootstrap(value: unknown): boolean {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const payload = value as Record<string, unknown>;
+	return payload.apiVersion === STUDIO_BOOTSTRAP_API_VERSION && payload.mode === "local-single-user";
+}
+
+/** Validate the one-time local access exchange exposed by a supervised sidecar. */
+export async function verifyStudioSidecarAccess(url: string): Promise<void> {
+	let origin: string;
+	try {
+		const parsedUrl = new URL(url);
+		if (parsedUrl.protocol !== "http:" || parsedUrl.hostname !== "127.0.0.1") {
+			throw new Error("invalid local sidecar URL");
+		}
+		origin = parsedUrl.origin;
+	} catch {
+		throw new Error("OMP Studio sidecar returned an invalid local URL.");
+	}
+
+	const exchange = await fetch(url, { redirect: "manual" });
+	if (exchange.status !== 302) {
+		throw new Error(`OMP Studio sidecar token exchange failed: HTTP ${exchange.status}`);
+	}
+	const cookie = exchange.headers.get("set-cookie")?.split(";", 1)[0];
+	if (!cookie?.startsWith("omp_studio_session=")) {
+		throw new Error("OMP Studio sidecar token exchange did not issue a session cookie.");
+	}
+
+	const bootstrap = await fetch(`${origin}/api/v1/bootstrap`, { headers: { Cookie: cookie } });
+	if (!bootstrap.ok) {
+		throw new Error(`OMP Studio sidecar bootstrap failed: HTTP ${bootstrap.status}`);
+	}
+	let payload: unknown;
+	try {
+		payload = await bootstrap.json();
+	} catch {
+		throw new Error("OMP Studio sidecar bootstrap returned invalid JSON.");
+	}
+	if (!isStudioBootstrap(payload)) {
+		throw new Error("OMP Studio sidecar bootstrap did not match the local Studio contract.");
+	}
 }
 
 function hasExited(child: StudioSidecar): boolean {
@@ -166,5 +220,15 @@ export async function startStudioServer(options: StudioServerLaunchOptions): Pro
 	} finally {
 		clearTimeout(readyTimeout);
 		options.signal?.removeEventListener("abort", abortStartup);
+	}
+}
+
+/** Start, authenticate against, and stop a sidecar without opening an Electron window. */
+export async function smokeTestStudioSidecar(options: StudioServerLaunchOptions): Promise<void> {
+	const server = await startStudioServer({ ...options, smoke: true });
+	try {
+		await verifyStudioSidecarAccess(server.url);
+	} finally {
+		await server.stop();
 	}
 }

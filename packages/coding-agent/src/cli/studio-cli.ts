@@ -1,6 +1,7 @@
 import { type StudioServer, startStudioServer } from "@oh-my-pi/omp-studio";
 import { openPath } from "../utils/open";
 import { createStudioAuthBridge } from "./studio-auth-bridge";
+import { createStudioChangeReviewAdapter } from "./studio-change-review";
 import { createStudioRpcTransportFactory } from "./studio-rpc-transport";
 
 export interface StudioCommandArgs {
@@ -18,6 +19,8 @@ export async function runStudioCommand(command: StudioCommandArgs): Promise<void
 	try {
 		studio = await startStudioServer({
 			authBridge,
+			changeReviewAdapter: createStudioChangeReviewAdapter(),
+			dbPath: process.env.OMP_STUDIO_DESKTOP_SMOKE === "1" ? ":memory:" : undefined,
 			port: command.port,
 			rpcTransportFactory: createStudioRpcTransportFactory(),
 		});
