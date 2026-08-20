@@ -1,47 +1,56 @@
+import { PanelRight, Plus, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { type FormEvent, memo } from "react";
 import type {
-	StudioActivityEntry,
-	StudioApproval,
-	StudioPlanSummary,
+	StudioProviderModel,
 	StudioRun,
 	StudioSession,
-	StudioToolDisplay,
+	StudioSessionMode,
+	StudioThinkingLevel,
 	StudioTranscriptMessage,
 	StudioWorkspace,
 } from "../../protocol";
 import type { StudioContextPanel } from "../context-panel";
 import { sessionTitle } from "../presentation";
-import { StudioComposer } from "./composer";
-import { StudioExecutionStrip } from "./execution-strip";
+import { StudioComposer, type StudioComposerImageDraft } from "./composer";
 import { StudioTranscriptMessageView } from "./transcript-message";
 
 interface StudioConversationPaneProps {
-	activityEntries: StudioActivityEntry[];
-	approvals: StudioApproval[];
 	cancelPending: boolean;
 	connectionPending: boolean;
 	composerBlocked: boolean;
 	controlPending: boolean;
 	draft: string;
+	imageAttachmentPending: boolean;
+	imageAttachments: StudioComposerImageDraft[];
+	imageInputEnabled: boolean;
+	modelOptions: StudioProviderModel[];
+	selectedModel?: StudioProviderModel;
+	modelPending: boolean;
+	thinkingLevels?: StudioThinkingLevel[];
+	selectedThinkingLevel?: StudioThinkingLevel;
+	thinkingPending: boolean;
 	earlierPending: boolean;
 	hasEarlierTranscript: boolean;
 	hasStreamingAssistant: boolean;
-	plan?: StudioPlanSummary;
+	onAttachImages(files: FileList): void;
+	onModelChange(provider: string, modelId: string): void;
+	onThinkingChange(level: StudioThinkingLevel | undefined): void;
 	onCancel(): void;
 	onLoadEarlier(): void;
 	onReconnect(): void;
 	onDraftChange(value: string): void;
 	onOpenContext(panel: StudioContextPanel): void;
-	onOpenNavigation(): void;
 	onOpenSetup(): void;
+	onRemoveImage(imageId: string): void;
+	onSessionModeChange(mode: StudioSessionMode): void;
 	onScroll(scrollHeight: number, scrollTop: number, clientHeight: number): void;
 	onSubmit(event: FormEvent<HTMLFormElement>): void;
 	selectedActiveRun?: StudioRun;
 	selectedSession?: StudioSession;
 	selectedWorkspace?: StudioWorkspace;
+	sessionModePending: boolean;
 	sessionError: string | null;
 	scrollRef: React.RefObject<HTMLElement | null>;
-	toolCards: StudioToolDisplay[];
 	textareaRef: React.RefObject<HTMLTextAreaElement | null>;
 	transcript: StudioTranscriptMessage[];
 	transcriptError: string | null;
@@ -50,33 +59,43 @@ interface StudioConversationPaneProps {
 }
 
 export const StudioConversationPane = memo(function StudioConversationPane({
-	activityEntries,
-	approvals,
 	cancelPending,
 	connectionPending,
 	composerBlocked,
 	controlPending,
 	draft,
+	imageAttachmentPending,
+	imageAttachments,
+	imageInputEnabled,
+	modelOptions,
+	selectedModel,
+	modelPending,
+	thinkingLevels,
+	selectedThinkingLevel,
+	thinkingPending,
+	onModelChange,
+	onThinkingChange,
 	earlierPending,
 	hasEarlierTranscript,
 	hasStreamingAssistant,
-	plan,
+	onAttachImages,
 	onCancel,
 	onLoadEarlier,
 	onReconnect,
 	onDraftChange,
 	onOpenContext,
-	onOpenNavigation,
 	onOpenSetup,
+	onRemoveImage,
 	onScroll,
+	onSessionModeChange,
 	onSubmit,
 	promptPending,
 	selectedActiveRun,
 	selectedSession,
 	selectedWorkspace,
+	sessionModePending,
 	sessionError,
 	scrollRef,
-	toolCards,
 	textareaRef,
 	transcript,
 	transcriptError,
@@ -90,6 +109,7 @@ export const StudioConversationPane = memo(function StudioConversationPane({
 					<h1>Open a focused session</h1>
 					<p>Choose a local project and provider once, then work in a persistent conversation.</p>
 					<button onClick={onOpenSetup} type="button">
+						<Plus aria-hidden="true" size={16} strokeWidth={2} />
 						New session
 					</button>
 					{sessionError && <p className="studio-inline-error">{sessionError}</p>}
@@ -116,29 +136,24 @@ export const StudioConversationPane = memo(function StudioConversationPane({
 					</span>
 					{(connectionPending || selectedSession.status === "failed") && (
 						<button disabled={connectionPending} onClick={onReconnect} type="button">
+							<RefreshCw aria-hidden="true" size={14} strokeWidth={1.8} />
 							{connectionPending ? "Connecting" : "Reconnect"}
 						</button>
 					)}
-					<button onClick={onOpenSetup} type="button">
-						Configure
+					<button aria-label="Configure session" onClick={onOpenSetup} title="Configure session" type="button">
+						<SlidersHorizontal aria-hidden="true" size={15} strokeWidth={1.8} />
 					</button>
-					<button className="studio-context-toggle" onClick={() => onOpenContext("overview")} type="button">
-						Context
-					</button>
-					<button className="studio-mobile-navigation-toggle" onClick={onOpenNavigation} type="button">
-						Sessions
+					<button
+						aria-label="Open session context"
+						className="studio-context-toggle"
+						onClick={() => onOpenContext("overview")}
+						title="Session context"
+						type="button"
+					>
+						<PanelRight aria-hidden="true" size={15} strokeWidth={1.8} />
 					</button>
 				</div>
 			</header>
-
-			<StudioExecutionStrip
-				activeRun={selectedActiveRun}
-				activityEntries={activityEntries}
-				approvals={approvals}
-				onOpenContext={onOpenContext}
-				plan={plan}
-				toolCards={toolCards}
-			/>
 
 			<section
 				aria-live="polite"
@@ -200,10 +215,26 @@ export const StudioConversationPane = memo(function StudioConversationPane({
 				composerBlocked={composerBlocked}
 				controlPending={controlPending}
 				draft={draft}
+				imageAttachmentPending={imageAttachmentPending}
+				imageAttachments={imageAttachments}
+				imageInputEnabled={imageInputEnabled}
+				modelOptions={modelOptions}
+				selectedModel={selectedModel}
+				modelPending={modelPending}
+				thinkingLevels={thinkingLevels}
+				selectedThinkingLevel={selectedThinkingLevel}
+				thinkingPending={thinkingPending}
+				onAttachImages={onAttachImages}
+				onModelChange={onModelChange}
+				onThinkingChange={onThinkingChange}
 				onCancel={onCancel}
 				onChange={onDraftChange}
+				onRemoveImage={onRemoveImage}
+				onSessionModeChange={onSessionModeChange}
 				onSubmit={onSubmit}
 				promptPending={promptPending}
+				sessionMode={selectedSession.mode ?? "code"}
+				sessionModePending={sessionModePending}
 				textareaRef={textareaRef}
 			/>
 			{transcriptError && <p className="studio-inline-error">{transcriptError}</p>}

@@ -1,3 +1,4 @@
+import { Folder, FolderPlus, LockKeyhole, Plus, Search, Settings } from "lucide-react";
 import { memo, useMemo, useState } from "react";
 import type { StudioSession, StudioWorkspace } from "../../protocol";
 import { formatWorkspaceDate, sessionTitle } from "../presentation";
@@ -51,14 +52,22 @@ export const StudioSessionRail = memo(function StudioSessionRail({
 		<aside aria-label="Projects and sessions" className="studio-sidebar">
 			<div className="studio-sidebar-actions">
 				<button className="studio-new-session" onClick={onOpenSetup} type="button">
-					+ New session
+					<Plus aria-hidden="true" size={16} strokeWidth={2} />
+					<span>New session</span>
 				</button>
-				<button className="studio-sidebar-button" onClick={onOpenSetup} type="button">
-					Settings
+				<button
+					aria-label="Open settings"
+					className="studio-sidebar-button studio-icon-button"
+					onClick={onOpenSetup}
+					title="Settings"
+					type="button"
+				>
+					<Settings aria-hidden="true" size={16} strokeWidth={1.8} />
 				</button>
 			</div>
 			<label className="studio-session-search">
 				<span className="studio-sr-only">Search sessions</span>
+				<Search aria-hidden="true" size={14} strokeWidth={1.8} />
 				<input
 					autoComplete="off"
 					onChange={event => setSessionQuery(event.target.value)}
@@ -71,8 +80,8 @@ export const StudioSessionRail = memo(function StudioSessionRail({
 			<section aria-labelledby="studio-projects-heading" className="studio-sidebar-section">
 				<div className="studio-sidebar-heading">
 					<h2 id="studio-projects-heading">Projects</h2>
-					<button aria-label="Add project" onClick={onAddProject} type="button">
-						+
+					<button aria-label="Add project" onClick={onAddProject} title="Add project" type="button">
+						<FolderPlus aria-hidden="true" size={15} strokeWidth={1.8} />
 					</button>
 				</div>
 				<div className="studio-project-list">
@@ -90,8 +99,11 @@ export const StudioSessionRail = memo(function StudioSessionRail({
 								onClick={() => onSelectWorkspace(workspace.id)}
 								type="button"
 							>
-								<span>{workspace.label}</span>
-								<small>{formatWorkspaceDate(workspace.updatedAtMs)}</small>
+								<Folder aria-hidden="true" className="studio-project-icon" size={15} strokeWidth={1.7} />
+								<span className="studio-project-copy">
+									<span>{workspace.label}</span>
+									<small>{formatWorkspaceDate(workspace.updatedAtMs)}</small>
+								</span>
 							</button>
 						))
 					)}
@@ -131,6 +143,10 @@ export const StudioSessionRail = memo(function StudioSessionRail({
 									>
 										<span className="studio-session-name">{sessionTitle(session)}</span>
 										<span className="studio-session-meta">
+											<span
+												aria-hidden="true"
+												className={`studio-session-state-dot studio-session-state-dot-${session.status}`}
+											/>
 											{session.model ? session.model.id : "model unavailable"}
 										</span>
 									</button>
@@ -147,9 +163,14 @@ export const StudioSessionRail = memo(function StudioSessionRail({
 										}
 										disabled={controlPendingId !== null}
 										onClick={() => onAcquireControl(session.id)}
+										title={hasLease ? "Renew control" : "Take control"}
 										type="button"
 									>
-										{controlPendingId === session.id ? "..." : hasLease ? "Control" : "Take"}
+										{controlPendingId === session.id ? (
+											<span aria-label="Claiming control" className="studio-button-spinner" />
+										) : (
+											<LockKeyhole aria-hidden="true" size={14} strokeWidth={1.8} />
+										)}
 									</button>
 								</article>
 							);

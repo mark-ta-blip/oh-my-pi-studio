@@ -1,3 +1,4 @@
+import { Settings, X } from "lucide-react";
 import { memo } from "react";
 import type {
 	StudioActivityEntry,
@@ -140,11 +141,11 @@ export const StudioSessionInspector = memo(function StudioSessionInspector({
 					<strong>{studioContextPanelLabel(activePanel)}</strong>
 				</div>
 				<div className="studio-inspector-topline-actions">
-					<button onClick={onOpenSetup} type="button">
-						Setup
+					<button aria-label="Open setup" onClick={onOpenSetup} title="Setup" type="button">
+						<Settings aria-hidden="true" size={15} strokeWidth={1.8} />
 					</button>
-					<button aria-label="Close run context" onClick={onClose} type="button">
-						Close
+					<button aria-label="Close run context" onClick={onClose} title="Close" type="button">
+						<X aria-hidden="true" size={16} strokeWidth={1.8} />
 					</button>
 				</div>
 			</header>

@@ -1,13 +1,15 @@
+import { Bot, UserRound } from "lucide-react";
 import { memo } from "react";
 import type { StudioTranscriptMessage } from "../../protocol";
 import { formatShortTime, transcriptDisplayText } from "../presentation";
+import { StudioMarkdown } from "./markdown";
 
 interface StudioTranscriptMessageViewProps {
 	message: StudioTranscriptMessage;
 }
 
 /**
- * One transcript bubble, memoized on the message object.
+ * One linear transcript entry, memoized on the message object.
  *
  * Streaming updates arrive roughly every 50ms and only ever replace the message being written, so
  * every settled bubble keeps its identity and skips re-rendering. Without this, a long conversation
@@ -16,16 +18,43 @@ interface StudioTranscriptMessageViewProps {
 export const StudioTranscriptMessageView = memo(function StudioTranscriptMessageView({
 	message,
 }: StudioTranscriptMessageViewProps): React.ReactNode {
+	const role = message.role === "user" ? "You" : "OMP";
+	const status =
+		message.status === "streaming"
+			? "Streaming"
+			: message.status === "failed"
+				? "Stopped"
+				: message.status === "interrupted"
+					? "Interrupted"
+					: undefined;
+
 	return (
-		<article className={`studio-message studio-message-${message.role}`}>
-			<div className="studio-message-meta">
-				<span>{message.role === "user" ? "You" : "OMP"}</span>
-				<time dateTime={new Date(message.createdAtMs).toISOString()}>{formatShortTime(message.createdAtMs)}</time>
-				{message.status === "streaming" && <span className="studio-message-streaming">Streaming</span>}
-				{message.status === "failed" && <span className="studio-message-failed">Stopped</span>}
-				{message.status === "interrupted" && <span className="studio-message-failed">Interrupted</span>}
+		<article aria-label={role} className={`studio-message studio-message-${message.role}`}>
+			<div aria-hidden="true" className="studio-message-avatar">
+				{message.role === "user" ? <UserRound size={16} strokeWidth={1.9} /> : <Bot size={16} strokeWidth={1.9} />}
 			</div>
-			<p>{transcriptDisplayText(message)}</p>
+			<div className="studio-message-content">
+				<div className="studio-message-meta">
+					<strong>{role}</strong>
+					<time dateTime={new Date(message.createdAtMs).toISOString()}>
+						{formatShortTime(message.createdAtMs)}
+					</time>
+				</div>
+				<div className="studio-message-body">
+					<StudioMarkdown text={transcriptDisplayText(message)} />
+				</div>
+				{status && (
+					<span
+						className={
+							message.status === "streaming"
+								? "studio-message-status studio-message-status-streaming"
+								: "studio-message-status studio-message-status-failed"
+						}
+					>
+						{status}
+					</span>
+				)}
+			</div>
 		</article>
 	);
 });

@@ -45,6 +45,7 @@ export type RpcCommand =
 	| { id?: string; type: "set_host_tools"; tools: RpcHostToolDefinition[] }
 	| { id?: string; type: "set_host_uri_schemes"; schemes: RpcHostUriSchemeDefinition[] }
 	| { id?: string; type: "set_subagent_subscription"; level: RpcSubagentSubscriptionLevel }
+	| { id?: string; type: "set_session_mode"; mode: "code" | "plan" }
 	| { id?: string; type: "get_subagents" }
 	| { id?: string; type: "get_subagent_messages"; subagentId?: string; sessionFile?: string; fromByte?: number }
 
@@ -237,6 +238,7 @@ export type RpcResponse =
 			success: true;
 			data: { level: RpcSubagentSubscriptionLevel };
 	  }
+	| { id?: string; type: "response"; command: "set_session_mode"; success: true; data: { mode: "code" | "plan" } }
 	| {
 			id?: string;
 			type: "response";

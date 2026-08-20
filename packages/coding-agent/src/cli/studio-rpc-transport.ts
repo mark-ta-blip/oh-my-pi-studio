@@ -1,5 +1,7 @@
 import { isPromise } from "node:util/types";
 import type {
+	StudioImageAttachment,
+	StudioModelSelection,
 	StudioRpcAgentEvent,
 	StudioRpcApprovalRequest,
 	StudioRpcLaunch,
@@ -12,8 +14,10 @@ import type {
 	StudioRpcTransportFactory,
 	StudioRpcUsage,
 	StudioRunFailureKind,
+	StudioSessionMode,
 	StudioSubagent,
 } from "@oh-my-pi/omp-studio";
+import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
@@ -60,7 +64,10 @@ type StudioRpcCommand =
 	| { type: "negotiate_protocol"; protocolVersion: 2 }
 	| { type: "get_state" }
 	| { type: "get_session_stats" }
-	| { type: "prompt"; message: string }
+	| { type: "prompt"; message: string; images?: StudioImageAttachment[] }
+	| { type: "set_session_mode"; mode: StudioSessionMode }
+	| { type: "set_model"; provider: string; modelId: string }
+	| { type: "set_thinking_level"; level: ThinkingLevel }
 	| { type: "set_subagent_subscription"; level: "events" }
 	| { type: "abort" };
 
@@ -78,6 +85,25 @@ interface StudioApprovalFrame extends Record<string, unknown> {
 	toolName: string;
 	type: "extension_ui_request";
 	reason?: string;
+}
+
+function toRpcThinkingLevel(level: StudioModelSelection["thinkingLevel"]): ThinkingLevel {
+	switch (level) {
+		case "minimal":
+			return ThinkingLevel.Minimal;
+		case "low":
+			return ThinkingLevel.Low;
+		case "medium":
+			return ThinkingLevel.Medium;
+		case "high":
+			return ThinkingLevel.High;
+		case "xhigh":
+			return ThinkingLevel.XHigh;
+		case "max":
+			return ThinkingLevel.Max;
+		default:
+			return ThinkingLevel.Inherit;
+	}
 }
 
 function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
@@ -436,6 +462,7 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 				"rpc-ui",
 				"--model",
 				`${this.launch.model.provider}/${this.launch.model.id}`,
+				...(this.launch.model.thinkingLevel ? ["--thinking", this.launch.model.thinkingLevel] : []),
 				...(this.launch.sessionRef ? ["--resume", this.launch.sessionRef] : []),
 			]),
 			{
@@ -502,6 +529,12 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 				throw new Error("OMP RPC protocol v2 negotiation failed.");
 			}
 			this.#protocolVersion = 2;
+			if (this.launch.mode === "plan") {
+				const modeResponse = await this.#send({ type: "set_session_mode", mode: "plan" });
+				if (!modeResponse.success || modeResponse.command !== "set_session_mode") {
+					throw new Error("OMP RPC plan mode initialization failed.");
+				}
+			}
 			// Subagent detail is optional; a missing event bus must not block the session itself.
 			void this.#send({ type: "set_subagent_subscription", level: "events" }).catch(() => {});
 		} catch (error) {
@@ -619,9 +652,28 @@ class CodingAgentStudioRpcTransport implements StudioRpcTransport {
 		return () => this.#transcriptListeners.delete(listener);
 	}
 
-	async prompt(message: string): Promise<void> {
-		const response = await this.#send({ type: "prompt", message });
+	async prompt(message: string, images?: StudioImageAttachment[]): Promise<void> {
+		const response = await this.#send({ type: "prompt", message, ...(images?.length ? { images } : {}) });
 		if (!response.success || response.command !== "prompt") throw rpcCommandFailed(response, "prompt");
+	}
+
+	async setSessionMode(mode: StudioSessionMode): Promise<void> {
+		const response = await this.#send({ type: "set_session_mode", mode });
+		if (!response.success || response.command !== "set_session_mode") {
+			throw rpcCommandFailed(response, "set_session_mode");
+		}
+	}
+
+	async setModel(provider: string, modelId: string): Promise<void> {
+		const response = await this.#send({ type: "set_model", provider, modelId });
+		if (!response.success || response.command !== "set_model") throw rpcCommandFailed(response, "set_model");
+	}
+
+	async setThinkingLevel(level: StudioModelSelection["thinkingLevel"]): Promise<void> {
+		const response = await this.#send({ type: "set_thinking_level", level: toRpcThinkingLevel(level) });
+		if (!response.success || response.command !== "set_thinking_level") {
+			throw rpcCommandFailed(response, "set_thinking_level");
+		}
 	}
 
 	async abort(): Promise<void> {

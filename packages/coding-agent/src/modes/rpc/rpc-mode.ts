@@ -1182,6 +1182,28 @@ export async function runRpcMode(
 				return success(id, "set_subagent_subscription", { level: subagentRegistry.getSubscriptionLevel() });
 			}
 
+			case "set_session_mode": {
+				if (session.isStreaming) {
+					return error(id, "set_session_mode", "Stop the active run before changing the session mode.");
+				}
+				if (command.mode === "plan") {
+					const previous = session.getPlanModeState();
+					session.setPlanModeState({
+						enabled: true,
+						planFilePath: previous?.planFilePath ?? "local://PLAN.md",
+						workflow: previous?.workflow ?? "parallel",
+						reentry: previous !== undefined,
+					});
+					session.setPlanProposalHandler(title => session.preparePlanForReview(title));
+				} else {
+					const previous = session.getPlanModeState();
+					if (previous?.enabled) session.setPlanReferencePath(previous.planFilePath);
+					session.setPlanProposalHandler(null);
+					session.setPlanModeState(undefined);
+				}
+				return success(id, "set_session_mode", { mode: command.mode });
+			}
+
 			case "get_subagents": {
 				if (!subagentRegistry) {
 					return error(id, "get_subagents", "Subagent event bus is unavailable");

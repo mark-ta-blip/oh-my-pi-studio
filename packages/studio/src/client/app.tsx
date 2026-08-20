@@ -1,3 +1,4 @@
+import { ChevronDown, FolderPlus } from "lucide-react";
 import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
 	StudioActivityEntry,
@@ -14,6 +15,7 @@ import type {
 	StudioControlLeaseResponse,
 	StudioEventEnvelope,
 	StudioEventResyncRequired,
+	StudioImageAttachment,
 	StudioPlanSummary,
 	StudioPlanSummaryResponse,
 	StudioPromptResponse,
@@ -25,9 +27,11 @@ import type {
 	StudioRunResponse,
 	StudioSession,
 	StudioSessionListResponse,
+	StudioSessionMode,
 	StudioSessionResponse,
 	StudioSubagent,
 	StudioSubagentListResponse,
+	StudioThinkingLevel,
 	StudioToolDisplay,
 	StudioToolDisplayListResponse,
 	StudioTranscriptMessage,
@@ -42,6 +46,7 @@ import type {
 import { mergeStudioActivitySnapshot, upsertStudioActivityEntry } from "./activity-state";
 import { mergeStudioAuthProgress } from "./auth-flow";
 import type { StudioContextPanel } from "./context-panel";
+import type { StudioComposerImageDraft } from "./conversation/composer";
 import { StudioConversationPane } from "./conversation/conversation-pane";
 import { mergeStudioRunHistorySnapshot, upsertStudioRunHistory } from "./history/run-history-state";
 import { StudioSessionInspector } from "./inspector/session-inspector";
@@ -49,6 +54,7 @@ import { StudioSessionRail } from "./navigation/session-rail";
 import { mergeStudioPlanSummary } from "./plan-state";
 import { isActiveRun, isTerminalRunStatus, mergeStudioSessionSnapshot, reconcileStudioSession } from "./session-state";
 import { type StudioConnectionState, StudioTitlebar } from "./shell/titlebar";
+import { getStudioThinkingPicker, getStudioThinkingVariantModel } from "./thinking-variants";
 import { mergeStudioToolDisplaySnapshot, upsertStudioToolDisplay } from "./tool-display-state";
 import { mergeStudioTranscriptSnapshot, upsertStudioTranscriptMessage } from "./transcript-state";
 
@@ -68,6 +74,47 @@ const EMPTY_SUBAGENTS: StudioSubagent[] = [];
 const EMPTY_TOOL_DISPLAYS: StudioToolDisplay[] = [];
 const EMPTY_TRANSCRIPT: StudioTranscriptMessage[] = [];
 const EMPTY_USAGE_HISTORY: StudioUsageHistoryEntry[] = [];
+const STUDIO_MAX_IMAGE_ATTACHMENTS = 4;
+const STUDIO_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+function isSupportedImageMimeType(value: string): value is StudioImageAttachment["mimeType"] {
+	return value === "image/jpeg" || value === "image/png" || value === "image/webp" || value === "image/gif";
+}
+
+function imageTranscriptText(imageCount: number): string {
+	return imageCount === 1 ? "Attached image" : `Attached ${imageCount} images`;
+}
+
+async function readImageAttachment(file: File): Promise<StudioImageAttachment> {
+	const mimeType = file.type;
+	if (!isSupportedImageMimeType(mimeType)) {
+		throw new Error("Choose a PNG, JPEG, WebP, or GIF image.");
+	}
+	if (file.size > STUDIO_MAX_IMAGE_BYTES) {
+		throw new Error("Each image must be 5 MB or smaller.");
+	}
+	const reader = new FileReader();
+	const { promise, reject, resolve } = Promise.withResolvers<StudioImageAttachment>();
+	reader.addEventListener("error", () => reject(new Error("Studio could not read that image.")), { once: true });
+	reader.addEventListener(
+		"load",
+		() => {
+			if (typeof reader.result !== "string") {
+				reject(new Error("Studio could not read that image."));
+				return;
+			}
+			const prefix = `data:${mimeType};base64,`;
+			if (!reader.result.startsWith(prefix)) {
+				reject(new Error("Studio could not encode that image."));
+				return;
+			}
+			resolve({ type: "image", data: reader.result.slice(prefix.length), mimeType });
+		},
+		{ once: true },
+	);
+	reader.readAsDataURL(file);
+	return await promise;
+}
 
 function parseStudioReady(message: unknown): message is StudioEventEnvelope<StudioBootstrap> {
 	if (!message || typeof message !== "object") return false;
@@ -306,10 +353,6 @@ function isActiveAuthFlow(progress: StudioAuthProgress): boolean {
 	return progress.phase === "authorization" || progress.phase === "progress" || progress.phase === "prompt";
 }
 
-function prefersOverlayPanels(): boolean {
-	return typeof window !== "undefined" && window.matchMedia("(max-width: 860px)").matches;
-}
-
 const selectedSessionStorageKey = "omp-studio-selected-session";
 
 function loadStoredSessionId(): string | null {
@@ -490,13 +533,19 @@ export function App(): ReactNode {
 	const [sessionWorkspaceId, setSessionWorkspaceId] = useState("");
 	const [sessionProviderId, setSessionProviderId] = useState("");
 	const [sessionModelId, setSessionModelId] = useState("");
+	const [sessionMode, setSessionMode] = useState<StudioSessionMode>("code");
 	const [sessionPending, setSessionPending] = useState(false);
 	const [sessionConnectPendingId, setSessionConnectPendingId] = useState<string | null>(null);
+	const [sessionModePendingId, setSessionModePendingId] = useState<string | null>(null);
+	const [sessionModelPendingId, setSessionModelPendingId] = useState<string | null>(null);
+	const [sessionThinkingPendingId, setSessionThinkingPendingId] = useState<string | null>(null);
 	const [selectedSessionId, setSelectedSessionId] = useState<string | null>(loadStoredSessionId);
 	const [contextPanel, setContextPanel] = useState<StudioContextPanel>("overview");
-	const [contextOpen, setContextOpen] = useState(() => !prefersOverlayPanels());
+	const [contextOpen, setContextOpen] = useState(false);
 	const [navigationOpen, setNavigationOpen] = useState(false);
 	const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>({});
+	const [promptImagesBySession, setPromptImagesBySession] = useState<Record<string, StudioComposerImageDraft[]>>({});
+	const [promptImagePending, setPromptImagePending] = useState(false);
 	const [promptPending, setPromptPending] = useState(false);
 	const [cancelPending, setCancelPending] = useState(false);
 	const [transcriptBySession, setTranscriptBySession] = useState<Record<string, StudioTranscriptMessage[]>>({});
@@ -529,6 +578,8 @@ export function App(): ReactNode {
 		setupAutoOpenedRef.current = shouldOpen;
 		return shouldOpen;
 	});
+	const [projectManagerOpen, setProjectManagerOpen] = useState(false);
+	const [providerManagerOpen, setProviderManagerOpen] = useState(false);
 	const [controlPendingId, setControlPendingId] = useState<string | null>(null);
 	const [leaseExpiresAtMs, setLeaseExpiresAtMs] = useState<Record<string, number>>({});
 	const [approvalPendingId, setApprovalPendingId] = useState<string | null>(null);
@@ -540,6 +591,7 @@ export function App(): ReactNode {
 	const conversationScrollRef = useRef<HTMLElement>(null);
 	const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
 	const workspacePathRef = useRef<HTMLInputElement>(null);
+	const sessionWorkspaceRef = useRef<HTMLSelectElement>(null);
 	const sessionNameRef = useRef<HTMLInputElement>(null);
 	const notifiedRunIdsRef = useRef(new Set<string>());
 	const runStateBySessionRef = useRef(new Map<string, StudioRun>());
@@ -655,6 +707,9 @@ export function App(): ReactNode {
 				);
 				return true;
 			} catch (reason) {
+				// A prompt can start this session through the same supervisor while this background warm-up
+				// request is still in flight. In that case the late connection failure is no longer relevant.
+				if (connectedSessionIdsRef.current.has(studioSessionId)) return true;
 				connectedSessionIdsRef.current.delete(studioSessionId);
 				const failedAtMs = Date.now();
 				setSessions(current =>
@@ -1029,12 +1084,23 @@ export function App(): ReactNode {
 
 	useEffect(() => {
 		if (workspaces.some(workspace => workspace.id === sessionWorkspaceId)) return;
-		setSessionWorkspaceId(workspaces[0]?.id ?? "");
-	}, [sessionWorkspaceId, workspaces]);
+		const recentWorkspaceId = sortSessions(sessions).find(
+			session => session.workspaceId && workspaces.some(workspace => workspace.id === session.workspaceId),
+		)?.workspaceId;
+		setSessionWorkspaceId(recentWorkspaceId ?? workspaces[0]?.id ?? "");
+	}, [sessionWorkspaceId, sessions, workspaces]);
 
 	useEffect(() => {
+		const preferredSession = sortSessions(sessions).find(session => {
+			if (!session.model) return false;
+			const provider = providers.find(candidate => candidate.id === session.model?.provider);
+			return provider?.models.some(model => model.id === session.model?.id) === true;
+		});
 		const provider =
 			providers.find(candidate => candidate.id === sessionProviderId && candidate.models.length > 0) ??
+			providers.find(
+				candidate => candidate.id === preferredSession?.model?.provider && candidate.models.length > 0,
+			) ??
 			providers.find(candidate => candidate.models.length > 0);
 		if (!provider) {
 			setSessionProviderId("");
@@ -1042,9 +1108,14 @@ export function App(): ReactNode {
 			return;
 		}
 		if (provider.id !== sessionProviderId) setSessionProviderId(provider.id);
-		const model = provider.models.find(candidate => candidate.id === sessionModelId) ?? provider.models[0];
+		const preferredModelId =
+			preferredSession?.model?.provider === provider.id ? preferredSession.model.id : undefined;
+		const model =
+			provider.models.find(candidate => candidate.id === sessionModelId) ??
+			provider.models.find(candidate => candidate.id === preferredModelId) ??
+			provider.models[0];
 		if (model && model.id !== sessionModelId) setSessionModelId(model.id);
-	}, [providers, sessionModelId, sessionProviderId]);
+	}, [providers, sessions, sessionModelId, sessionProviderId]);
 
 	useEffect(() => {
 		if (selectedSessionId && sessions.some(session => session.id === selectedSessionId)) return;
@@ -1409,6 +1480,18 @@ export function App(): ReactNode {
 		[providers, sessionProviderId],
 	);
 	const selectedProviderModels = selectedProvider?.models ?? [];
+	const quickStartWorkspaces = useMemo(() => {
+		const workspaceById = new Map(workspaces.map(workspace => [workspace.id, workspace]));
+		const orderedIds: string[] = [];
+		const addWorkspaceId = (workspaceId: string | undefined): void => {
+			if (!workspaceId || orderedIds.includes(workspaceId) || !workspaceById.has(workspaceId)) return;
+			orderedIds.push(workspaceId);
+		};
+		addWorkspaceId(sessionWorkspaceId);
+		for (const session of sortSessions(sessions)) addWorkspaceId(session.workspaceId);
+		for (const workspace of workspaces) addWorkspaceId(workspace.id);
+		return orderedIds.slice(0, 4).map(workspaceId => workspaceById.get(workspaceId) as StudioWorkspace);
+	}, [sessionWorkspaceId, sessions, workspaces]);
 	const sessionStartBlockedReason =
 		connection === "offline"
 			? "Studio is reconnecting."
@@ -1418,16 +1501,17 @@ export function App(): ReactNode {
 					? "Connect a provider with an available model to start a session."
 					: null;
 	const sessionStartLabel = sessionPending
-		? "starting"
+		? "Opening session"
 		: !sessionWorkspaceId
-			? "choose project"
+			? "Choose a project"
 			: !sessionProviderId || !sessionModelId
-				? "connect model"
-				: "start session";
+				? "Connect a provider"
+				: "Start session";
 	const selectedActivity = (selectedSessionId ? activityBySession[selectedSessionId] : undefined) ?? EMPTY_ACTIVITY;
 	const selectedTranscript =
 		(selectedSessionId ? transcriptBySession[selectedSessionId] : undefined) ?? EMPTY_TRANSCRIPT;
 	const promptText = selectedSessionId ? (promptDrafts[selectedSessionId] ?? "") : "";
+	const promptImages = selectedSessionId ? (promptImagesBySession[selectedSessionId] ?? []) : [];
 	const transcriptError = selectedSessionId ? (transcriptErrorsBySession[selectedSessionId] ?? null) : null;
 	const transcriptLoading = selectedSessionId ? transcriptLoadingBySession[selectedSessionId] === true : false;
 	const earlierTranscriptOrdinal = selectedSessionId ? transcriptCursorBySession[selectedSessionId] : undefined;
@@ -1463,6 +1547,25 @@ export function App(): ReactNode {
 	const selectedApprovals = (selectedSessionId ? approvalsBySession[selectedSessionId] : undefined) ?? EMPTY_APPROVALS;
 	const selectedSubagents = (selectedSessionId ? subagentsBySession[selectedSessionId] : undefined) ?? EMPTY_SUBAGENTS;
 	const selectedActiveRun = isActiveRun(selectedSession?.activeRun) ? selectedSession.activeRun : undefined;
+	const selectedSessionModel = useMemo(() => {
+		if (!selectedSession?.model) return null;
+		const provider = providers.find(candidate => candidate.id === selectedSession.model?.provider);
+		return provider?.models.find(candidate => candidate.id === selectedSession.model?.id) ?? null;
+	}, [providers, selectedSession?.model]);
+	const selectedSessionProviderModels = useMemo(
+		() => providers.find(provider => provider.id === selectedSession?.model?.provider)?.models ?? [],
+		[providers, selectedSession?.model?.provider],
+	);
+	const selectedSessionSupportsImageInput = selectedSessionModel?.supportsImageInput === true;
+	const selectedSessionThinkingPicker = useMemo(
+		() => getStudioThinkingPicker(selectedSessionModel ?? undefined, selectedSessionProviderModels),
+		[selectedSessionModel, selectedSessionProviderModels],
+	);
+	const selectedSessionThinkingLevels = selectedSessionThinkingPicker?.levels;
+	const selectedSessionThinkingLevel =
+		selectedSessionThinkingPicker?.kind === "model_variant"
+			? selectedSessionThinkingPicker.selectedLevel
+			: selectedSession?.model?.thinkingLevel;
 	const selectedWorkspace = useMemo(
 		() => workspaces.find(workspace => workspace.id === selectedSession?.workspaceId) ?? null,
 		[selectedSession?.workspaceId, workspaces],
@@ -1765,10 +1868,12 @@ export function App(): ReactNode {
 				body: JSON.stringify({
 					holderId,
 					modelId: sessionModelId,
+					mode: sessionMode,
 					provider: sessionProviderId,
 					workspaceId: sessionWorkspaceId,
 					...(name ? { name } : {}),
 				}),
+				signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
 			});
 			if (!response.ok) throw new Error(await responseError(response));
 			const body = (await response.json()) as StudioSessionResponse;
@@ -1779,6 +1884,7 @@ export function App(): ReactNode {
 			setSelectedSessionId(body.session.id);
 			setSessionName("");
 			setSetupOpen(false);
+			window.requestAnimationFrame(() => composerTextareaRef.current?.focus());
 			void connectSession(body.session.id);
 		} catch (reason) {
 			setSessionError(reason instanceof Error ? reason.message : "Studio could not start the local OMP session.");
@@ -1791,22 +1897,28 @@ export function App(): ReactNode {
 		async (event: FormEvent<HTMLFormElement>): Promise<void> => {
 			event.preventDefault();
 			const message = promptText.trim();
-			if (!selectedSessionId || !selectedSessionKnown || !message || promptPending) return;
+			const images = promptImages.map(image => image.attachment);
+			if (
+				!selectedSessionId ||
+				!selectedSessionKnown ||
+				(!message && images.length === 0) ||
+				promptPending ||
+				promptImagePending
+			) {
+				return;
+			}
 			const studioSessionId = selectedSessionId;
 			setSessionError(null);
 			setPromptPending(true);
 			let optimisticMessageId: string | undefined;
 			try {
-				// Only force a reconnect when this tab has no live connection: a redundant /connect on a warm
-				// session costs a round trip and flips the session back to "starting", which disables the composer.
-				const connecting = connectSession(studioSessionId, !connectedSessionIdsRef.current.has(studioSessionId));
-				// The prompt needs a live lease, not a fresh one. Reuse an unexpired lease, and when a renewal is
-				// needed overlap it with the connect instead of chaining both round trips ahead of the prompt.
+				// `/prompts` starts (or joins the start of) the OMP session server-side. Do not make the user's
+				// first message depend on the separate best-effort warm-up request completing successfully.
+				// The prompt needs a live lease, not a fresh one. Reuse an unexpired lease when possible.
 				const reusedLease =
 					(leaseExpiresAtMs[studioSessionId] ?? 0) - Date.now() > STUDIO_CONTROL_LEASE_REUSE_MARGIN_MS;
 				const controlling = reusedLease ? Promise.resolve(true) : acquireControl(studioSessionId, false);
-				const [connected, controlled] = await Promise.all([connecting, controlling]);
-				if (!connected || !controlled) return;
+				if (!(await controlling)) return;
 				const optimisticId = `local_${crypto.randomUUID().replaceAll("-", "")}`;
 				optimisticMessageId = optimisticId;
 				const promptedAtMs = Date.now();
@@ -1814,7 +1926,7 @@ export function App(): ReactNode {
 					await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/prompts`, {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({ holderId, message }),
+						body: JSON.stringify({ holderId, message, ...(images.length ? { images } : {}) }),
 						signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
 					});
 				let response = await sendPrompt();
@@ -1832,6 +1944,7 @@ export function App(): ReactNode {
 					body.run,
 					runStateBySessionRef.current.get(studioSessionId),
 				);
+				connectedSessionIdsRef.current.add(studioSessionId);
 				if (reconciled.run) runStateBySessionRef.current.set(studioSessionId, reconciled.run);
 				sessionSnapshotVersionRef.current += 1;
 				setSessions(current =>
@@ -1844,13 +1957,18 @@ export function App(): ReactNode {
 						studioSessionId,
 						runId: body.run.id,
 						role: "user",
-						text: message,
+						text: message || imageTranscriptText(images.length),
 						status: "completed",
 						createdAtMs: promptedAtMs,
 						updatedAtMs: Date.now(),
 					}),
 				}));
 				setPromptDrafts(current => {
+					const next = { ...current };
+					delete next[studioSessionId];
+					return next;
+				});
+				setPromptImagesBySession(current => {
 					const next = { ...current };
 					delete next[studioSessionId];
 					return next;
@@ -1873,11 +1991,12 @@ export function App(): ReactNode {
 		},
 		[
 			acquireControl,
-			connectSession,
 			holderId,
 			leaseExpiresAtMs,
 			loadSessions,
 			loadTranscript,
+			promptImagePending,
+			promptImages,
 			promptPending,
 			promptText,
 			selectedSessionId,
@@ -1921,6 +2040,121 @@ export function App(): ReactNode {
 		}
 	}, [acquireControl, cancelPending, holderId, loadSessions, selectedActiveRun, selectedSessionId]);
 
+	const changeSessionMode = useCallback(
+		async (mode: StudioSessionMode): Promise<void> => {
+			if (
+				!selectedSessionId ||
+				!selectedSession ||
+				selectedActiveRun ||
+				sessionModePendingId !== null ||
+				(selectedSession.mode ?? "code") === mode
+			) {
+				return;
+			}
+			const studioSessionId = selectedSessionId;
+			if (!(await acquireControl(studioSessionId, false))) return;
+			setSessionError(null);
+			setSessionModePendingId(studioSessionId);
+			try {
+				const response = await fetch(`/api/v1/sessions/${encodeURIComponent(studioSessionId)}/mode`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ holderId, mode }),
+					signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
+				});
+				if (!response.ok) throw new Error(await responseError(response));
+				const body = (await response.json()) as StudioSessionResponse;
+				sessionSnapshotVersionRef.current += 1;
+				setSessions(current =>
+					sortSessions([body.session, ...current.filter(session => session.id !== body.session.id)]),
+				);
+			} catch (reason) {
+				setSessionError(reason instanceof Error ? reason.message : "Studio could not change the session mode.");
+			} finally {
+				setSessionModePendingId(current => (current === studioSessionId ? null : current));
+			}
+		},
+		[acquireControl, holderId, selectedActiveRun, selectedSession, selectedSessionId, sessionModePendingId],
+	);
+
+	const changeSessionModel = useCallback(
+		async (provider: string, modelId: string): Promise<void> => {
+			if (!selectedSessionId || !selectedSession || selectedActiveRun || sessionModelPendingId !== null) return;
+			if (selectedSession.model?.provider === provider && selectedSession.model.id === modelId) return;
+			if (!(await acquireControl(selectedSessionId, false))) return;
+			setSessionError(null);
+			setSessionModelPendingId(selectedSessionId);
+			try {
+				const response = await fetch(`/api/v1/sessions/${encodeURIComponent(selectedSessionId)}/model`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ holderId, provider, modelId }),
+					signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
+				});
+				if (!response.ok) throw new Error(await responseError(response));
+				const body = (await response.json()) as StudioSessionResponse;
+				sessionSnapshotVersionRef.current += 1;
+				setSessions(current =>
+					sortSessions([body.session, ...current.filter(session => session.id !== body.session.id)]),
+				);
+			} catch (reason) {
+				setSessionError(reason instanceof Error ? reason.message : "Studio could not change the session model.");
+			} finally {
+				setSessionModelPendingId(current => (current === selectedSessionId ? null : current));
+			}
+		},
+		[acquireControl, holderId, selectedActiveRun, selectedSession, selectedSessionId, sessionModelPendingId],
+	);
+
+	const changeSessionThinking = useCallback(
+		async (thinkingLevel: StudioThinkingLevel | undefined): Promise<void> => {
+			if (!selectedSessionId || !selectedSession || selectedActiveRun || sessionThinkingPendingId !== null) return;
+			if (selectedSessionThinkingPicker?.kind === "model_variant") {
+				if (!thinkingLevel || !selectedSessionModel) return;
+				const variant = getStudioThinkingVariantModel(
+					selectedSessionModel,
+					selectedSessionProviderModels,
+					thinkingLevel,
+				);
+				if (variant) await changeSessionModel(variant.providerId, variant.id);
+				return;
+			}
+			if (!(await acquireControl(selectedSessionId, false))) return;
+			setSessionError(null);
+			setSessionThinkingPendingId(selectedSessionId);
+			try {
+				const response = await fetch(`/api/v1/sessions/${encodeURIComponent(selectedSessionId)}/thinking`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ holderId, ...(thinkingLevel ? { thinkingLevel } : {}) }),
+					signal: AbortSignal.timeout(STUDIO_MUTATION_TIMEOUT_MS),
+				});
+				if (!response.ok) throw new Error(await responseError(response));
+				const body = (await response.json()) as StudioSessionResponse;
+				sessionSnapshotVersionRef.current += 1;
+				setSessions(current =>
+					sortSessions([body.session, ...current.filter(session => session.id !== body.session.id)]),
+				);
+			} catch (reason) {
+				setSessionError(reason instanceof Error ? reason.message : "Studio could not change Thinking.");
+			} finally {
+				setSessionThinkingPendingId(current => (current === selectedSessionId ? null : current));
+			}
+		},
+		[
+			acquireControl,
+			changeSessionModel,
+			holderId,
+			selectedActiveRun,
+			selectedSession,
+			selectedSessionId,
+			selectedSessionModel,
+			selectedSessionProviderModels,
+			selectedSessionThinkingPicker?.kind,
+			sessionThinkingPendingId,
+		],
+	);
+
 	const resolveToolApproval = useCallback(
 		async (approval: StudioApproval, decision: "approve" | "reject"): Promise<void> => {
 			if (approval.status !== "pending" || approvalPendingId !== null) return;
@@ -1955,7 +2189,6 @@ export function App(): ReactNode {
 
 	useEffect(() => {
 		setNavigationOpen(false);
-		if (selectedSessionId && !prefersOverlayPanels()) setContextOpen(true);
 	}, [selectedSessionId]);
 
 	useEffect(() => {
@@ -1984,11 +2217,12 @@ export function App(): ReactNode {
 			if (key === "n") {
 				event.preventDefault();
 				openSetup();
-				window.requestAnimationFrame(() => sessionNameRef.current?.focus());
+				window.requestAnimationFrame(() => sessionWorkspaceRef.current?.focus());
 				return;
 			}
 			if (key === "o") {
 				event.preventDefault();
+				setProjectManagerOpen(true);
 				openSetup();
 				if (window.ompStudio) void selectWorkspace();
 				else window.requestAnimationFrame(() => workspacePathRef.current?.focus());
@@ -2012,6 +2246,7 @@ export function App(): ReactNode {
 		[acquireControl],
 	);
 	const handleAddProject = useCallback((): void => {
+		setProjectManagerOpen(true);
 		openSetup();
 		window.requestAnimationFrame(() => workspacePathRef.current?.focus());
 	}, [openSetup]);
@@ -2033,6 +2268,64 @@ export function App(): ReactNode {
 			setPromptDrafts(current => ({ ...current, [selectedSessionId]: value }));
 		},
 		[selectedSessionId],
+	);
+	const handleAttachPromptImages = useCallback(
+		async (files: FileList): Promise<void> => {
+			if (!selectedSessionId || !selectedSessionSupportsImageInput || promptImagePending) return;
+			const studioSessionId = selectedSessionId;
+			const existingImages = promptImagesBySession[studioSessionId] ?? [];
+			if (files.length === 0) return;
+			if (existingImages.length + files.length > STUDIO_MAX_IMAGE_ATTACHMENTS) {
+				setSessionError(`Attach up to ${STUDIO_MAX_IMAGE_ATTACHMENTS} images to one message.`);
+				return;
+			}
+			setSessionError(null);
+			setPromptImagePending(true);
+			try {
+				const attachments = await Promise.all(Array.from(files).map(readImageAttachment));
+				const drafts = attachments.map((attachment, index) => ({
+					id: crypto.randomUUID(),
+					attachment,
+					name: files[index]?.name || "Image",
+				}));
+				setPromptImagesBySession(current => ({
+					...current,
+					[studioSessionId]: [...(current[studioSessionId] ?? []), ...drafts],
+				}));
+			} catch (reason) {
+				setSessionError(reason instanceof Error ? reason.message : "Studio could not prepare that image.");
+			} finally {
+				setPromptImagePending(false);
+			}
+		},
+		[promptImagePending, promptImagesBySession, selectedSessionId, selectedSessionSupportsImageInput],
+	);
+	const handleRemovePromptImage = useCallback(
+		(imageId: string): void => {
+			if (!selectedSessionId) return;
+			setPromptImagesBySession(current => {
+				const nextImages = (current[selectedSessionId] ?? []).filter(image => image.id !== imageId);
+				if (nextImages.length === 0) {
+					const next = { ...current };
+					delete next[selectedSessionId];
+					return next;
+				}
+				return { ...current, [selectedSessionId]: nextImages };
+			});
+		},
+		[selectedSessionId],
+	);
+	const handleSessionModeChange = useCallback(
+		(mode: StudioSessionMode): void => void changeSessionMode(mode),
+		[changeSessionMode],
+	);
+	const handleSessionModelChange = useCallback(
+		(provider: string, modelId: string): void => void changeSessionModel(provider, modelId),
+		[changeSessionModel],
+	);
+	const handleSessionThinkingChange = useCallback(
+		(level: StudioThinkingLevel | undefined): void => void changeSessionThinking(level),
+		[changeSessionThinking],
 	);
 	const handleReconnect = useCallback((): void => {
 		if (selectedSessionId) void connectSession(selectedSessionId, true);
@@ -2097,8 +2390,15 @@ export function App(): ReactNode {
 				/>
 
 				<StudioConversationPane
-					activityEntries={selectedActivity}
-					approvals={selectedApprovals}
+					imageAttachments={promptImages}
+					imageAttachmentPending={promptImagePending}
+					imageInputEnabled={selectedSessionSupportsImageInput}
+					modelOptions={selectedSessionProviderModels}
+					selectedModel={selectedSessionModel ?? undefined}
+					modelPending={sessionModelPendingId === selectedSessionId}
+					thinkingLevels={selectedSessionThinkingLevels}
+					selectedThinkingLevel={selectedSessionThinkingLevel}
+					thinkingPending={sessionThinkingPendingId === selectedSessionId}
 					cancelPending={cancelPending}
 					connectionPending={selectedSessionConnecting}
 					composerBlocked={composerBlocked}
@@ -2107,23 +2407,26 @@ export function App(): ReactNode {
 					earlierPending={earlierTranscriptPending}
 					hasEarlierTranscript={earlierTranscriptOrdinal !== undefined}
 					hasStreamingAssistant={hasStreamingAssistant}
-					plan={selectedPlan}
 					onCancel={handleCancelActiveRun}
+					onAttachImages={handleAttachPromptImages}
+					onModelChange={handleSessionModelChange}
+					onThinkingChange={handleSessionThinkingChange}
 					onDraftChange={handleDraftChange}
 					onLoadEarlier={handleLoadEarlierTranscript}
 					onOpenContext={openContext}
-					onOpenNavigation={openNavigation}
 					onOpenSetup={openSetup}
+					onRemoveImage={handleRemovePromptImage}
 					onReconnect={handleReconnect}
+					onSessionModeChange={handleSessionModeChange}
 					onScroll={handleConversationScroll}
 					onSubmit={submitPrompt}
 					promptPending={promptPending}
 					selectedActiveRun={selectedActiveRun}
 					selectedSession={selectedSession ?? undefined}
+					sessionModePending={sessionModePendingId === selectedSessionId}
 					selectedWorkspace={selectedWorkspace ?? undefined}
 					scrollRef={conversationScrollRef}
 					sessionError={sessionError}
-					toolCards={selectedToolDisplays}
 					textareaRef={composerTextareaRef}
 					transcript={displayedTranscript}
 					transcriptError={transcriptError}
@@ -2202,227 +2505,82 @@ export function App(): ReactNode {
 					>
 						<header className="studio-drawer-header">
 							<div>
-								<span className="studio-drawer-kicker">Local configuration</span>
-								<h2 id="studio-setup-heading">Setup</h2>
+								<span className="studio-drawer-kicker">Local workspace</span>
+								<h2 id="studio-setup-heading">New session</h2>
 							</div>
 							<button aria-label="Close setup" onClick={() => setSetupOpen(false)} type="button">
 								Close
 							</button>
 						</header>
 
-						<section className="studio-drawer-section" aria-labelledby="studio-workspaces-heading">
+						<section
+							className="studio-drawer-section studio-session-start"
+							aria-labelledby="studio-session-start-heading"
+						>
 							<div className="studio-drawer-section-heading">
 								<div>
 									<span>01</span>
-									<h3 id="studio-workspaces-heading">Project folders</h3>
-								</div>
-								<span>{workspaces.length}</span>
-							</div>
-							<form className="studio-workspace-form" onSubmit={registerWorkspace}>
-								<label>
-									<span>Folder</span>
-									<input
-										ref={workspacePathRef}
-										autoComplete="off"
-										disabled={workspacePending}
-										name="workspace-path"
-										onChange={event => setWorkspacePath(event.target.value)}
-										placeholder="C:\\Projects\\my-app"
-										required
-										value={workspacePath}
-									/>
-								</label>
-								<label>
-									<span>Label</span>
-									<input
-										autoComplete="off"
-										disabled={workspacePending}
-										name="workspace-label"
-										onChange={event => setWorkspaceLabel(event.target.value)}
-										placeholder="My app"
-										value={workspaceLabel}
-									/>
-								</label>
-								<div className="studio-drawer-form-actions">
-									{window.ompStudio && (
-										<button
-											disabled={workspacePending || workspacePickerPending}
-											onClick={() => void selectWorkspace()}
-											type="button"
-										>
-											{workspacePickerPending ? "Opening" : "Choose folder"}
-										</button>
-									)}
-									<button disabled={workspacePending || workspacePickerPending} type="submit">
-										{workspacePending ? "Saving" : "Add project"}
-									</button>
-								</div>
-							</form>
-							{workspaceError && <p className="studio-inline-error">{workspaceError}</p>}
-							{workspaces.length > 0 && (
-								<div className="studio-drawer-list">
-									{workspaces.map(workspace => (
-										<div className="studio-drawer-row" key={workspace.id}>
-											<button
-												className={
-													workspace.id === sessionWorkspaceId
-														? "studio-drawer-row-select studio-drawer-row-select-active"
-														: "studio-drawer-row-select"
-												}
-												onClick={() => setSessionWorkspaceId(workspace.id)}
-												type="button"
-											>
-												{workspace.label}
-											</button>
-											<button
-												aria-label={`Remove ${workspace.label}`}
-												disabled={workspacePending}
-												onClick={() => void removeWorkspace(workspace.id)}
-												type="button"
-											>
-												{workspaceRemovalPendingId === workspace.id ? "Removing" : "Remove"}
-											</button>
-										</div>
-									))}
-								</div>
-							)}
-						</section>
-
-						<section className="studio-drawer-section" aria-labelledby="studio-providers-heading">
-							<div className="studio-drawer-section-heading">
-								<div>
-									<span>02</span>
-									<h3 id="studio-providers-heading">Provider</h3>
-								</div>
-								<span>{providers.filter(provider => provider.authState !== "unconfigured").length} ready</span>
-							</div>
-							{providerOnboarding ? (
-								<>
-									{providerError && <p className="studio-inline-error">{providerError}</p>}
-									<div className="studio-provider-list">
-										{providers.length === 0 ? (
-											<p className="studio-drawer-empty">No OMP providers are available yet.</p>
-										) : (
-											providers.map(provider => (
-												<article className="studio-provider-row" key={provider.id}>
-													<div>
-														<strong>{provider.name}</strong>
-														<span
-															className={`studio-provider-state studio-provider-state-${provider.authState}`}
-														>
-															{providerState(provider)}
-														</span>
-														<small>
-															{provider.models.length === 0
-																? "No model discovered yet"
-																: `${provider.models.length} model${provider.models.length === 1 ? "" : "s"}`}
-														</small>
-													</div>
-													{provider.canLogin && (
-														<button
-															disabled={providerPending !== null}
-															onClick={() => void startProviderLogin(provider)}
-															type="button"
-														>
-															{providerPending === provider.id
-																? "Connecting"
-																: provider.authState === "authenticated"
-																	? "Reconnect"
-																	: "Connect"}
-														</button>
-													)}
-												</article>
-											))
-										)}
-									</div>
-									{authFlow && (
-										<section className="studio-auth-flow" aria-live="polite">
-											<div>
-												<strong>
-													{authFlow.phase === "completed"
-														? "Provider connected"
-														: authFlow.phase === "failed"
-															? "Provider sign-in stopped"
-															: "Provider sign-in in progress"}
-												</strong>
-												{authFlow.message && <p>{authFlow.message}</p>}
-												{authFlow.instructions && <p>{authFlow.instructions}</p>}
-											</div>
-											{isActiveAuthFlow(authFlow) && (
-												<div className="studio-auth-actions">
-													{(authFlow.launchUrl ?? authFlow.authorizationUrl) && (
-														<button
-															disabled={authBrowserPending}
-															onClick={() => void openProviderAuthorization()}
-															type="button"
-														>
-															{authBrowserPending ? "Opening sign-in" : "Open sign-in"}
-														</button>
-													)}
-													<button
-														disabled={authCancelPending}
-														onClick={() => void cancelProviderLogin()}
-														type="button"
-													>
-														{authCancelPending ? "Cancelling" : "Cancel"}
-													</button>
-												</div>
-											)}
-											{authFlow.phase === "prompt" && authFlow.prompt && (
-												<form className="studio-auth-form" onSubmit={submitAuthResponse}>
-													<label>
-														<span>{authFlow.prompt.message}</span>
-														<input
-															autoComplete="off"
-															disabled={authPending}
-															onChange={event => setAuthResponse(event.target.value)}
-															placeholder={authFlow.prompt.placeholder}
-															required={!authFlow.prompt.allowEmpty}
-															type={promptNeedsSecretInput(authFlow) ? "password" : "text"}
-															value={authResponse}
-														/>
-													</label>
-													<button disabled={authPending} type="submit">
-														{authPending ? "Sending" : "Continue"}
-													</button>
-												</form>
-											)}
-										</section>
-									)}
-								</>
-							) : (
-								<p className="studio-drawer-empty">Provider setup is unavailable in this Studio process.</p>
-							)}
-						</section>
-
-						<section className="studio-drawer-section" aria-labelledby="studio-new-session-heading">
-							<div className="studio-drawer-section-heading">
-								<div>
-									<span>03</span>
-									<h3 id="studio-new-session-heading">New session</h3>
+									<h3 id="studio-session-start-heading">Start a session</h3>
 								</div>
 								<span>{rpcSupervisor ? "Ready" : "Unavailable"}</span>
 							</div>
 							{rpcSupervisor ? (
 								<form className="studio-session-form" onSubmit={createSession}>
-									<label>
+									<label className="studio-session-project-field">
 										<span>Project</span>
-										<select
-											disabled={sessionPending || workspaces.length === 0}
-											onChange={event => setSessionWorkspaceId(event.target.value)}
-											value={sessionWorkspaceId}
-										>
-											<option value="">Choose a project</option>
-											{workspaces.map(workspace => (
-												<option key={workspace.id} value={workspace.id}>
-													{workspace.label}
-												</option>
-											))}
-										</select>
+										<div className="studio-session-project-control">
+											<select
+												aria-label="Project"
+												disabled={sessionPending || workspaces.length === 0}
+												onChange={event => setSessionWorkspaceId(event.target.value)}
+												ref={sessionWorkspaceRef}
+												value={sessionWorkspaceId}
+											>
+												<option value="">Choose a project</option>
+												{workspaces.map(workspace => (
+													<option key={workspace.id} value={workspace.id}>
+														{workspace.label}
+													</option>
+												))}
+											</select>
+											{window.ompStudio && (
+												<button
+													aria-label="Add project folder"
+													className="studio-session-add-project"
+													disabled={sessionPending || workspacePending || workspacePickerPending}
+													onClick={() => void selectWorkspace()}
+													title="Add project folder"
+													type="button"
+												>
+													<FolderPlus aria-hidden="true" size={15} strokeWidth={1.8} />
+												</button>
+											)}
+										</div>
+										{quickStartWorkspaces.length > 1 && (
+											<div aria-label="Recent projects" className="studio-session-recent-projects">
+												<span>Recent</span>
+												{quickStartWorkspaces.map(workspace => (
+													<button
+														aria-pressed={workspace.id === sessionWorkspaceId}
+														className={
+															workspace.id === sessionWorkspaceId
+																? "studio-session-recent-active"
+																: undefined
+														}
+														onClick={() => setSessionWorkspaceId(workspace.id)}
+														title={workspace.label}
+														type="button"
+													>
+														{workspace.label}
+													</button>
+												))}
+											</div>
+										)}
 									</label>
 									<label>
 										<span>Provider</span>
 										<select
+											aria-label="Provider"
 											disabled={sessionPending || providers.every(provider => provider.models.length === 0)}
 											onChange={event => setSessionProviderId(event.target.value)}
 											value={sessionProviderId}
@@ -2437,9 +2595,19 @@ export function App(): ReactNode {
 												))}
 										</select>
 									</label>
+									{providers.every(provider => provider.models.length === 0) && (
+										<button
+											className="studio-session-provider-setup"
+											onClick={() => setProviderManagerOpen(true)}
+											type="button"
+										>
+											Connect a provider
+										</button>
+									)}
 									<label>
 										<span>Model</span>
 										<select
+											aria-label="Model"
 											disabled={sessionPending || selectedProviderModels.length === 0}
 											onChange={event => setSessionModelId(event.target.value)}
 											value={sessionModelId}
@@ -2452,21 +2620,47 @@ export function App(): ReactNode {
 											))}
 										</select>
 									</label>
-									<label>
-										<span>Name</span>
-										<input
-											ref={sessionNameRef}
-											autoComplete="off"
-											disabled={sessionPending}
-											onChange={event => setSessionName(event.target.value)}
-											placeholder="Release planning"
-											value={sessionName}
-										/>
-									</label>
+									<fieldset className="studio-session-mode-field">
+										<legend>Mode</legend>
+										<div aria-label="Session mode" className="studio-mode-segmented" role="group">
+											<button
+												aria-pressed={sessionMode === "code"}
+												className={sessionMode === "code" ? "studio-mode-option-active" : undefined}
+												disabled={sessionPending}
+												onClick={() => setSessionMode("code")}
+												type="button"
+											>
+												Code
+											</button>
+											<button
+												aria-pressed={sessionMode === "plan"}
+												className={sessionMode === "plan" ? "studio-mode-option-active" : undefined}
+												disabled={sessionPending}
+												onClick={() => setSessionMode("plan")}
+												type="button"
+											>
+												Plan
+											</button>
+										</div>
+									</fieldset>
+									<details className="studio-session-advanced">
+										<summary>Optional session name</summary>
+										<label>
+											<span>Name</span>
+											<input
+												ref={sessionNameRef}
+												autoComplete="off"
+												disabled={sessionPending}
+												onChange={event => setSessionName(event.target.value)}
+												placeholder="Release planning"
+												value={sessionName}
+											/>
+										</label>
+									</details>
 									<div className="studio-drawer-form-actions">
 										<button
 											aria-describedby={sessionStartBlockedReason ? "studio-session-requirement" : undefined}
-											disabled={sessionPending || connection === "offline"}
+											disabled={sessionPending || sessionStartBlockedReason !== null}
 											type="submit"
 										>
 											{sessionStartLabel}
@@ -2482,6 +2676,233 @@ export function App(): ReactNode {
 								</p>
 							)}
 							{sessionError && <p className="studio-inline-error">{sessionError}</p>}
+						</section>
+
+						<section className="studio-drawer-section" aria-labelledby="studio-workspaces-heading">
+							<div className="studio-drawer-section-heading">
+								<div>
+									<span>02</span>
+									<h3 id="studio-workspaces-heading">Project folders</h3>
+								</div>
+								<div className="studio-drawer-section-heading-actions">
+									<span>{workspaces.length}</span>
+									<button
+										aria-expanded={projectManagerOpen}
+										aria-label={projectManagerOpen ? "Hide project folders" : "Show project folders"}
+										className="studio-drawer-disclosure"
+										onClick={() => setProjectManagerOpen(current => !current)}
+										title={projectManagerOpen ? "Hide project folders" : "Show project folders"}
+										type="button"
+									>
+										<ChevronDown
+											aria-hidden="true"
+											className={projectManagerOpen ? "studio-drawer-disclosure-open" : undefined}
+											size={15}
+											strokeWidth={1.8}
+										/>
+									</button>
+								</div>
+							</div>
+							{projectManagerOpen && (
+								<>
+									<form className="studio-workspace-form" onSubmit={registerWorkspace}>
+										<label>
+											<span>Folder</span>
+											<input
+												ref={workspacePathRef}
+												autoComplete="off"
+												disabled={workspacePending}
+												name="workspace-path"
+												onChange={event => setWorkspacePath(event.target.value)}
+												placeholder="C:\\Projects\\my-app"
+												required
+												value={workspacePath}
+											/>
+										</label>
+										<label>
+											<span>Label</span>
+											<input
+												autoComplete="off"
+												disabled={workspacePending}
+												name="workspace-label"
+												onChange={event => setWorkspaceLabel(event.target.value)}
+												placeholder="My app"
+												value={workspaceLabel}
+											/>
+										</label>
+										<div className="studio-drawer-form-actions">
+											{window.ompStudio && (
+												<button
+													disabled={workspacePending || workspacePickerPending}
+													onClick={() => void selectWorkspace()}
+													type="button"
+												>
+													{workspacePickerPending ? "Opening" : "Choose folder"}
+												</button>
+											)}
+											<button disabled={workspacePending || workspacePickerPending} type="submit">
+												{workspacePending ? "Saving" : "Add project"}
+											</button>
+										</div>
+									</form>
+									{workspaceError && <p className="studio-inline-error">{workspaceError}</p>}
+									{workspaces.length > 0 && (
+										<div className="studio-drawer-list">
+											{workspaces.map(workspace => (
+												<div className="studio-drawer-row" key={workspace.id}>
+													<button
+														className={
+															workspace.id === sessionWorkspaceId
+																? "studio-drawer-row-select studio-drawer-row-select-active"
+																: "studio-drawer-row-select"
+														}
+														onClick={() => setSessionWorkspaceId(workspace.id)}
+														type="button"
+													>
+														{workspace.label}
+													</button>
+													<button
+														aria-label={`Remove ${workspace.label}`}
+														disabled={workspacePending}
+														onClick={() => void removeWorkspace(workspace.id)}
+														type="button"
+													>
+														{workspaceRemovalPendingId === workspace.id ? "Removing" : "Remove"}
+													</button>
+												</div>
+											))}
+										</div>
+									)}
+								</>
+							)}
+						</section>
+
+						<section className="studio-drawer-section" aria-labelledby="studio-providers-heading">
+							<div className="studio-drawer-section-heading">
+								<div>
+									<span>03</span>
+									<h3 id="studio-providers-heading">Provider</h3>
+								</div>
+								<div className="studio-drawer-section-heading-actions">
+									<span>
+										{providers.filter(provider => provider.authState !== "unconfigured").length} ready
+									</span>
+									<button
+										aria-expanded={providerManagerOpen}
+										aria-label={providerManagerOpen ? "Hide provider setup" : "Show provider setup"}
+										className="studio-drawer-disclosure"
+										onClick={() => setProviderManagerOpen(current => !current)}
+										title={providerManagerOpen ? "Hide provider setup" : "Show provider setup"}
+										type="button"
+									>
+										<ChevronDown
+											aria-hidden="true"
+											className={providerManagerOpen ? "studio-drawer-disclosure-open" : undefined}
+											size={15}
+											strokeWidth={1.8}
+										/>
+									</button>
+								</div>
+							</div>
+							{providerManagerOpen ? (
+								providerOnboarding ? (
+									<>
+										{providerError && <p className="studio-inline-error">{providerError}</p>}
+										<div className="studio-provider-list">
+											{providers.length === 0 ? (
+												<p className="studio-drawer-empty">No OMP providers are available yet.</p>
+											) : (
+												providers.map(provider => (
+													<article className="studio-provider-row" key={provider.id}>
+														<div>
+															<strong>{provider.name}</strong>
+															<span
+																className={`studio-provider-state studio-provider-state-${provider.authState}`}
+															>
+																{providerState(provider)}
+															</span>
+															<small>
+																{provider.models.length === 0
+																	? "No model discovered yet"
+																	: `${provider.models.length} model${provider.models.length === 1 ? "" : "s"}`}
+															</small>
+														</div>
+														{provider.canLogin && (
+															<button
+																disabled={providerPending !== null}
+																onClick={() => void startProviderLogin(provider)}
+																type="button"
+															>
+																{providerPending === provider.id
+																	? "Connecting"
+																	: provider.authState === "authenticated"
+																		? "Reconnect"
+																		: "Connect"}
+															</button>
+														)}
+													</article>
+												))
+											)}
+										</div>
+										{authFlow && (
+											<section className="studio-auth-flow" aria-live="polite">
+												<div>
+													<strong>
+														{authFlow.phase === "completed"
+															? "Provider connected"
+															: authFlow.phase === "failed"
+																? "Provider sign-in stopped"
+																: "Provider sign-in in progress"}
+													</strong>
+													{authFlow.message && <p>{authFlow.message}</p>}
+													{authFlow.instructions && <p>{authFlow.instructions}</p>}
+												</div>
+												{isActiveAuthFlow(authFlow) && (
+													<div className="studio-auth-actions">
+														{(authFlow.launchUrl ?? authFlow.authorizationUrl) && (
+															<button
+																disabled={authBrowserPending}
+																onClick={() => void openProviderAuthorization()}
+																type="button"
+															>
+																{authBrowserPending ? "Opening sign-in" : "Open sign-in"}
+															</button>
+														)}
+														<button
+															disabled={authCancelPending}
+															onClick={() => void cancelProviderLogin()}
+															type="button"
+														>
+															{authCancelPending ? "Cancelling" : "Cancel"}
+														</button>
+													</div>
+												)}
+												{authFlow.phase === "prompt" && authFlow.prompt && (
+													<form className="studio-auth-form" onSubmit={submitAuthResponse}>
+														<label>
+															<span>{authFlow.prompt.message}</span>
+															<input
+																autoComplete="off"
+																disabled={authPending}
+																onChange={event => setAuthResponse(event.target.value)}
+																placeholder={authFlow.prompt.placeholder}
+																required={!authFlow.prompt.allowEmpty}
+																type={promptNeedsSecretInput(authFlow) ? "password" : "text"}
+																value={authResponse}
+															/>
+														</label>
+														<button disabled={authPending} type="submit">
+															{authPending ? "Sending" : "Continue"}
+														</button>
+													</form>
+												)}
+											</section>
+										)}
+									</>
+								) : (
+									<p className="studio-drawer-empty">Provider setup is unavailable in this Studio process.</p>
+								)
+							) : null}
 						</section>
 					</aside>
 				</div>

@@ -3,11 +3,13 @@ import type {
 	StudioActivityEntry,
 	StudioAgentEvent,
 	StudioApproval,
+	StudioImageAttachment,
 	StudioModelSelection,
 	StudioPlanSummary,
 	StudioRun,
 	StudioRunFailureKind,
 	StudioSession,
+	StudioSessionMode,
 	StudioSubagent,
 	StudioToolDisplay,
 	StudioToolDisplayStatus,
@@ -22,6 +24,11 @@ const STUDIO_APPROVAL_REASON = "OMP requires confirmation for this tool.";
 const INITIAL_ASSISTANT_TRANSCRIPT_SOURCE_ID = "assistant_initial";
 const STUDIO_TRANSCRIPT_UPDATE_INTERVAL_MS = 50;
 
+function promptTranscriptText(message: string, images: StudioImageAttachment[] | undefined): string {
+	if (message) return message;
+	return images?.length === 1 ? "Attached image" : `Attached ${images?.length ?? 0} images`;
+}
+
 export type StudioRpcSupervisorErrorCode =
 	| "rpc_supervisor_unavailable"
 	| "studio_session_not_found"
@@ -29,6 +36,9 @@ export type StudioRpcSupervisorErrorCode =
 	| "studio_session_model_missing"
 	| "studio_workspace_not_found"
 	| "rpc_start_failed"
+	| "rpc_mode_change_failed"
+	| "rpc_model_change_failed"
+	| "rpc_thinking_change_failed"
 	| "run_active"
 	| "run_not_found"
 	| "run_not_active"
@@ -54,6 +64,7 @@ export class StudioRpcSupervisorError extends Error {
 export interface StudioRpcLaunch {
 	cwd: string;
 	model: StudioModelSelection;
+	mode?: StudioSessionMode;
 	profile: string;
 	sessionRef?: string;
 }
@@ -124,8 +135,11 @@ export interface StudioRpcTransport {
 	onSubagentState?(listener: (subagent: StudioSubagent) => void): () => void;
 	onPlanSummary?(listener: (summary: StudioRpcPlanSummary) => void): () => void;
 	onTranscriptUpdate?(listener: (update: StudioRpcTranscriptUpdate) => void): () => void;
-	prompt(message: string): Promise<void>;
+	prompt(message: string, images?: StudioImageAttachment[]): Promise<void>;
 	resolveApproval?(requestId: string, approved: boolean): Promise<void>;
+	setSessionMode?(mode: StudioSessionMode): Promise<void>;
+	setModel?(provider: string, modelId: string): Promise<void>;
+	setThinkingLevel?(level: StudioModelSelection["thinkingLevel"]): Promise<void>;
 	stop(): Promise<void>;
 }
 
@@ -273,7 +287,11 @@ export class StudioRpcSupervisor {
 		}
 	}
 
-	async prompt(studioSessionId: string, message: string): Promise<{ run: StudioRun; session: StudioSession }> {
+	async prompt(
+		studioSessionId: string,
+		message: string,
+		images?: StudioImageAttachment[],
+	): Promise<{ run: StudioRun; session: StudioSession }> {
 		this.#assertSessionNotRemoving(studioSessionId);
 		const session = await this.startSession(studioSessionId);
 		this.#assertSessionNotRemoving(studioSessionId);
@@ -305,14 +323,14 @@ export class StudioRpcSupervisor {
 		};
 		active.awaitingPromptAcceptance = awaitingPromptAcceptance;
 		try {
-			await active.transport.prompt(message);
+			await active.transport.prompt(message, images);
 			if (this.#activeSessions.get(studioSessionId) !== active) {
 				throw new Error("OMP RPC process exited while accepting the prompt.");
 			}
 			const userMessage = this.#store.createStudioUserTranscriptMessage({
 				studioSessionId,
 				runId: created.run.id,
-				text: message,
+				text: promptTranscriptText(message, images),
 			});
 			if (!userMessage) throw new Error("Studio could not persist the accepted prompt.");
 			this.#events.onTranscriptUpdated(studioSessionId, userMessage);
@@ -362,6 +380,115 @@ export class StudioRpcSupervisor {
 			}
 			throw new StudioRpcSupervisorError("rpc_prompt_failed", "OMP could not accept the prompt.");
 		}
+	}
+
+	async setSessionMode(studioSessionId: string, mode: StudioSessionMode): Promise<StudioSession> {
+		this.#assertSessionNotRemoving(studioSessionId);
+		const session = this.#store.getStudioSession(studioSessionId);
+		if (!session) {
+			throw new StudioRpcSupervisorError("studio_session_not_found", "The requested Studio session was not found.");
+		}
+		if (session.activeRun) {
+			throw new StudioRpcSupervisorError("run_active", "Stop the active run before changing the session mode.");
+		}
+		if ((session.mode ?? "code") === mode) return session;
+
+		const starting = this.#startingSessions.get(studioSessionId);
+		if (starting) await starting;
+		const active = this.#activeSessions.get(studioSessionId);
+		if (active) {
+			if (!active.transport.setSessionMode) {
+				throw new StudioRpcSupervisorError(
+					"rpc_mode_change_failed",
+					"This OMP runtime does not support changing the Studio session mode.",
+				);
+			}
+			try {
+				await active.transport.setSessionMode(mode);
+			} catch {
+				throw new StudioRpcSupervisorError(
+					"rpc_mode_change_failed",
+					"OMP could not change the Studio session mode.",
+				);
+			}
+		}
+		const updated = this.#store.updateStudioSessionMode(studioSessionId, mode);
+		if (!updated) {
+			throw new StudioRpcSupervisorError("studio_session_not_found", "The requested Studio session was not found.");
+		}
+		this.#store.appendAuditEntry({
+			action: "session_mode_changed",
+			studioSessionId,
+			detail: { reason: mode },
+		});
+		return updated;
+	}
+
+	async setSessionModel(studioSessionId: string, model: StudioModelSelection): Promise<StudioSession> {
+		this.#assertSessionNotRemoving(studioSessionId);
+		const session = this.#store.getStudioSession(studioSessionId);
+		if (!session)
+			throw new StudioRpcSupervisorError("studio_session_not_found", "The requested Studio session was not found.");
+		if (session.activeRun)
+			throw new StudioRpcSupervisorError("run_active", "Stop the active run before changing the model.");
+		if (session.model?.provider === model.provider && session.model.id === model.id) return session;
+		const starting = this.#startingSessions.get(studioSessionId);
+		if (starting) await starting;
+		const active = this.#activeSessions.get(studioSessionId);
+		if (!active?.transport.setModel) {
+			throw new StudioRpcSupervisorError("rpc_model_change_failed", "This OMP runtime cannot change the model.");
+		}
+		try {
+			await active.transport.setModel(model.provider, model.id);
+		} catch {
+			throw new StudioRpcSupervisorError("rpc_model_change_failed", "OMP could not change the session model.");
+		}
+		const updated = this.#store.updateStudioSessionModel(studioSessionId, model);
+		if (!updated)
+			throw new StudioRpcSupervisorError("studio_session_not_found", "The requested Studio session was not found.");
+		this.#store.appendAuditEntry({
+			action: "session_model_changed",
+			studioSessionId,
+			detail: { modelId: model.id, provider: model.provider },
+		});
+		return updated;
+	}
+
+	async setSessionThinkingLevel(
+		studioSessionId: string,
+		thinkingLevel: StudioModelSelection["thinkingLevel"],
+	): Promise<StudioSession> {
+		this.#assertSessionNotRemoving(studioSessionId);
+		const session = this.#store.getStudioSession(studioSessionId);
+		if (!session)
+			throw new StudioRpcSupervisorError("studio_session_not_found", "The requested Studio session was not found.");
+		if (session.activeRun)
+			throw new StudioRpcSupervisorError("run_active", "Stop the active run before changing Thinking.");
+		if (session.model?.thinkingLevel === thinkingLevel) return session;
+		const starting = this.#startingSessions.get(studioSessionId);
+		if (starting) await starting;
+		const active = this.#activeSessions.get(studioSessionId);
+		if (!active?.transport.setThinkingLevel) {
+			throw new StudioRpcSupervisorError("rpc_thinking_change_failed", "This OMP runtime cannot change Thinking.");
+		}
+		try {
+			await active.transport.setThinkingLevel(thinkingLevel);
+		} catch {
+			throw new StudioRpcSupervisorError("rpc_thinking_change_failed", "OMP could not change Thinking.");
+		}
+		const updated = this.#store.updateStudioSessionModel(studioSessionId, {
+			provider: session.model?.provider ?? "",
+			id: session.model?.id ?? "",
+			...(thinkingLevel ? { thinkingLevel } : {}),
+		});
+		if (!updated)
+			throw new StudioRpcSupervisorError("studio_session_not_found", "The requested Studio session was not found.");
+		this.#store.appendAuditEntry({
+			action: "session_thinking_changed",
+			studioSessionId,
+			detail: { reason: thinkingLevel ?? "default" },
+		});
+		return updated;
 	}
 
 	async removeWorkspace(workspaceId: string): Promise<RemoveWorkspaceResult> {
@@ -644,6 +771,7 @@ export class StudioRpcSupervisor {
 			transport = await factory.start({
 				cwd,
 				model,
+				mode: stored.session.mode ?? "code",
 				profile: stored.session.profile,
 				...(stored.ompSessionRef ? { sessionRef: stored.ompSessionRef } : {}),
 			});

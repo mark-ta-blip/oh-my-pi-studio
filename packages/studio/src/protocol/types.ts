@@ -46,7 +46,24 @@ export interface StudioWorkspaceResponse {
 export interface StudioModelSelection {
 	provider: string;
 	id: string;
+	thinkingLevel?: StudioThinkingLevel;
 }
+
+/** Stable effort labels shared by the Studio picker and OMP's CLI parser. */
+export type StudioThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** The compact workflow choice for one Studio session. */
+export type StudioSessionMode = "code" | "plan";
+
+/** An image payload accepted by the OMP RPC prompt command. */
+export interface StudioImageAttachment {
+	type: "image";
+	data: string;
+	mimeType: "image/jpeg" | "image/png" | "image/webp" | "image/gif";
+}
+
+export const STUDIO_MAX_IMAGE_ATTACHMENTS = 4;
+export const STUDIO_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 /** Runtime availability of a Studio session. OMP session paths never appear in this state. */
 export type StudioSessionStatus = "starting" | "ready" | "running" | "interrupted" | "failed";
@@ -88,6 +105,7 @@ export interface StudioSession {
 	workspaceId: string;
 	name?: string;
 	model?: StudioModelSelection;
+	mode?: StudioSessionMode;
 	status: StudioSessionStatus;
 	createdAtMs: number;
 	updatedAtMs: number;
@@ -403,6 +421,8 @@ export interface StudioSessionCreateRequest {
 	workspaceId: string;
 	provider: string;
 	modelId: string;
+	mode?: StudioSessionMode;
+	thinkingLevel?: StudioThinkingLevel;
 	holderId: string;
 	name?: string;
 }
@@ -410,6 +430,7 @@ export interface StudioSessionCreateRequest {
 export interface StudioPromptRequest {
 	holderId: string;
 	message: string;
+	images?: StudioImageAttachment[];
 }
 
 /** A lease view never reveals a different tab's holder capability. */
@@ -443,6 +464,7 @@ export interface StudioProviderModel {
 	name: string;
 	providerId: string;
 	reasoning: boolean;
+	thinkingLevels?: StudioThinkingLevel[];
 	supportsImageInput: boolean;
 	supportsTools: boolean;
 	contextWindow?: number;

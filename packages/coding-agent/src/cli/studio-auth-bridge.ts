@@ -5,9 +5,12 @@ import {
 	type StudioCredentialOrigin,
 	type StudioProvider,
 	type StudioProviderModel,
+	type StudioThinkingLevel,
 } from "@oh-my-pi/omp-studio";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { ModelRegistry } from "../config/model-registry";
 import { discoverAuthStorage } from "../session/auth-broker-config";
@@ -24,12 +27,40 @@ function toStudioCredentialOrigin(origin: CredentialOrigin | undefined): StudioC
 	return origin?.kind;
 }
 
+function toStudioThinkingLevels(model: Model<Api>): StudioThinkingLevel[] {
+	const supported: StudioThinkingLevel[] = [];
+	for (const effort of getSupportedEfforts(model)) {
+		switch (effort) {
+			case Effort.Minimal:
+				supported.push("minimal");
+				break;
+			case Effort.Low:
+				supported.push("low");
+				break;
+			case Effort.Medium:
+				supported.push("medium");
+				break;
+			case Effort.High:
+				supported.push("high");
+				break;
+			case Effort.XHigh:
+				supported.push("xhigh");
+				break;
+			case Effort.Max:
+				supported.push("max");
+				break;
+		}
+	}
+	return supported;
+}
+
 function toStudioModel(model: Model<Api>): StudioProviderModel {
 	return {
 		id: model.id,
 		name: model.name,
 		providerId: model.provider,
 		reasoning: model.reasoning,
+		thinkingLevels: toStudioThinkingLevels(model),
 		supportsImageInput: model.input.includes("image"),
 		supportsTools: model.supportsTools !== false,
 		...(model.contextWindow === null ? {} : { contextWindow: model.contextWindow }),

@@ -267,6 +267,7 @@
       "version": "17.3.6",
       "dependencies": {
         "@oh-my-pi/pi-utils": "catalog:",
+        "lucide-react": "catalog:",
         "react": "catalog:",
         "react-dom": "catalog:",
       },

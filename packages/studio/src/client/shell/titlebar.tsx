@@ -1,3 +1,4 @@
+import { Menu, PanelRight, Settings } from "lucide-react";
 import { memo } from "react";
 import type { StudioSession } from "../../protocol";
 import { sessionTitle } from "../presentation";
@@ -32,18 +33,36 @@ export const StudioTitlebar = memo(function StudioTitlebar({
 				<span className="studio-titlebar-profile">{profile}</span>
 			</div>
 			<div className="studio-titlebar-actions">
-				<button className="studio-titlebar-mobile-button" onClick={onOpenNavigation} type="button">
-					Sessions
+				<button
+					aria-label="Open session navigation"
+					className="studio-titlebar-mobile-button studio-icon-button"
+					onClick={onOpenNavigation}
+					title="Sessions"
+					type="button"
+				>
+					<Menu aria-hidden="true" size={17} strokeWidth={1.8} />
 				</button>
-				<button className="studio-titlebar-context-button" onClick={onOpenContext} type="button">
-					Context
+				<button
+					aria-label="Open session context"
+					className="studio-titlebar-context-button studio-icon-button"
+					onClick={onOpenContext}
+					title="Session context"
+					type="button"
+				>
+					<PanelRight aria-hidden="true" size={17} strokeWidth={1.8} />
 				</button>
 				<div className={`studio-connection studio-connection-${connection}`}>
 					<span className="studio-connection-dot" />
 					{connection === "ready" ? "connected" : connection === "offline" ? "reconnecting" : "connecting"}
 				</div>
-				<button className="studio-titlebar-button" onClick={onOpenSetup} type="button">
-					Setup
+				<button
+					aria-label="Open setup"
+					className="studio-titlebar-button studio-icon-button"
+					onClick={onOpenSetup}
+					title="Setup"
+					type="button"
+				>
+					<Settings aria-hidden="true" size={17} strokeWidth={1.8} />
 				</button>
 			</div>
 		</header>

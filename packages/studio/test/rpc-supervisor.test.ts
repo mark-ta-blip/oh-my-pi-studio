@@ -26,15 +26,18 @@ import type {
 	StudioAuditListResponse,
 	StudioChangeSetResponse,
 	StudioEventEnvelope,
+	StudioImageAttachment,
 	StudioPlanSummary,
 	StudioPlanSummaryResponse,
 	StudioPromptResponse,
 	StudioRun,
 	StudioRunHistoryResponse,
 	StudioSession,
+	StudioSessionMode,
 	StudioSessionResponse,
 	StudioSubagent,
 	StudioSubagentListResponse,
+	StudioThinkingLevel,
 	StudioToolDisplay,
 	StudioToolDisplayListResponse,
 	StudioTranscriptMessage,
@@ -67,12 +70,16 @@ class FakeStudioRpcTransport implements StudioRpcTransport {
 
 	abortCalls = 0;
 	approvalDecisions: Array<{ approved: boolean; requestId: string }> = [];
+	imagePrompts: StudioImageAttachment[][] = [];
+	modelChanges: Array<{ provider: string; modelId: string }> = [];
+	modeChanges: StudioSessionMode[] = [];
 	promptError: Error | undefined;
 	promptGate: Promise<void> | undefined;
 	prompts: string[] = [];
 	protocolVersion = 2;
 	stopGate: Promise<void> | undefined;
 	stopped = false;
+	thinkingChanges: Array<StudioThinkingLevel | undefined> = [];
 	usage: StudioRpcUsage = {
 		cacheReadTokens: 4,
 		cacheWriteTokens: 5,
@@ -139,10 +146,23 @@ class FakeStudioRpcTransport implements StudioRpcTransport {
 		return () => this.#transcriptListeners.delete(listener);
 	}
 
-	async prompt(message: string): Promise<void> {
+	async prompt(message: string, images?: StudioImageAttachment[]): Promise<void> {
 		this.prompts.push(message);
+		this.imagePrompts.push(images ?? []);
 		await this.promptGate;
 		if (this.promptError) throw this.promptError;
+	}
+
+	async setSessionMode(mode: StudioSessionMode): Promise<void> {
+		this.modeChanges.push(mode);
+	}
+
+	async setModel(provider: string, modelId: string): Promise<void> {
+		this.modelChanges.push({ provider, modelId });
+	}
+
+	async setThinkingLevel(level: StudioThinkingLevel | undefined): Promise<void> {
+		this.thinkingChanges.push(level);
 	}
 
 	async resolveApproval(requestId: string, approved: boolean): Promise<void> {
@@ -376,6 +396,122 @@ afterEach(async () => {
 });
 
 describe("Studio RPC session supervision", () => {
+	it("forwards image-only prompts while persisting a safe transcript label", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-image-prompt");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const created = await createSession(studio, cookie, workspace.workspace.id);
+		const response = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({
+				holderId: HOLDER_A,
+				message: "",
+				images: [{ type: "image", data: "AQID", mimeType: "image/png" }],
+			}),
+		});
+		expect(response.status).toBe(202);
+		expect(factory.transports[0]?.prompts).toEqual([""]);
+		expect(factory.transports[0]?.imagePrompts).toEqual([[{ type: "image", data: "AQID", mimeType: "image/png" }]]);
+		const transcriptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/transcript`, {
+			headers: { Cookie: cookie },
+		});
+		const transcript = (await transcriptResponse.json()) as StudioTranscriptResponse;
+		expect(transcript.messages.find(message => message.role === "user")?.text).toBe("Attached image");
+	});
+
+	it("changes an idle session mode through RPC and rejects changes during a run", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-mode-change");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const created = await createSession(studio, cookie, workspace.workspace.id);
+		const planResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/mode`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, mode: "plan" }),
+		});
+		expect(planResponse.status).toBe(200);
+		expect(((await planResponse.json()) as StudioSessionResponse).session.mode).toBe("plan");
+		expect(factory.transports[0]?.modeChanges).toEqual(["plan"]);
+
+		const promptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, message: "draft the plan" }),
+		});
+		expect(promptResponse.status).toBe(202);
+		const blockedResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/mode`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, mode: "code" }),
+		});
+		expect(blockedResponse.status).toBe(409);
+		factory.transports[0]?.emit({ type: "agent_end" });
+		await Bun.sleep(10);
+		const codeResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/mode`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, mode: "code" }),
+		});
+		expect(codeResponse.status).toBe(200);
+		expect(factory.transports[0]?.modeChanges).toEqual(["plan", "code"]);
+	});
+
+	it("changes model and Thinking through the composer routes, then rejects both while a run is active", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-model-change");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const created = await createSession(studio, cookie, workspace.workspace.id);
+		const modelResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/model`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, provider: "example", modelId: "example-fast" }),
+		});
+		expect(modelResponse.status).toBe(200);
+		expect(((await modelResponse.json()) as StudioSessionResponse).session.model).toEqual({
+			provider: "example",
+			id: "example-fast",
+		});
+		expect(factory.transports[0]?.modelChanges).toEqual([{ provider: "example", modelId: "example-fast" }]);
+
+		const thinkingResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/thinking`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, thinkingLevel: "high" }),
+		});
+		expect(thinkingResponse.status).toBe(200);
+		expect(((await thinkingResponse.json()) as StudioSessionResponse).session.model?.thinkingLevel).toBe("high");
+		expect(factory.transports[0]?.thinkingChanges).toEqual(["high"]);
+
+		const promptResponse = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, message: "keep this run active" }),
+		});
+		expect(promptResponse.status).toBe(202);
+		const blockedModel = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/model`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, provider: "example", modelId: "example-safe" }),
+		});
+		expect(blockedModel.status).toBe(409);
+		const blockedThinking = await fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/thinking`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, thinkingLevel: "low" }),
+		});
+		expect(blockedThinking.status).toBe(409);
+		expect(factory.transports[0]?.modelChanges).toHaveLength(1);
+		expect(factory.transports[0]?.thinkingChanges).toEqual(["high"]);
+		factory.transports[0]?.emit({ type: "agent_end" });
+	});
+
 	it("keeps OMP references server-only, requires the lease, and completes only after a terminal agent_end", async () => {
 		const { factory, root, studio } = await startTestStudio();
 		const workspacePath = path.join(root, "workspace-alpha");
@@ -399,6 +535,7 @@ describe("Studio RPC session supervision", () => {
 			expect(factory.launches).toEqual([
 				{
 					cwd: workspacePath,
+					mode: "code",
 					model: { id: "example-model", provider: "example" },
 					profile: "default",
 				},
@@ -483,6 +620,35 @@ describe("Studio RPC session supervision", () => {
 		} finally {
 			events.close();
 		}
+	});
+
+	it("accepts the first prompt once while a background session connection is still starting", async () => {
+		const { factory, root, studio } = await startTestStudio();
+		const workspacePath = path.join(root, "workspace-first-prompt");
+		await fs.mkdir(workspacePath);
+		const cookie = await exchangeLocalAccess(studio);
+		const workspace = await registerWorkspace(studio, cookie, workspacePath);
+		const created = await createSession(studio, cookie, workspace.workspace.id, HOLDER_A, false);
+		const startGate = Promise.withResolvers<void>();
+		factory.startGate = startGate.promise;
+
+		const connection = fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/connect`, {
+			method: "POST",
+			headers: { Cookie: cookie, Origin: studio.origin },
+		});
+		await waitForCondition(() => factory.launches.length === 1);
+		const prompt = fetch(`${studio.origin}/api/v1/sessions/${created.session.id}/prompts`, {
+			method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json", Origin: studio.origin },
+			body: JSON.stringify({ holderId: HOLDER_A, message: "start with this instruction" }),
+		});
+
+		startGate.resolve();
+		const [connectionResponse, promptResponse] = await Promise.all([connection, prompt]);
+		expect(connectionResponse.status).toBe(200);
+		expect(promptResponse.status).toBe(202);
+		expect(factory.transports).toHaveLength(1);
+		expect(factory.transports[0].prompts).toEqual(["start with this instruction"]);
 	});
 
 	it("removes an idle project together with its Studio sessions without touching project files", async () => {

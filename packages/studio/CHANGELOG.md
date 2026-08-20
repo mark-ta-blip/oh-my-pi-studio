@@ -17,8 +17,14 @@
 - Added Phase 5 tool approval cards, browser-safe subagent and usage summaries, and lease-gated approval decisions.
 - Added Phase 6 reconnect cursors with bounded replay/resync recovery, stale-lease clearing on restart, and a paginated local audit review ledger.
 
+### Changed
+
+- Improved the desktop workbench navigation, session state hierarchy, responsive drawers, CLI-style transcript presentation, and composer interactions.
+- Changed the Studio transcript to render CLI-style GFM responses and keep run context closed until explicitly opened.
+
 ### Fixed
 
+- Fixed the first Studio prompt being dropped when its background session warm-up had not completed yet.
 - Fixed Studio session startup and retry feedback, provider-error recovery guidance, and removal of idle projects with their Studio-only history.
 - Fixed Studio chat stalls caused by unbounded transcript updates, stale WebSocket reconnects, and forced scrolling during streaming.
 - Fixed stale run locks and setup overlays that could leave the chat composer unusable after a desktop restart, and added bounded mutation requests with automatic state recovery.

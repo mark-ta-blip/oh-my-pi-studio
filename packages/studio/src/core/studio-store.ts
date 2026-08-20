@@ -17,7 +17,9 @@ import type {
 	StudioRunFailureKind,
 	StudioRunStatus,
 	StudioSession,
+	StudioSessionMode,
 	StudioSessionStatus,
+	StudioThinkingLevel,
 	StudioToolDisplay,
 	StudioToolDisplayKind,
 	StudioToolDisplayStatus,
@@ -28,7 +30,7 @@ import type {
 	StudioWorkspace,
 } from "../protocol";
 
-const STUDIO_SCHEMA_VERSION = 8;
+const STUDIO_SCHEMA_VERSION = 9;
 const ACTIVE_RUN_STATUSES = ["starting", "running", "cancelling"] as const;
 const MAX_STUDIO_TRANSCRIPT_TEXT_LENGTH = 100_000;
 const DEFAULT_STUDIO_TRANSCRIPT_PAGE_SIZE = 200;
@@ -56,6 +58,8 @@ const AUDIT_REASON_VALUES = new Set([
 	"run_cancel_requested",
 	"run_cancelled",
 	"run_completed",
+	"code",
+	"plan",
 	"studio_restart",
 	"studio_shutdown",
 ]);
@@ -287,6 +291,13 @@ const STUDIO_MIGRATIONS = [
 			ALTER TABLE runs ADD COLUMN failure_kind TEXT;
 		`,
 	},
+	{
+		version: 9,
+		sql: `
+			ALTER TABLE studio_sessions ADD COLUMN thinking_level TEXT;
+			ALTER TABLE studio_sessions ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'code';
+		`,
+	},
 ] as const;
 
 interface StudioMigrationRow {
@@ -313,6 +324,8 @@ interface StudioSessionRow {
 	name: string | null;
 	model_provider: string | null;
 	model_id: string | null;
+	thinking_level: StudioThinkingLevel | null;
+	session_mode: StudioSessionMode;
 	status: StudioSessionStatus;
 	created_at_ms: number;
 	updated_at_ms: number;
@@ -453,6 +466,7 @@ export interface CreateStudioSessionInput {
 	workspaceId: string;
 	name?: string;
 	model: StudioModelSelection;
+	mode: StudioSessionMode;
 }
 
 export interface StudioStoredSession {
@@ -836,7 +850,11 @@ function toStudioSession(row: StudioSessionRow, activeRun?: StudioRun): StudioSe
 	const model =
 		row.model_provider === null || row.model_id === null
 			? undefined
-			: { provider: row.model_provider, id: row.model_id };
+			: {
+					provider: row.model_provider,
+					id: row.model_id,
+					...(row.thinking_level === null ? {} : { thinkingLevel: row.thinking_level }),
+				};
 	const usage = toStudioUsage(row);
 	return {
 		id: row.id,
@@ -844,6 +862,7 @@ function toStudioSession(row: StudioSessionRow, activeRun?: StudioRun): StudioSe
 		workspaceId: row.workspace_id,
 		...(row.name === null ? {} : { name: row.name }),
 		...(model ? { model } : {}),
+		mode: row.session_mode,
 		status: row.status,
 		createdAtMs: row.created_at_ms,
 		updatedAtMs: row.updated_at_ms,
@@ -1058,12 +1077,24 @@ export class StudioStore {
 		const row = this.#db
 			.query<
 				StudioSessionRow,
-				[string, string, string, string | null, string, string, StudioSessionStatus, number, number]
+				[
+					string,
+					string,
+					string,
+					string | null,
+					string,
+					string,
+					StudioThinkingLevel | null,
+					StudioSessionMode,
+					StudioSessionStatus,
+					number,
+					number,
+				]
 			>(
 				`INSERT INTO studio_sessions (
-					id, profile, workspace_id, name, model_provider, model_id, status, created_at_ms, updated_at_ms
-				 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-				 RETURNING id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id,
+					id, profile, workspace_id, name, model_provider, model_id, thinking_level, session_mode, status, created_at_ms, updated_at_ms
+				 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				 RETURNING id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id, thinking_level, session_mode,
 					status, created_at_ms, updated_at_ms, last_activity_at_ms, usage_json, usage_updated_at_ms`,
 			)
 			.get(
@@ -1073,6 +1104,8 @@ export class StudioStore {
 				input.name ?? null,
 				input.model.provider,
 				input.model.id,
+				input.model.thinkingLevel ?? null,
+				input.mode,
 				"starting",
 				now,
 				now,
@@ -1084,7 +1117,7 @@ export class StudioStore {
 	listStudioSessions(): StudioSession[] {
 		const rows = this.#db
 			.query<StudioSessionRow, []>(
-				`SELECT id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id,
+				`SELECT id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id, thinking_level, session_mode,
 					status, created_at_ms, updated_at_ms, last_activity_at_ms, usage_json, usage_updated_at_ms
 				 FROM studio_sessions ORDER BY updated_at_ms DESC, id`,
 			)
@@ -1099,7 +1132,7 @@ export class StudioStore {
 	getStoredStudioSession(studioSessionId: string): StudioStoredSession | undefined {
 		const row = this.#db
 			.query<StudioSessionRow, [string]>(
-				`SELECT id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id,
+				`SELECT id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id, thinking_level, session_mode,
 					status, created_at_ms, updated_at_ms, last_activity_at_ms, usage_json, usage_updated_at_ms
 				 FROM studio_sessions WHERE id = ?`,
 			)
@@ -1126,10 +1159,36 @@ export class StudioStore {
 					updated_at_ms = ?,
 					last_activity_at_ms = ?
 				 WHERE id = ?
-				 RETURNING id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id,
+				 RETURNING id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id, thinking_level, session_mode,
 					status, created_at_ms, updated_at_ms, last_activity_at_ms, usage_json, usage_updated_at_ms`,
 			)
 			.get(input.status, input.ompSessionId ?? null, input.ompSessionRef ?? null, now, now, studioSessionId);
+		return row ? toStudioSession(row, this.#getActiveRunForSession(studioSessionId)) : undefined;
+	}
+
+	updateStudioSessionMode(studioSessionId: string, mode: StudioSessionMode): StudioSession | undefined {
+		const now = Date.now();
+		const row = this.#db
+			.query<StudioSessionRow, [StudioSessionMode, number, string]>(
+				`UPDATE studio_sessions SET session_mode = ?, updated_at_ms = ?
+				 WHERE id = ?
+				 RETURNING id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id, thinking_level, session_mode,
+					status, created_at_ms, updated_at_ms, last_activity_at_ms, usage_json, usage_updated_at_ms`,
+			)
+			.get(mode, now, studioSessionId);
+		return row ? toStudioSession(row, this.#getActiveRunForSession(studioSessionId)) : undefined;
+	}
+
+	updateStudioSessionModel(studioSessionId: string, model: StudioModelSelection): StudioSession | undefined {
+		const now = Date.now();
+		const row = this.#db
+			.query<StudioSessionRow, [string, string, string | null, number, string]>(
+				`UPDATE studio_sessions SET model_provider = ?, model_id = ?, thinking_level = ?, updated_at_ms = ?
+				 WHERE id = ?
+				 RETURNING id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id, thinking_level, session_mode,
+				 status, created_at_ms, updated_at_ms, last_activity_at_ms, usage_json, usage_updated_at_ms`,
+			)
+			.get(model.provider, model.id, model.thinkingLevel ?? null, now, studioSessionId);
 		return row ? toStudioSession(row, this.#getActiveRunForSession(studioSessionId)) : undefined;
 	}
 
@@ -1147,7 +1206,7 @@ export class StudioStore {
 					updated_at_ms = ?,
 					last_activity_at_ms = ?
 				 WHERE id = ?
-				 RETURNING id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id,
+				 RETURNING id, profile, workspace_id, omp_session_id, omp_session_ref, name, model_provider, model_id, thinking_level, session_mode,
 					status, created_at_ms, updated_at_ms, last_activity_at_ms, usage_json, usage_updated_at_ms`,
 			)
 			.get(usageJson, now, now, now, studioSessionId);

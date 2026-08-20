@@ -110,6 +110,37 @@ describe("Studio control leases", () => {
 	});
 });
 
+describe("Studio session modes", () => {
+	it("persists the selected mode and thinking level across a store reopen", async () => {
+		const store = await createStore();
+		const dbPath = store.dbPath;
+		let storeClosed = false;
+		try {
+			seedStudioSession(dbPath, "sts_mode_persisted");
+			const created = store.createStudioSession({
+				mode: "plan",
+				model: { id: "example-model", provider: "example", thinkingLevel: "high" },
+				profile: "default",
+				workspaceId: "wsp_seed",
+			});
+			expect(created).toMatchObject({ mode: "plan", model: { thinkingLevel: "high" } });
+			store.close();
+			storeClosed = true;
+			const reopened = await StudioStore.open({ dbPath });
+			try {
+				expect(reopened.getStudioSession(created.id)).toMatchObject({
+					mode: "plan",
+					model: { id: "example-model", provider: "example", thinkingLevel: "high" },
+				});
+			} finally {
+				reopened.close();
+			}
+		} finally {
+			if (!storeClosed) store.close();
+		}
+	});
+});
+
 describe("Studio runtime recovery", () => {
 	it("interrupts the session that owns an active run while preserving idle ready sessions", async () => {
 		const store = await createStore();

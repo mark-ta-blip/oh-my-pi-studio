@@ -23,6 +23,8 @@ import { resolveWorkspaceRegistration, WorkspaceRegistrationError } from "./core
 import embeddedClientArchiveTxt from "./embedded-client.generated.txt";
 import {
 	STUDIO_API_VERSION,
+	STUDIO_MAX_IMAGE_ATTACHMENTS,
+	STUDIO_MAX_IMAGE_BYTES,
 	type StudioActivityListResponse,
 	type StudioApprovalListResponse,
 	type StudioApprovalResolutionRequest,
@@ -40,6 +42,8 @@ import {
 	type StudioEventResyncRequired,
 	type StudioEventType,
 	type StudioFeatures,
+	type StudioImageAttachment,
+	type StudioModelSelection,
 	type StudioPlanSummaryResponse,
 	type StudioPromptRequest,
 	type StudioPromptResponse,
@@ -50,8 +54,10 @@ import {
 	type StudioRunResponse,
 	type StudioSessionCreateRequest,
 	type StudioSessionListResponse,
+	type StudioSessionMode,
 	type StudioSessionResponse,
 	type StudioSubagentListResponse,
+	type StudioThinkingLevel,
 	type StudioToolDisplayListResponse,
 	type StudioTranscriptResponse,
 	type StudioUsageHistoryResponse,
@@ -257,6 +263,30 @@ function requireModelValue(value: unknown, field: "provider" | "modelId"): strin
 	return normalized;
 }
 
+function isStudioThinkingLevel(value: unknown): value is StudioThinkingLevel {
+	return (
+		value === "minimal" ||
+		value === "low" ||
+		value === "medium" ||
+		value === "high" ||
+		value === "xhigh" ||
+		value === "max"
+	);
+}
+
+function isStudioImageMimeType(value: unknown): value is StudioImageAttachment["mimeType"] {
+	return value === "image/jpeg" || value === "image/png" || value === "image/webp" || value === "image/gif";
+}
+
+function isStudioImageData(value: string): boolean {
+	return value.length > 0 && value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value);
+}
+
+function imageDataByteLength(value: string): number {
+	const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+	return (value.length / 4) * 3 - padding;
+}
+
 async function readSessionCreateRequest(request: Request): Promise<StudioSessionCreateRequest> {
 	const body = await readJsonRecord(request, "Studio session creation requires a JSON request body.");
 	if (typeof body.workspaceId !== "string" || !/^wsp_[a-f0-9]{32}$/.test(body.workspaceId)) {
@@ -266,6 +296,14 @@ async function readSessionCreateRequest(request: Request): Promise<StudioSession
 		throw new StudioRequestError("invalid_session_request", "Studio session name must be a string.");
 	}
 	const name = typeof body.name === "string" ? body.name.trim() : undefined;
+	const mode = body.mode === undefined ? "code" : body.mode;
+	if (mode !== "code" && mode !== "plan") {
+		throw new StudioRequestError("invalid_session_request", "Studio session mode must be code or plan.");
+	}
+	const thinkingLevel = body.thinkingLevel;
+	if (thinkingLevel !== undefined && !isStudioThinkingLevel(thinkingLevel)) {
+		throw new StudioRequestError("invalid_session_request", "Studio session thinking level is invalid.");
+	}
 	if (
 		name !== undefined &&
 		(!name || name.length > STUDIO_MAX_SESSION_NAME_LENGTH || /[\u0000-\u001f\u007f]/.test(name))
@@ -276,6 +314,8 @@ async function readSessionCreateRequest(request: Request): Promise<StudioSession
 		workspaceId: body.workspaceId,
 		provider: requireModelValue(body.provider, "provider"),
 		modelId: requireModelValue(body.modelId, "modelId"),
+		mode,
+		...(thinkingLevel === undefined ? {} : { thinkingLevel }),
 		holderId: requireHolderId(body.holderId),
 		...(name === undefined ? {} : { name }),
 	};
@@ -298,13 +338,71 @@ async function readControlLeaseRequest(request: Request): Promise<StudioControlL
 
 async function readPromptRequest(request: Request): Promise<StudioPromptRequest> {
 	const body = await readJsonRecord(request, "Studio prompts require a JSON request body.");
-	if (typeof body.message !== "string" || !body.message.trim() || body.message.length > STUDIO_MAX_PROMPT_LENGTH) {
-		throw new StudioRequestError(
-			"invalid_prompt",
-			"Studio prompt text must be non-empty and within the maximum length.",
-		);
+	if (typeof body.message !== "string" || body.message.length > STUDIO_MAX_PROMPT_LENGTH) {
+		throw new StudioRequestError("invalid_prompt", "Studio prompt text must be within the maximum length.");
 	}
-	return { holderId: requireHolderId(body.holderId), message: body.message };
+	const message = body.message.trim();
+	let images: StudioPromptRequest["images"];
+	if (body.images !== undefined) {
+		if (!Array.isArray(body.images) || body.images.length > STUDIO_MAX_IMAGE_ATTACHMENTS) {
+			throw new StudioRequestError("invalid_prompt", "Studio prompts may include up to four images.");
+		}
+		images = body.images.map(image => {
+			if (
+				!isRecord(image) ||
+				image.type !== "image" ||
+				typeof image.data !== "string" ||
+				typeof image.mimeType !== "string" ||
+				!isStudioImageMimeType(image.mimeType) ||
+				!image.data ||
+				image.data.length > Math.ceil(STUDIO_MAX_IMAGE_BYTES / 3) * 4 ||
+				!isStudioImageData(image.data)
+			) {
+				throw new StudioRequestError("invalid_prompt", "Studio image attachment is invalid.");
+			}
+			if (imageDataByteLength(image.data) > STUDIO_MAX_IMAGE_BYTES) {
+				throw new StudioRequestError("invalid_prompt", "Studio image attachment is too large.");
+			}
+			return { type: "image", data: image.data, mimeType: image.mimeType };
+		});
+	}
+	if (!message && !images?.length) {
+		throw new StudioRequestError("invalid_prompt", "Studio prompts must include text or an image.");
+	}
+	return { holderId: requireHolderId(body.holderId), message, ...(images?.length ? { images } : {}) };
+}
+
+async function readSessionModeRequest(request: Request): Promise<{ holderId: string; mode: StudioSessionMode }> {
+	const body = await readJsonRecord(request, "Studio session mode changes require a JSON request body.");
+	if (body.mode !== "code" && body.mode !== "plan") {
+		throw new StudioRequestError("invalid_session_mode", "Studio session mode must be code or plan.");
+	}
+	return { holderId: requireHolderId(body.holderId), mode: body.mode };
+}
+
+async function readSessionModelRequest(request: Request): Promise<{ holderId: string; model: StudioModelSelection }> {
+	const body = await readJsonRecord(request, "Studio session model changes require a JSON request body.");
+	const provider = requireModelValue(body.provider, "provider");
+	const modelId = requireModelValue(body.modelId, "modelId");
+	const thinkingLevel = body.thinkingLevel;
+	if (thinkingLevel !== undefined && !isStudioThinkingLevel(thinkingLevel)) {
+		throw new StudioRequestError("invalid_session_request", "Studio session thinking level is invalid.");
+	}
+	return {
+		holderId: requireHolderId(body.holderId),
+		model: { provider, id: modelId, ...(thinkingLevel ? { thinkingLevel } : {}) },
+	};
+}
+
+async function readSessionThinkingRequest(
+	request: Request,
+): Promise<{ holderId: string; thinkingLevel: StudioThinkingLevel | undefined }> {
+	const body = await readJsonRecord(request, "Studio Thinking changes require a JSON request body.");
+	const thinkingLevel = body.thinkingLevel;
+	if (thinkingLevel !== undefined && !isStudioThinkingLevel(thinkingLevel)) {
+		throw new StudioRequestError("invalid_session_request", "Studio session thinking level is invalid.");
+	}
+	return { holderId: requireHolderId(body.holderId), thinkingLevel };
 }
 
 async function readRunCancelRequest(request: Request): Promise<StudioRunCancelRequest> {
@@ -366,6 +464,9 @@ function parseStudioSessionActionId(
 	pathname: string,
 	action:
 		| "connect"
+		| "mode"
+		| "model"
+		| "thinking"
 		| "lease"
 		| "prompts"
 		| "approvals"
@@ -699,10 +800,33 @@ async function handleSessionCollection(request: Request, runtime: StudioRuntime)
 		if (!runtime.store.getWorkspaceCanonicalPath(requestBody.workspaceId)) {
 			return errorResponse(404, "workspace_not_found", "The requested workspace is not registered.");
 		}
+		if (runtime.auth.enabled) {
+			const provider = (await runtime.auth.listProviders()).find(candidate => candidate.id === requestBody.provider);
+			const model = provider?.models.find(candidate => candidate.id === requestBody.modelId);
+			if (!model) {
+				return errorResponse(
+					400,
+					"model_not_available",
+					"Choose a model that is available through the selected provider.",
+				);
+			}
+			if (requestBody.thinkingLevel && !model.thinkingLevels?.includes(requestBody.thinkingLevel)) {
+				return errorResponse(
+					400,
+					"thinking_not_supported",
+					"The selected model does not support that thinking level.",
+				);
+			}
+		}
 		const created = runtime.store.createStudioSession({
 			profile: runtime.profile,
 			workspaceId: requestBody.workspaceId,
-			model: { provider: requestBody.provider, id: requestBody.modelId },
+			model: {
+				provider: requestBody.provider,
+				id: requestBody.modelId,
+				...(requestBody.thinkingLevel ? { thinkingLevel: requestBody.thinkingLevel } : {}),
+			},
+			mode: requestBody.mode ?? "code",
 			...(requestBody.name ? { name: requestBody.name } : {}),
 		});
 		runtime.store.acquireControlLease(created.id, requestBody.holderId, STUDIO_CONTROL_LEASE_DEFAULT_TTL_MS);
@@ -746,6 +870,90 @@ async function handleSessionConnect(
 		const body: StudioSessionResponse = { session };
 		return jsonResponse(body);
 	} catch (error) {
+		if (error instanceof StudioRpcSupervisorError) return supervisorErrorResponse(error);
+		throw error;
+	}
+}
+
+async function handleSessionMode(request: Request, studioSessionId: string, runtime: StudioRuntime): Promise<Response> {
+	if (request.method !== "POST") {
+		return errorResponse(405, "method_not_allowed", "Studio session mode changes require POST requests.");
+	}
+	if (!hasAllowedOrigin(request, runtime.origin)) {
+		return errorResponse(403, "origin_not_allowed", "The Studio request origin is not allowed.");
+	}
+	try {
+		const requestBody = await readSessionModeRequest(request);
+		const leaseError = requireControlLease(runtime, studioSessionId, requestBody.holderId);
+		if (leaseError) return leaseError;
+		const session = await runtime.supervisor.setSessionMode(studioSessionId, requestBody.mode);
+		const body: StudioSessionResponse = { session };
+		return jsonResponse(body);
+	} catch (error) {
+		if (error instanceof StudioRequestError) return requestErrorResponse(error);
+		if (error instanceof StudioRpcSupervisorError) return supervisorErrorResponse(error);
+		throw error;
+	}
+}
+
+async function handleSessionModel(
+	request: Request,
+	studioSessionId: string,
+	runtime: StudioRuntime,
+): Promise<Response> {
+	if (request.method !== "POST")
+		return errorResponse(405, "method_not_allowed", "Studio model changes require POST requests.");
+	if (!hasAllowedOrigin(request, runtime.origin))
+		return errorResponse(403, "origin_not_allowed", "The Studio request origin is not allowed.");
+	try {
+		const requestBody = await readSessionModelRequest(request);
+		const leaseError = requireControlLease(runtime, studioSessionId, requestBody.holderId);
+		if (leaseError) return leaseError;
+		if (runtime.auth.enabled) {
+			const provider = (await runtime.auth.listProviders()).find(
+				candidate => candidate.id === requestBody.model.provider,
+			);
+			const model = provider?.models.find(candidate => candidate.id === requestBody.model.id);
+			if (!model)
+				return errorResponse(
+					400,
+					"model_not_available",
+					"Choose a model that is available through the selected provider.",
+				);
+			if (requestBody.model.thinkingLevel && !model.thinkingLevels?.includes(requestBody.model.thinkingLevel)) {
+				return errorResponse(
+					400,
+					"thinking_not_supported",
+					"The selected model does not support that thinking level.",
+				);
+			}
+		}
+		const session = await runtime.supervisor.setSessionModel(studioSessionId, requestBody.model);
+		return jsonResponse({ session } satisfies StudioSessionResponse);
+	} catch (error) {
+		if (error instanceof StudioRequestError) return requestErrorResponse(error);
+		if (error instanceof StudioRpcSupervisorError) return supervisorErrorResponse(error);
+		throw error;
+	}
+}
+
+async function handleSessionThinking(
+	request: Request,
+	studioSessionId: string,
+	runtime: StudioRuntime,
+): Promise<Response> {
+	if (request.method !== "POST")
+		return errorResponse(405, "method_not_allowed", "Studio Thinking changes require POST requests.");
+	if (!hasAllowedOrigin(request, runtime.origin))
+		return errorResponse(403, "origin_not_allowed", "The Studio request origin is not allowed.");
+	try {
+		const requestBody = await readSessionThinkingRequest(request);
+		const leaseError = requireControlLease(runtime, studioSessionId, requestBody.holderId);
+		if (leaseError) return leaseError;
+		const session = await runtime.supervisor.setSessionThinkingLevel(studioSessionId, requestBody.thinkingLevel);
+		return jsonResponse({ session } satisfies StudioSessionResponse);
+	} catch (error) {
+		if (error instanceof StudioRequestError) return requestErrorResponse(error);
 		if (error instanceof StudioRpcSupervisorError) return supervisorErrorResponse(error);
 		throw error;
 	}
@@ -957,7 +1165,18 @@ async function handleSessionPrompt(
 		const requestBody = await readPromptRequest(request);
 		const leaseError = requireControlLease(runtime, studioSessionId, requestBody.holderId);
 		if (leaseError) return leaseError;
-		const result = await runtime.supervisor.prompt(studioSessionId, requestBody.message);
+		if (requestBody.images?.length && runtime.auth.enabled) {
+			const session = runtime.store.getStudioSession(studioSessionId);
+			const model = session?.model;
+			const provider = model
+				? (await runtime.auth.listProviders()).find(candidate => candidate.id === model.provider)
+				: undefined;
+			const selectedModel = provider?.models.find(candidate => candidate.id === model?.id);
+			if (!selectedModel?.supportsImageInput) {
+				return errorResponse(400, "image_input_not_supported", "The selected model does not support image input.");
+			}
+		}
+		const result = await runtime.supervisor.prompt(studioSessionId, requestBody.message, requestBody.images);
 		const body: StudioPromptResponse = result;
 		return jsonResponse(body, 202);
 	} catch (error) {
@@ -1376,6 +1595,14 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 					if (url.pathname === "/api/v1/sessions") return await handleSessionCollection(request, runtime);
 					const sessionConnectId = parseStudioSessionActionId(url.pathname, "connect");
 					if (sessionConnectId !== null) return await handleSessionConnect(request, sessionConnectId, runtime);
+					const sessionModeId = parseStudioSessionActionId(url.pathname, "mode");
+					if (sessionModeId !== null) return await handleSessionMode(request, sessionModeId, runtime);
+					const sessionModelActionId = parseStudioSessionActionId(url.pathname, "model");
+					if (sessionModelActionId !== null)
+						return await handleSessionModel(request, sessionModelActionId, runtime);
+					const sessionThinkingActionId = parseStudioSessionActionId(url.pathname, "thinking");
+					if (sessionThinkingActionId !== null)
+						return await handleSessionThinking(request, sessionThinkingActionId, runtime);
 					const sessionLeaseId = parseStudioSessionActionId(url.pathname, "lease");
 					if (sessionLeaseId !== null) return await handleSessionLease(request, sessionLeaseId, runtime);
 					const sessionPromptId = parseStudioSessionActionId(url.pathname, "prompts");
