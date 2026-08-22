@@ -25,9 +25,12 @@
 
 - Fixed Desktop startup and shutdown hangs when the Studio sidecar fails to become ready or does not exit promptly.
 - Fixed packaged Desktop builds serving a stale Studio client after a sidecar restart.
-- Fixed orphaned OMP processes after quitting on Windows. Terminating the sidecar
-  now terminates its whole process tree, so the `omp --mode rpc-ui` children it
-  started for each Studio session no longer outlive the app.
+- Fixed sidecar termination reaching only the root process. The force pass now
+  terminates the whole tree, so an `omp --mode rpc-ui` child the sidecar started
+  for a Studio session cannot outlive the app. On POSIX that child was reliably
+  orphaned; on Windows the old behaviour happened to survive because the sidecar
+  runtime places its children in a job object, which is not a guarantee the shell
+  should depend on.
 
 ### Security
 

@@ -718,6 +718,23 @@ jobs:
               if ($LASTEXITCODE -ne 0) {
                 exit $LASTEXITCODE
               }
+         # The shell force-kills its sidecar as a process tree. If that ever
+         # regresses to terminating the root alone, the sidecar's own children
+         # outlive the app, and the smoke test above would still pass.
+         - name: Verify the desktop smoke left no OMP processes behind
+           shell: pwsh
+           run: |
+              $deadline = (Get-Date).AddSeconds(10)
+              do {
+                $leaked = @(Get-Process -Name omp -ErrorAction SilentlyContinue)
+                if ($leaked.Count -eq 0) { break }
+                Start-Sleep -Milliseconds 250
+              } while ((Get-Date) -lt $deadline)
+              if ($leaked.Count -gt 0) {
+                $leaked | Select-Object Id, ProcessName, Path | Format-Table | Out-String | Write-Host
+                throw "The packaged desktop smoke test left $($leaked.Count) omp process(es) running."
+              }
+              Write-Host "No omp processes remain after the packaged desktop smoke test."
          - name: Verify configured Windows code signatures
            if: env.WIN_CSC_LINK != ''
            shell: pwsh

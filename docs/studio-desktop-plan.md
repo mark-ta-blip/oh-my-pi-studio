@@ -114,11 +114,10 @@ Status: landed, with one item carried forward.
 
 Done:
 
-- Terminate the sidecar as a process tree. `child.kill()` on Windows maps to
-  `TerminateProcess`, so the sidecar's signal handlers never run and the
-  `omp --mode rpc-ui` grandchildren it spawned per session are orphaned. The
-  force pass is now `taskkill /PID <pid> /T /F` on Windows and a deepest-first
-  descendant sweep on POSIX, in `src/main/process-tree.ts`.
+- Terminate the sidecar as a process tree. `child.kill()` reaches the root alone,
+  so an `omp --mode rpc-ui` child the sidecar spawned per session can outlive the
+  app. The force pass is now `taskkill /PID <pid> /T /F` on Windows and a
+  deepest-first descendant sweep on POSIX, in `src/main/process-tree.ts`.
 - Ask before forcing. POSIX sends `SIGTERM` to the sidecar alone so its own
   handler runs `studio.stop()` → `supervisor.close()` and unwinds session state.
   Windows attempts `taskkill /T` and reports refusal, so a console sidecar that
@@ -131,16 +130,29 @@ Done:
   `requestSingleInstanceLock` additional data.
 - Remove the unused `electron-updater` dependency.
 
+Measured, not assumed: the orphan was reproduced on a real three-level tree, and
+the tree walk clears it. The exposure is platform-dependent. POSIX has no job
+objects, so a root-only kill reliably leaks. On Windows the sidecar runtime
+happens to place its children in a job object that the OS tears down with the
+parent, so the old code was accidentally covered there — the tree walk removes the
+dependency on that undocumented behaviour rather than fixing an observed leak.
+
 Carried forward: an authenticated local shutdown request. The OS-primitive
 graceful pass above genuinely runs the sidecar's own teardown on POSIX, but
 Windows has no equivalent, so a Windows quit still ends in a force kill. Closing
 that gap needs a shutdown route in `packages/studio` and its own credential for
 the main process, which crosses two packages and belongs in its own change.
 
-Completion contract: quitting the packaged app on Windows leaves no `omp.exe`
-process behind after a session has been started and a run has completed; tests
-prove a graceful stop is attempted before any kill, that a compliant sidecar is
-never force-killed, and that a hung sidecar is still forced within the timeout.
+Completion contract: tests prove a graceful stop is attempted before any kill,
+that a compliant sidecar is never force-killed, that a hung sidecar is still
+forced within the timeout, and that force-killing a real tree removes a detached
+grandchild that a root-only kill leaves running. Release CI fails if the packaged
+smoke test leaves an `omp` process behind.
+
+Not covered: no automated run creates a Studio session and then quits, so the
+`omp --mode rpc-ui` case is verified by an equivalent fixture rather than by the
+real child. A local `--smoke-test` against the real sidecar leaves no processes
+behind, but a smoke run creates no session.
 
 ### Phase 8. Startup experience
 
@@ -427,7 +439,9 @@ workbench plan. They are in this plan because full parity was the chosen target,
 and the phases are ordered so that each one can be deferred at its boundary
 without stranding the phase before it.
 
-The single highest-value change in this document is Phase 7: the orphaned
-`omp.exe` grandchildren on Windows were a real defect in shipped behaviour, and
-the fix was small and testable. It has landed; Phase 8 is next.
+Phase 7 has landed. Its value turned out to be narrower than expected — the
+Windows orphan the phase was written for is masked by the sidecar runtime's job
+objects — but the POSIX leak was real, the tree walk removes the dependency on
+undocumented runtime behaviour, and the shell now asks before it forces. Phase 8
+is next.
 
