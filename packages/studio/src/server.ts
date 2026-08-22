@@ -1703,7 +1703,11 @@ export async function startStudioServer(options: StudioServerOptions = {}): Prom
 				stopped = true;
 				supervisor.close();
 				auth.close();
-				server.stop();
+				// Close active connections rather than draining them. The event
+				// WebSocket is open for as long as a tab is, so a drain never
+				// finishes: the process would outlive its own shutdown until
+				// something killed it.
+				server.stop(true);
 				store.close();
 			},
 		};

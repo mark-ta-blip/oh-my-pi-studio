@@ -325,6 +325,28 @@ describe("Studio local access boundary", () => {
 			initial.close();
 		}
 	});
+	it("closes a connected event socket when the server stops", async () => {
+		const { studio } = await startTestStudio();
+		const cookie = await exchangeLocalAccess(studio);
+		const socket = new BunWebSocket(eventsUrl(studio.origin), {
+			headers: { Cookie: cookie, Origin: studio.origin },
+		});
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve());
+			socket.addEventListener("error", () => reject(new Error("Studio event socket did not open")));
+		});
+		const closed = new Promise<void>((resolve, reject) => {
+			socket.addEventListener("close", () => resolve());
+			const timer = setTimeout(() => reject(new Error("Studio event socket stayed open after stop")), 2_000);
+			timer.unref();
+		});
+
+		studio.stop();
+
+		// A drain would never finish: an idle tab holds this socket open for as
+		// long as it is on screen, so the process would outlive its own shutdown.
+		await closed;
+	});
 });
 
 describe("Studio provider onboarding", () => {

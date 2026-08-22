@@ -33,3 +33,6 @@
 - Fixed Studio session startup and retry feedback, provider-error recovery guidance, and removal of idle projects with their Studio-only history.
 - Fixed Studio chat stalls caused by unbounded transcript updates, stale WebSocket reconnects, and forced scrolling during streaming.
 - Fixed stale run locks and setup overlays that could leave the chat composer unusable after a desktop restart, and added bounded mutation requests with automatic state recovery.
+- Fixed `omp studio` outliving its own shutdown while a browser tab was connected.
+  Stopping the server closed no active connections, so the event WebSocket an idle
+  tab holds open kept the process alive until something killed it.
