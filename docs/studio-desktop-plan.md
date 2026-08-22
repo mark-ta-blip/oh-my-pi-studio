@@ -43,7 +43,7 @@ Verified against the tree at the time of writing; `bun test` in
 | Capability | Hermes Studio | OMP Studio Desktop today | This plan |
 | --- | --- | --- | --- |
 | Child process termination | `taskkill /T /F` on Windows, POSIX descendant sweep | `child.kill()` only | Phase 7 |
-| Graceful server shutdown | Authenticated `POST /api/desktop/shutdown`, then force kill | None; terminate immediately | Phase 7 |
+| Graceful server shutdown | Authenticated `POST /api/desktop/shutdown`, then force kill | `child.kill()` only | Phase 7 (stdin control channel instead) |
 | IPC sender validation | Rejects any sender that is not the main window | Not checked | Phase 7 |
 | Start hidden / quit an existing instance | `--hidden`, `--quit`, single-instance quit request | Neither | Phase 7 |
 | Startup feedback | Splash window with staged progress and byte counters | Blank until the sidecar is ready | Phase 8 |
@@ -110,7 +110,7 @@ No phase after 13 may begin until that revision is written down and reviewed.
 
 ### Phase 7. Lifecycle and process ownership
 
-Status: landed, with one item carried forward.
+Status: complete.
 
 Done:
 
@@ -118,17 +118,28 @@ Done:
   so an `omp --mode rpc-ui` child the sidecar spawned per session can outlive the
   app. The force pass is now `taskkill /PID <pid> /T /F` on Windows and a
   deepest-first descendant sweep on POSIX, in `src/main/process-tree.ts`.
-- Ask before forcing. POSIX sends `SIGTERM` to the sidecar alone so its own
-  handler runs `studio.stop()` → `supervisor.close()` and unwinds session state.
-  Windows attempts `taskkill /T` and reports refusal, so a console sidecar that
-  cannot accept a graceful close goes straight to the force pass instead of
-  waiting out a grace period it will never use.
+- A graceful stop that works on Windows. The sidecar runs a stdin control channel
+  when the shell supervises it: a `shutdown` line stops the server through
+  `studio.stop()` → `supervisor.close()`, and a closed channel stops it too, so a
+  sidecar cannot outlive a shell that crashed without cleaning up. The sidecar
+  announces the channel on stdout before its ready line, so a sidecar built
+  before the channel existed is signalled immediately instead of being waited on.
+- Signal and force fallbacks behind that: `SIGTERM` to the sidecar alone on POSIX,
+  `taskkill /T` on Windows with refusal reported, then the tree-wide force pass.
 - Validate `event.sender` on all three IPC channels and reject calls from any
   renderer other than the Studio window.
 - Accept `--hidden` (start to tray without showing a window, overridden when no
   tray could be created) and `--quit` (stop a running instance), routed through
   `requestSingleInstanceLock` additional data.
 - Remove the unused `electron-updater` dependency.
+
+The graceful stop deliberately does not use the shutdown route this plan
+originally called for. An HTTP route would need its own credential in the sidecar's
+environment, readable by any same-user process, to guard an endpoint whose only
+power is stopping a local app. The stdin channel needs no credential, adds no HTTP
+surface, is unreachable by any process that is not the shell, and additionally
+gives the shell-crash case a fix that no amount of care in the shell can: the
+sidecar notices its channel closed and stops itself.
 
 Measured, not assumed: the orphan was reproduced on a real three-level tree, and
 the tree walk clears it. The exposure is platform-dependent. POSIX has no job
@@ -137,22 +148,17 @@ happens to place its children in a job object that the OS tears down with the
 parent, so the old code was accidentally covered there — the tree walk removes the
 dependency on that undocumented behaviour rather than fixing an observed leak.
 
-Carried forward: an authenticated local shutdown request. The OS-primitive
-graceful pass above genuinely runs the sidecar's own teardown on POSIX, but
-Windows has no equivalent, so a Windows quit still ends in a force kill. Closing
-that gap needs a shutdown route in `packages/studio` and its own credential for
-the main process, which crosses two packages and belongs in its own change.
-
-Completion contract: tests prove a graceful stop is attempted before any kill,
-that a compliant sidecar is never force-killed, that a hung sidecar is still
+Completion contract: tests prove the control-channel request stops a sidecar
+without any signal, that a sidecar predating the channel is signalled rather than
+waited on, that a signalled sidecar is never force-killed, that a hung sidecar is
 forced within the timeout, and that force-killing a real tree removes a detached
-grandchild that a root-only kill leaves running. Release CI fails if the packaged
-smoke test leaves an `omp` process behind.
+grandchild a root-only kill leaves running. The source sidecar was verified to
+announce the channel before its ready line and to exit 0 on request. Release CI
+fails if the packaged smoke test leaves an `omp` process behind.
 
 Not covered: no automated run creates a Studio session and then quits, so the
 `omp --mode rpc-ui` case is verified by an equivalent fixture rather than by the
-real child. A local `--smoke-test` against the real sidecar leaves no processes
-behind, but a smoke run creates no session.
+real child.
 
 ### Phase 8. Startup experience
 
@@ -439,9 +445,9 @@ workbench plan. They are in this plan because full parity was the chosen target,
 and the phases are ordered so that each one can be deferred at its boundary
 without stranding the phase before it.
 
-Phase 7 has landed. Its value turned out to be narrower than expected — the
+Phase 7 is complete. Its value turned out to be narrower than expected — the
 Windows orphan the phase was written for is masked by the sidecar runtime's job
 objects — but the POSIX leak was real, the tree walk removes the dependency on
-undocumented runtime behaviour, and the shell now asks before it forces. Phase 8
-is next.
+undocumented runtime behaviour, and the shell now has a graceful stop that works
+on Windows. Phase 8 is next.
 

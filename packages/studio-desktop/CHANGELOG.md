@@ -14,7 +14,10 @@
 ### Changed
 
 - Changed sidecar shutdown to ask the sidecar to stop before forcing it, so its
-  own OMP RPC teardown runs whenever the request is accepted.
+  own OMP RPC teardown runs whenever the request is accepted. The request goes
+  over a stdin control channel, which is the only graceful stop that works on
+  Windows. A sidecar that does not announce the channel is signalled directly
+  rather than waited on.
 
 ### Removed
 

@@ -41,10 +41,27 @@ afterEach(async () => {
 	for (const root of tempRoots.splice(0)) await fs.rm(root, { force: true, recursive: true });
 });
 
-/** Spawn a throwaway process standing in for the OMP sidecar. */
-function spawnFakeSidecar(script: string): FakeSidecar {
-	const child = childProcess.spawn(process.execPath, ["-e", script], {
-		stdio: ["ignore", "pipe", "pipe"],
+/** A sidecar that announces and honours the shell's stdin control channel. */
+const OBEYS_CONTROL_CHANNEL = `
+	const readline = require("node:readline");
+	readline.createInterface({ input: process.stdin }).on("line", line => {
+		if (line.trim() === "shutdown") process.exit(0);
+	});
+	console.log("OMP Studio control channel: stdin");
+`;
+
+/**
+ * Spawn a throwaway process standing in for the OMP sidecar.
+ *
+ * The real sidecar announces and honours the stdin control channel, so fakes do
+ * too by default. Pass `obeysControlChannel: false` for a sidecar built before the
+ * channel existed, which is what exercises the signal and force fallbacks.
+ */
+function spawnFakeSidecar(script: string, options: { obeysControlChannel?: boolean } = {}): FakeSidecar {
+	const source = options.obeysControlChannel === false ? script : `${OBEYS_CONTROL_CHANNEL}\n${script}`;
+	const child = childProcess.spawn(process.execPath, ["-e", source], {
+		// stdin is piped because the shell uses it as the sidecar's control channel.
+		stdio: ["pipe", "pipe", "pipe"],
 	}) as FakeSidecar;
 	children.push(child);
 	return child;
@@ -70,12 +87,12 @@ test("resolves the sidecar URL from the ready line and ignores unrelated output"
 	expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
 });
 
-test("asks the sidecar to stop before forcing it, and stops there when it complies", async () => {
+test("stops on the control-channel request without ever signalling the sidecar", async () => {
 	const child = spawnFakeSidecar(
 		`console.log("OMP Studio available at: ${READY_URL}");
 		 setTimeout(() => undefined, 30000);`,
 	);
-	const termination = recordTermination(child, { obeysGracefulStop: true });
+	const termination = recordTermination(child, { obeysGracefulStop: false });
 
 	const server = await superviseStudioSidecar(child, {
 		processTree: termination.control,
@@ -84,8 +101,29 @@ test("asks the sidecar to stop before forcing it, and stops there when it compli
 	});
 	await server.stop();
 
-	// A sidecar that exits on its own request must never be force-killed: the
-	// force pass would cut short its own RPC-child teardown.
+	// The whole point of the channel: on Windows this is the only stop that lets
+	// the sidecar run its own Studio teardown, so nothing may be signalled here.
+	expect(termination.steps).toEqual([]);
+	expect(child.exitCode).toBe(0);
+});
+
+test("falls back to a signal when the sidecar predates the control channel", async () => {
+	const child = spawnFakeSidecar(
+		`console.log("OMP Studio available at: ${READY_URL}");
+		 setTimeout(() => undefined, 30000);`,
+		{ obeysControlChannel: false },
+	);
+	const termination = recordTermination(child, { obeysGracefulStop: true });
+
+	const server = await superviseStudioSidecar(child, {
+		processTree: termination.control,
+		readyTimeoutMs: 10_000,
+		// Deliberately long: a sidecar that never announced the channel must not be
+		// waited on at all, so this grace period should never be spent.
+		stopGraceMs: 30_000,
+	});
+	await server.stop();
+
 	expect(termination.steps).toEqual(["SIGTERM"]);
 	expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
 });
@@ -95,6 +133,7 @@ test("forces the whole tree when the sidecar ignores the stop request", async ()
 		`process.on("SIGTERM", () => undefined);
 		 console.log("OMP Studio available at: ${READY_URL}");
 		 setTimeout(() => undefined, 30000);`,
+		{ obeysControlChannel: false },
 	);
 	const termination = recordTermination(child, { obeysGracefulStop: false });
 

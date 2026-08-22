@@ -1,7 +1,7 @@
 import * as childProcess from "node:child_process";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import { type DesktopPaths, resolveDevelopmentServerScript } from "./paths";
 import {
 	createProcessTreeControl,
@@ -12,6 +12,12 @@ import {
 import { openSidecarLogSink, type StudioSidecarLogSink } from "./sidecar-log";
 
 const READY_LINE = /^OMP Studio available at: (https?:\/\/127\.0\.0\.1:\d+\/\?token=[^\s]+)$/;
+/**
+ * The sidecar announces its stdin control channel before the ready line. Without
+ * it, a graceful shutdown request would be written into a pipe nobody reads, so
+ * the shell would wait out the whole grace period before signalling.
+ */
+const CONTROL_CHANNEL_LINE = "OMP Studio control channel: stdin";
 const STUDIO_SERVER_READY_TIMEOUT_MS = 30_000;
 /**
  * How long a sidecar that accepted a graceful stop may take to unwind. It has to
@@ -19,8 +25,12 @@ const STUDIO_SERVER_READY_TIMEOUT_MS = 30_000;
  * than a process teardown.
  */
 const STUDIO_SERVER_GRACEFUL_STOP_MS = 5_000;
+/** How long a signalled sidecar may take to exit before the tree is forced. */
+const STUDIO_SERVER_SIGNAL_STOP_MS = 2_000;
 /** How long to confirm the tree is gone after the force pass. */
 const STUDIO_SERVER_FORCE_STOP_MS = 2_000;
+/** The line the sidecar's desktop control channel treats as a shutdown request. */
+const STUDIO_SIDECAR_SHUTDOWN_COMMAND = "shutdown\n";
 const STUDIO_BOOTSTRAP_API_VERSION = 1;
 /** Enough stderr to identify a startup failure without pasting a whole log into a dialog. */
 const STUDIO_SERVER_STDERR_TAIL_LINES = 20;
@@ -68,7 +78,7 @@ export interface StudioSidecarSupervisionOptions {
 	stopGraceMs?: number;
 }
 
-type StudioSidecar = childProcess.ChildProcessByStdio<null, Readable, Readable>;
+type StudioSidecar = childProcess.ChildProcessByStdio<Writable, Readable, Readable>;
 
 function serverExecutable(paths: DesktopPaths): string {
 	return path.join(paths.serverResourceDir, process.platform === "win32" ? "omp.exe" : "omp");
@@ -88,7 +98,7 @@ function spawnServer(options: StudioServerLaunchOptions): StudioSidecar {
 		return childProcess.spawn(configuredCommand, ["studio", "--no-open", "--port", "0"], {
 			cwd: options.paths.packageRoot,
 			env: studioServerEnvironment(options),
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: ["pipe", "pipe", "pipe"],
 		});
 	}
 
@@ -96,7 +106,7 @@ function spawnServer(options: StudioServerLaunchOptions): StudioSidecar {
 		return childProcess.spawn(serverExecutable(options.paths), ["studio", "--no-open", "--port", "0"], {
 			cwd: options.paths.userDataDir,
 			env: studioServerEnvironment(options),
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: ["pipe", "pipe", "pipe"],
 		});
 	}
 
@@ -106,7 +116,7 @@ function spawnServer(options: StudioServerLaunchOptions): StudioSidecar {
 		{
 			cwd: options.paths.packageRoot,
 			env: studioServerEnvironment(options),
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: ["pipe", "pipe", "pipe"],
 		},
 	);
 }
@@ -192,15 +202,46 @@ async function waitForSidecarExit(child: StudioSidecar, timeoutMs: number): Prom
 }
 
 /**
- * Stop a sidecar and everything it spawned: ask first, force second.
+ * Ask the sidecar to shut itself down over its stdin control channel.
+ *
+ * This is the only graceful stop that works on Windows, where there is no signal
+ * to deliver: the sidecar runs its own Studio teardown — closing RPC transports
+ * and settling session state — instead of dying with that work unfinished.
+ * Ending stdin afterwards is a second signal: a sidecar that outlives this shell
+ * sees its channel close and stops on its own.
+ */
+function requestSidecarShutdown(child: StudioSidecar): boolean {
+	const stdin = child.stdin as Writable | null;
+	if (!stdin || stdin.destroyed || stdin.writableEnded) return false;
+	try {
+		stdin.write(STUDIO_SIDECAR_SHUTDOWN_COMMAND);
+		stdin.end();
+		return true;
+	} catch {
+		// A sidecar that already exited leaves a broken pipe behind.
+		return false;
+	}
+}
+
+/**
+ * Stop a sidecar and everything it spawned: ask over the control channel, then by
+ * signal, then force the tree.
  *
  * The force pass has to be tree-wide. A sidecar with an active Studio session has
- * its own `omp --mode rpc-ui` children, and terminating only the root strands
- * them — on Windows unconditionally, since there is no signal for the sidecar to
- * handle.
+ * its own `omp --mode rpc-ui` children, and terminating only the root can strand
+ * them.
  */
-async function stopSidecar(child: StudioSidecar, control: ProcessTreeControl, gracefulStopMs: number): Promise<void> {
+async function stopSidecar(
+	child: StudioSidecar,
+	control: ProcessTreeControl,
+	gracefulStopMs: number,
+	hasControlChannel: boolean,
+): Promise<void> {
 	if (hasExited(child)) return;
+	if (hasControlChannel && requestSidecarShutdown(child) && (await waitForSidecarExit(child, gracefulStopMs))) {
+		return;
+	}
+
 	const pid = child.pid;
 	if (pid === undefined) {
 		// No pid means the spawn never produced a process to signal.
@@ -213,7 +254,7 @@ async function stopSidecar(child: StudioSidecar, control: ProcessTreeControl, gr
 	}
 
 	const accepted = await requestGracefulTreeStop(pid, control);
-	if (accepted && (await waitForSidecarExit(child, gracefulStopMs))) return;
+	if (accepted && (await waitForSidecarExit(child, STUDIO_SERVER_SIGNAL_STOP_MS))) return;
 	await forceKillTree(pid, control);
 	await waitForSidecarExit(child, STUDIO_SERVER_FORCE_STOP_MS);
 }
@@ -279,8 +320,13 @@ export async function superviseStudioSidecar(
 	const stderrTail: string[] = [];
 	const { promise: ready, resolve, reject } = Promise.withResolvers<string>();
 	let settled = false;
+	/** Set when the sidecar announces a stdin control channel it is listening on. */
+	let hasControlChannel = false;
 	const readyTimeoutMs = options.readyTimeoutMs ?? STUDIO_SERVER_READY_TIMEOUT_MS;
 
+	// The sidecar's stdin is a control channel, not a data stream. A broken pipe on
+	// it must not reach the process as an unhandled 'error'.
+	child.stdin.on("error", () => undefined);
 	// readline also drains stderr, which the sidecar's pipe needs regardless of
 	// whether anything is listening.
 	stderrLines.on("line", line => {
@@ -313,7 +359,12 @@ export async function superviseStudioSidecar(
 	void (async () => {
 		try {
 			for await (const line of stdoutLines) {
-				const match = READY_LINE.exec(line.trim());
+				const trimmed = line.trim();
+				if (trimmed === CONTROL_CHANNEL_LINE) {
+					hasControlChannel = true;
+					continue;
+				}
+				const match = READY_LINE.exec(trimmed);
 				if (!match) continue;
 				if (settled) continue;
 				settled = true;
@@ -332,14 +383,14 @@ export async function superviseStudioSidecar(
 			url,
 			async stop(): Promise<void> {
 				stdoutLines.close();
-				await stopSidecar(child, processTree, stopGraceMs);
+				await stopSidecar(child, processTree, stopGraceMs, hasControlChannel);
 				stderrLines.close();
 				await logSink?.close();
 			},
 		};
 	} catch (error) {
 		stdoutLines.close();
-		await stopSidecar(child, processTree, stopGraceMs);
+		await stopSidecar(child, processTree, stopGraceMs, hasControlChannel);
 		// Snapshot the tail only once stderr has ended: these lines are the whole
 		// diagnostic the startup dialog and log have to offer.
 		await drainSidecarStderr(child);

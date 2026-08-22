@@ -10,6 +10,10 @@
 - Added `rpc-ui` Studio transport support for redacted tool approvals, optional subagent events, and session usage summaries while keeping raw arguments and tool output server-only.
 - Added ephemeral Studio control-plane storage for the packaged Desktop smoke path,
   so release verification does not alter persistent Studio session state.
+- Added a desktop control channel to `omp studio`: when the Desktop shell
+  supervises it, a `shutdown` line on stdin stops the server through its normal
+  teardown, and a closed channel stops it too, so a sidecar never outlives the
+  shell that started it. Interactive runs are unaffected.
 
 ### Fixed
 
