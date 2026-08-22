@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta
+			http-equiv="Content-Security-Policy"
+			content="default-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'"
+		/>
+		<title>OMP Studio</title>
+		<link rel="stylesheet" href="./splash.css" />
+	</head>
+	<body>
+		<main class="shell">
+			<h1 class="brand"><span class="kicker">OMP</span> Studio</h1>
+
+			<section id="progress" class="progress" aria-live="polite">
+				<p id="stage" class="stage">Starting</p>
+				<div class="track"><div class="bar"></div></div>
+			</section>
+
+			<section id="failure" class="failure" hidden>
+				<h2 class="failure-title" id="failure-title">OMP Studio could not start</h2>
+				<p class="failure-message" id="failure-message"></p>
+				<pre class="failure-output" id="failure-output" hidden></pre>
+				<p class="failure-log" id="failure-log" hidden></p>
+				<div class="actions">
+					<button id="retry" type="button" class="primary">Try again</button>
+					<button id="logs" type="button" hidden>Open log folder</button>
+					<button id="copy" type="button">Copy details</button>
+				</div>
+			</section>
+		</main>
+		<script src="./splash.js" type="module"></script>
+	</body>
+</html>

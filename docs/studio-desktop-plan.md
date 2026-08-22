@@ -162,22 +162,38 @@ real child.
 
 ### Phase 8. Startup experience
 
-Scope:
+Status: complete.
 
-- Create the window immediately with a splash document, before the sidecar is
-  spawned. Today `windowManager.create()` runs only after the ready line
-  arrives, so a cold start is up to 30 seconds of nothing.
-- Feed the splash staged progress through one IPC channel: locating the sidecar,
-  waiting for the ready line, exchanging the local token, loading the client.
-- Replace the terminal `dialog.showErrorBox` → `app.exit(1)` failure path with an
-  in-window failure surface that offers retry, "open log folder", and copy of
-  the stderr tail. A failed startup must not require relaunching the app.
-- Introduce a main-process string table for every dialog, tray, splash, and
-  failure string, with `en` as the base locale. Every later phase adds its
-  strings there rather than inlining literals.
+Done:
+
+- The window is created with a splash document before the sidecar is spawned.
+  Startup previously created it only after the ready line, so a cold start showed
+  nothing for as long as the sidecar took, up to its 30-second timeout.
+- Staged progress over one channel: locating the runtime, starting the local
+  server, opening the workbench. The splash is a real document on disk with its
+  own strict CSP meta policy, fed typed state through the preload — the shell
+  never evaluates script in that window.
+- The terminal `dialog.showErrorBox` → `app.exit(1)` path is gone. A failed
+  startup now renders in the window with the reason, the sidecar's stderr tail,
+  the log path, and retry / open-log-folder / copy-details actions. Retry
+  re-enters the same startup function, stopping any half-started sidecar first.
+- A main-process string table with `en` as the base locale. Dialog, tray, splash,
+  and failure text all resolve through `t()`; later phases add keys there.
+- Splash channels are rejected once the Studio client owns the window. The window
+  keeps one preload across both documents, so that check is where the boundary
+  actually holds.
+
+Found while verifying: `omp studio` outlived its own shutdown whenever a tab was
+connected. `server.stop()` drained active connections instead of closing them, and
+the event WebSocket an idle tab holds open never closes on its own — so the process
+survived its own stop until the shell's force pass killed it. Measured at 5,783ms
+to stop a sidecar with one connected client, 30ms after the fix, and a full desktop
+quit went from 6,829ms to 2,354ms. Fixed in `packages/studio`.
 
 Completion contract: a sidecar that cannot start leaves the app running with a
-readable reason and a working retry; the smoke test still opens no window.
+readable reason and a working retry — verified live with a bogus executable path,
+where the app stayed up and reported `ENOENT` with its log path instead of exiting.
+The smoke test still opens no window.
 
 ### Phase 9. Native window chrome
 
@@ -449,5 +465,6 @@ Phase 7 is complete. Its value turned out to be narrower than expected — the
 Windows orphan the phase was written for is masked by the sidecar runtime's job
 objects — but the POSIX leak was real, the tree walk removes the dependency on
 undocumented runtime behaviour, and the shell now has a graceful stop that works
-on Windows. Phase 8 is next.
+on Windows. Phase 8 is complete too, and turned up a real shutdown defect in
+`packages/studio` on the way. Phase 9 is next.
 

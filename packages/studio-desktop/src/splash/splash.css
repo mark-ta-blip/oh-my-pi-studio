@@ -1,0 +1,168 @@
+:root {
+	color-scheme: dark;
+	--surface: #10201d;
+	--ink: #e8f1ef;
+	--muted: #8fa8a3;
+	--accent: #4ec9b0;
+	--danger: #ff9f9f;
+	--line: #24403b;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	height: 100%;
+	background: var(--surface);
+	color: var(--ink);
+	font: 14px/1.55 system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+
+.shell {
+	height: 100%;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 26px;
+	padding: 40px;
+}
+
+.brand {
+	margin: 0;
+	font-size: 21px;
+	font-weight: 550;
+	letter-spacing: 0.01em;
+}
+
+.kicker {
+	color: var(--accent);
+	font-weight: 650;
+}
+
+.progress {
+	width: min(360px, 100%);
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 14px;
+}
+
+.stage {
+	margin: 0;
+	color: var(--muted);
+}
+
+.track {
+	width: 100%;
+	height: 4px;
+	border-radius: 999px;
+	background: var(--line);
+	overflow: hidden;
+}
+
+.bar {
+	width: 38%;
+	height: 100%;
+	border-radius: 999px;
+	background: var(--accent);
+	animation: slide 1.25s ease-in-out infinite;
+}
+
+@keyframes slide {
+	0% {
+		transform: translateX(-110%);
+	}
+	100% {
+		transform: translateX(370%);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.bar {
+		width: 100%;
+		animation: none;
+		opacity: 0.55;
+	}
+}
+
+.failure {
+	width: min(620px, 100%);
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+.failure-title {
+	margin: 0;
+	font-size: 16px;
+	font-weight: 600;
+	color: var(--danger);
+}
+
+.failure-message,
+.failure-log {
+	margin: 0;
+	color: var(--ink);
+}
+
+.failure-log {
+	color: var(--muted);
+	font-size: 12px;
+	word-break: break-all;
+}
+
+.failure-output {
+	margin: 0;
+	max-height: 180px;
+	overflow: auto;
+	padding: 10px 12px;
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	background: #0b1614;
+	color: var(--muted);
+	font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	white-space: pre-wrap;
+}
+
+.actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 2px;
+}
+
+button {
+	min-height: 32px;
+	padding: 0 14px;
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	background: #172c28;
+	color: var(--ink);
+	font: inherit;
+	cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+	border-color: var(--accent);
+}
+
+button:disabled {
+	opacity: 0.55;
+	cursor: default;
+}
+
+button:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+
+button.primary {
+	background: var(--accent);
+	border-color: var(--accent);
+	color: #06120f;
+	font-weight: 600;
+}

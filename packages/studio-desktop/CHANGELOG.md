@@ -10,6 +10,13 @@
   authenticated bootstrap before shutdown.
 - Added `--hidden` to start OMP Studio in the tray without showing a window, and
   `--quit` to stop an already-running instance.
+- Added a splash window that opens before the sidecar is spawned and reports what
+  startup is waiting for, replacing an empty screen that could last as long as the
+  sidecar's ready timeout.
+- Added a recoverable startup failure surface. A sidecar that cannot start now
+  leaves the app running with the reason, the sidecar's own last output, the log
+  path, and working retry, open-log-folder, and copy-details actions. Startup no
+  longer ends in a modal dialog and an exit.
 
 ### Changed
 

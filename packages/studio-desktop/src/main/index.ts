@@ -1,33 +1,26 @@
 import * as path from "node:path";
-import { app, dialog, type IpcMainInvokeEvent, ipcMain, Notification, type OpenDialogOptions } from "electron";
+import {
+	app,
+	clipboard,
+	dialog,
+	type IpcMainInvokeEvent,
+	ipcMain,
+	Notification,
+	type OpenDialogOptions,
+} from "electron";
 import { isStudioQuitRequest, parseStudioDesktopArgs } from "./instance-args";
 import { isStudioIpcSender } from "./ipc-sender";
 import { createDesktopPaths, resolveTrayIconPath } from "./paths";
 import {
-	type StudioServerProcess,
-	StudioSidecarStartupError,
-	smokeTestStudioSidecar,
-	startStudioServer,
-} from "./studio-server";
+	describeError,
+	formatStudioStartupFailure,
+	type StudioStartupState,
+	toStudioStartupFailure,
+} from "./startup-state";
+import { t } from "./strings";
+import { type StudioServerProcess, smokeTestStudioSidecar, startStudioServer } from "./studio-server";
 import { TrayManager } from "./tray-manager";
 import { WindowManager } from "./window-manager";
-
-function describeError(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-/**
- * Startup failures are the one class of error with no UI behind it, so the
- * dialog has to carry the sidecar's own output and the log path with it.
- */
-function describeStartupFailure(error: unknown): string {
-	const message = describeError(error);
-	if (!(error instanceof StudioSidecarStartupError)) return message;
-	const sections = [message];
-	if (error.stderrTail.length > 0) sections.push(`Recent OMP Studio server output:\n${error.stderrTail.join("\n")}`);
-	if (error.logPath) sections.push(`Full server log:\n${error.logPath}`);
-	return sections.join("\n\n");
-}
 
 const { hidden: startHidden, quitExisting, smokeTest } = parseStudioDesktopArgs(process.argv);
 const hasLock = smokeTest || app.requestSingleInstanceLock(quitExisting ? { quit: true } : undefined);
@@ -35,12 +28,20 @@ if (!hasLock) {
 	app.quit();
 } else {
 	const packageRoot = path.resolve(import.meta.dirname, "..", "..");
+	let desktopPaths: ReturnType<typeof createDesktopPaths> | undefined;
 	let windowManager: WindowManager | undefined;
 	let trayManager: TrayManager | undefined;
 	let studioServer: StudioServerProcess | undefined;
 	let studioServerStartup: Promise<StudioServerProcess> | undefined;
 	let studioServerStartupAbort: AbortController | undefined;
+	let startupState: StudioStartupState = { kind: "progress", stage: "locating" };
+	let startupInFlight: Promise<void> | undefined;
 	let shutdownStarted = false;
+
+	function publishStartupState(state: StudioStartupState): void {
+		startupState = state;
+		windowManager?.publishStartupState(state);
+	}
 
 	/**
 	 * Reject a privileged call from anything but the Studio window. Every channel
@@ -48,21 +49,31 @@ if (!hasLock) {
 	 */
 	function requireStudioSender(event: IpcMainInvokeEvent): void {
 		if (isStudioIpcSender(event.sender, windowManager?.window)) return;
-		throw new Error("OMP Studio desktop controls are only available to the OMP Studio window.");
+		throw new Error(t("ipc.senderRejected"));
+	}
+
+	/**
+	 * Splash channels answer only while the splash owns the window. The window keeps
+	 * one preload across both documents, so this is what keeps the Studio client
+	 * from reaching startup controls that mean nothing to it.
+	 */
+	function requireSplashSender(event: IpcMainInvokeEvent): void {
+		requireStudioSender(event);
+		if (windowManager?.showingSplash !== true) throw new Error(t("ipc.senderRejected"));
 	}
 
 	function installIpc(): void {
 		ipcMain.handle("omp-studio:open-external", async (event, url: unknown) => {
 			requireStudioSender(event);
-			if (typeof url !== "string") throw new TypeError("OMP Studio can only open a URL.");
-			if (!windowManager) throw new Error("OMP Studio window is not ready.");
+			if (typeof url !== "string") throw new TypeError(t("ipc.urlRequired"));
+			if (!windowManager) throw new Error(t("ipc.windowNotReady"));
 			await windowManager.openExternal(url);
 		});
 		ipcMain.handle("omp-studio:select-workspace", async event => {
 			requireStudioSender(event);
 			const options = {
 				properties: ["openDirectory", "createDirectory"],
-				title: "Select workspace",
+				title: t("workspace.pickerTitle"),
 			} satisfies OpenDialogOptions;
 			const window = windowManager?.window;
 			const result = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
@@ -73,6 +84,74 @@ if (!hasLock) {
 			if (typeof title !== "string" || typeof body !== "string") return;
 			new Notification({ title, body }).show();
 		});
+		ipcMain.handle("omp-studio:startup-state", event => {
+			requireSplashSender(event);
+			return startupState;
+		});
+		ipcMain.handle("omp-studio:retry-startup", async event => {
+			requireSplashSender(event);
+			await startStudio();
+		});
+		ipcMain.handle("omp-studio:open-log-folder", event => {
+			requireSplashSender(event);
+			windowManager?.openLogFolder();
+		});
+		ipcMain.handle("omp-studio:copy-startup-failure", event => {
+			requireSplashSender(event);
+			if (startupState.kind !== "failure") return;
+			clipboard.writeText(formatStudioStartupFailure(startupState));
+		});
+	}
+
+	/**
+	 * Spawn the sidecar and hand the window over to the Studio client.
+	 *
+	 * Re-entrant by design: the splash's retry calls straight back into this, so a
+	 * failed startup never requires relaunching the app. Concurrent calls share the
+	 * one in-flight attempt.
+	 */
+	function startStudio(): Promise<void> {
+		if (startupInFlight) return startupInFlight;
+		const paths = desktopPaths;
+		if (!paths) return Promise.resolve();
+		const attempt = (async (): Promise<void> => {
+			publishStartupState({ kind: "progress", stage: "locating" });
+			// A retry after a partial start must not leave the previous sidecar behind.
+			const previous = studioServer;
+			studioServer = undefined;
+			await previous?.stop().catch(() => undefined);
+
+			studioServerStartupAbort = new AbortController();
+			studioServerStartup = startStudioServer({
+				paths,
+				packaged: app.isPackaged,
+				command: app.isPackaged ? undefined : process.env.OMP_STUDIO_OMP_EXECUTABLE,
+				signal: studioServerStartupAbort.signal,
+			});
+			try {
+				publishStartupState({ kind: "progress", stage: "starting" });
+				const startedServer = await studioServerStartup;
+				studioServer = startedServer;
+				if (shutdownStarted) return;
+				publishStartupState({ kind: "progress", stage: "loading" });
+				await windowManager?.loadStudio(startedServer.url);
+			} catch (error) {
+				if (shutdownStarted) return;
+				const failure = toStudioStartupFailure(error);
+				process.stderr.write(`OMP Studio could not start: ${formatStudioStartupFailure(failure)}\n`);
+				publishStartupState(failure);
+				// The window stays open on the splash, so the failure is recoverable.
+				windowManager?.show();
+			} finally {
+				studioServerStartup = undefined;
+				studioServerStartupAbort = undefined;
+			}
+		})();
+		const tracked: Promise<void> = attempt.finally(() => {
+			if (startupInFlight === tracked) startupInFlight = undefined;
+		});
+		startupInFlight = tracked;
+		return tracked;
 	}
 
 	async function shutdown(): Promise<void> {
@@ -94,25 +173,9 @@ if (!hasLock) {
 		}
 	}
 
-	async function failStartup(error: unknown): Promise<void> {
-		if (shutdownStarted) return;
-		shutdownStarted = true;
-		const detail = describeStartupFailure(error);
-		try {
-			windowManager?.allowClose();
-			await studioServer?.stop();
-			trayManager?.destroy();
-			process.stderr.write(`OMP Studio could not start: ${detail}\n`);
-			dialog.showErrorBox("OMP Studio could not start", detail);
-		} catch (cleanupError) {
-			process.stderr.write(`OMP Studio startup cleanup error: ${describeError(cleanupError)}\n`);
-		} finally {
-			app.exit(1);
-		}
-	}
-
 	function failSmokeTest(error: unknown): void {
-		process.stderr.write(`OMP Studio desktop smoke failed: ${describeStartupFailure(error)}\n`);
+		const failure = toStudioStartupFailure(error);
+		process.stderr.write(`OMP Studio desktop smoke failed: ${formatStudioStartupFailure(failure)}\n`);
 		app.exit(1);
 	}
 
@@ -143,6 +206,7 @@ if (!hasLock) {
 				return;
 			}
 			const paths = createDesktopPaths(app.getPath("userData"), process.resourcesPath, packageRoot);
+			desktopPaths = paths;
 			if (smokeTest) {
 				try {
 					await smokeTestStudioSidecar({
@@ -158,21 +222,7 @@ if (!hasLock) {
 			}
 			windowManager = new WindowManager(paths);
 			installIpc();
-			studioServerStartupAbort = new AbortController();
-			studioServerStartup = startStudioServer({
-				paths,
-				packaged: app.isPackaged,
-				command: app.isPackaged ? undefined : process.env.OMP_STUDIO_OMP_EXECUTABLE,
-				signal: studioServerStartupAbort.signal,
-			});
-			try {
-				const startedServer = await studioServerStartup;
-				studioServer = startedServer;
-				await windowManager.create(startedServer.url, { hidden: startHidden });
-			} finally {
-				studioServerStartup = undefined;
-				studioServerStartupAbort = undefined;
-			}
+			await windowManager.createShell({ hidden: startHidden });
 			trayManager = new TrayManager(
 				windowManager,
 				() => void app.quit(),
@@ -180,7 +230,7 @@ if (!hasLock) {
 			);
 			if (!trayManager.available) {
 				// No tray means no way to reopen a hidden window, so close has to
-				// quit instead. See the window-all-closed handler below. A --hidden
+				// quit instead. See the window-all-closed handler above. A --hidden
 				// start would also be unreachable, so it is overridden here.
 				process.stderr.write(
 					`OMP Studio tray unavailable (${trayManager.failure ?? "unknown"}); close will quit.\n`,
@@ -188,8 +238,14 @@ if (!hasLock) {
 				windowManager.enableCloseToQuit();
 				windowManager.show();
 			}
+			await startStudio();
 		})
 		.catch(error => {
-			if (!shutdownStarted) void failStartup(error);
+			// Only reachable if the window itself could not be created; a sidecar
+			// failure is reported on the splash instead.
+			if (shutdownStarted) return;
+			process.stderr.write(`OMP Studio could not start its window: ${describeError(error)}\n`);
+			dialog.showErrorBox(t("failure.title"), describeError(error));
+			app.exit(1);
 		});
 }

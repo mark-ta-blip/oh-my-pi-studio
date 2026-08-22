@@ -2,6 +2,8 @@ import * as path from "node:path";
 import { BrowserWindow, dialog, screen, session, shell } from "electron";
 import { resolveExternalHttpUrl } from "./external-url";
 import type { DesktopPaths } from "./paths";
+import type { StudioStartupState } from "./startup-state";
+import { t } from "./strings";
 import {
 	clampWindowStateToDisplays,
 	MIN_WINDOW_HEIGHT,
@@ -9,6 +11,8 @@ import {
 	readWindowState,
 	writeWindowState,
 } from "./window-state";
+
+const STUDIO_STARTUP_STATE_CHANNEL = "omp-studio:startup-state";
 
 export interface StudioWindowCreateOptions {
 	/** Leave the window hidden so a `--hidden` launch starts in the tray. */
@@ -20,10 +24,19 @@ export class WindowManager {
 	#allowClose = false;
 	#closeToQuit = false;
 	#saveTimer: NodeJS.Timeout | undefined;
+	#studioOrigin: string | undefined;
+	#cspInstalled = false;
 
 	constructor(readonly paths: DesktopPaths) {}
 
-	async create(serverUrl: string, options: StudioWindowCreateOptions = {}): Promise<BrowserWindow> {
+	/**
+	 * Open the window before the sidecar is spawned, showing the splash.
+	 *
+	 * Startup can take up to the sidecar's ready timeout. Creating the window only
+	 * after that left the app with nothing on screen for the whole wait, and left a
+	 * failure with nowhere to render but a modal dialog.
+	 */
+	async createShell(options: StudioWindowCreateOptions = {}): Promise<BrowserWindow> {
 		const saved = await readWindowState(this.paths.windowStatePath);
 		const state = clampWindowStateToDisplays(
 			saved,
@@ -46,12 +59,12 @@ export class WindowManager {
 		window.webContents.once("preload-error", () => {
 			void dialog.showMessageBox(window, {
 				type: "error",
-				title: "OMP Studio desktop controls are unavailable",
-				message: "OMP Studio could not initialize its desktop integration.",
-				detail: "Restart OMP Studio. If the issue persists, reinstall the app.",
+				title: t("preload.title"),
+				message: t("preload.message"),
+				detail: t("preload.detail"),
 			});
 		});
-		this.#installNavigationPolicy(window, serverUrl);
+		this.#installNavigationPolicy(window);
 		window.on("move", () => this.#scheduleSave());
 		window.on("resize", () => this.#scheduleSave());
 		// Minimize stays a real minimize: hiding it too leaves the taskbar and the
@@ -62,8 +75,42 @@ export class WindowManager {
 			window.hide();
 		});
 		if (!options.hidden) window.once("ready-to-show", () => window.show());
-		await window.loadURL(serverUrl);
+		await window.loadFile(path.join(this.paths.packageRoot, "dist", "splash", "index.html"));
 		return window;
+	}
+
+	/** True until the Studio client has loaded, which is when splash IPC stops answering. */
+	get showingSplash(): boolean {
+		return this.#studioOrigin === undefined;
+	}
+
+	/** Push typed startup state to the splash. Ignored once the window is gone. */
+	publishStartupState(state: StudioStartupState): void {
+		const window = this.#window;
+		if (!window || window.isDestroyed()) return;
+		window.webContents.send(STUDIO_STARTUP_STATE_CHANNEL, state);
+	}
+
+	/** Replace the splash with the Studio client and lock navigation to its origin. */
+	async loadStudio(serverUrl: string): Promise<void> {
+		const window = this.#window;
+		if (!window || window.isDestroyed()) throw new Error(t("ipc.windowNotReady"));
+		const origin = new URL(serverUrl).origin;
+		this.#installContentSecurityPolicy(origin);
+		this.#studioOrigin = origin;
+		try {
+			await window.loadURL(serverUrl);
+		} catch (error) {
+			// A failed navigation must not leave the shell believing the client owns
+			// the window, or the splash could no longer report the failure.
+			this.#studioOrigin = undefined;
+			throw error;
+		}
+	}
+
+	/** Reveal the sidecar log directory, so a failed startup is actionable. */
+	openLogFolder(): void {
+		shell.showItemInFolder(this.paths.sidecarLogPath);
 	}
 
 	get window(): BrowserWindow | null {
@@ -94,7 +141,7 @@ export class WindowManager {
 
 	async openExternal(url: string): Promise<void> {
 		const externalUrl = resolveExternalHttpUrl(url);
-		if (!externalUrl) throw new Error("OMP Studio can only open HTTP or HTTPS links outside the app.");
+		if (!externalUrl) throw new Error(t("startup.externalOnlyHttp"));
 		await shell.openExternal(externalUrl);
 	}
 
@@ -111,19 +158,31 @@ export class WindowManager {
 		}, 250);
 	}
 
-	#installNavigationPolicy(window: BrowserWindow, serverUrl: string): void {
-		const origin = new URL(serverUrl).origin;
+	/**
+	 * Installed once, before any document loads. Until `loadStudio` records an
+	 * origin there is no in-app destination at all, so every navigation the splash
+	 * could attempt is deflected outward.
+	 */
+	#installNavigationPolicy(window: BrowserWindow): void {
 		window.webContents.setWindowOpenHandler(details => {
 			void this.openExternal(details.url).catch(() => undefined);
 			return { action: "deny" };
 		});
 		window.webContents.on("will-navigate", (event, navigationUrl) => {
 			try {
-				if (new URL(navigationUrl).origin === origin) return;
+				if (this.#studioOrigin !== undefined && new URL(navigationUrl).origin === this.#studioOrigin) return;
 			} catch {}
 			event.preventDefault();
 			void this.openExternal(navigationUrl).catch(() => undefined);
 		});
+	}
+
+	#installContentSecurityPolicy(origin: string): void {
+		if (this.#cspInstalled) return;
+		this.#cspInstalled = true;
+		// Widened from the server's own header only by `'unsafe-inline'` for styles,
+		// which the Studio client still needs. The splash document carries its own
+		// stricter policy in a meta tag, because file:// responses never reach here.
 		session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
 			if (details.url.startsWith(origin)) {
 				callback({
