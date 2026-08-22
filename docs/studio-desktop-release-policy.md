@@ -39,18 +39,31 @@ release notes, or desktop configuration files.
 
 ## Update Policy
 
-`electron-updater` is not enabled by the desktop runtime. There is no update
-feed, background download, silent install, or automatic sidecar replacement.
-Users update by downloading a signed installer from the GitHub release.
+OMP Studio Desktop has no automatic updates, and this is a permanent product
+decision rather than a deferral. There is no update feed, no background download,
+no silent install, no self-replacement of the application, and no automatic
+sidecar replacement. `electron-updater` is removed from the desktop package;
+reintroducing it requires reversing this section first.
 
-Automatic updates may be proposed only after all of the following exist:
+Users update by downloading a signed installer from the GitHub release. The
+application may show its current version and link to the releases page. It must
+not download or install anything.
 
-1. A versioned HTTPS feed owned by the release team.
-2. Signed Windows artifacts with publisher identity verification.
-3. Checksum and signature verification before any download is offered.
-4. A staged rollout policy with a documented pause and rollback path.
-5. User-visible update state and an explicit install decision.
+Release owners can withdraw a bad installer, publish a replacement release, and
+document its checksum. The application must never mutate an installed sidecar in
+place as a rollback mechanism.
 
-Until then, release owners can withdraw a bad installer, publish a replacement
-release, and document its checksum. The application must not mutate an installed
-sidecar in place as a rollback mechanism.
+## Platform Coverage
+
+Windows is the first and currently the only packaged target. Phase 12 of
+[`studio-desktop-plan.md`](./studio-desktop-plan.md) extends the release matrix
+to darwin-arm64, darwin-x64, linux-x64, and linux-arm64.
+
+Each matrix target downloads only its own platform-matched OMP binary and
+uploads only its own artifact globs. A Windows job must never require a macOS
+`.dmg`, and a Linux job must never require a Windows installer. Keep the
+per-platform artifact lists explicit so the expectation fails loudly when a
+target produces nothing.
+
+macOS signing and notarization follow
+[`macos-signing-notarization.md`](./macos-signing-notarization.md).

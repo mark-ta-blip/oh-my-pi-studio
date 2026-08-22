@@ -28,4 +28,5 @@ the bundled sidecar, exchanges its one-time local token for a cookie, reads the
 authenticated bootstrap endpoint, stops the sidecar, and exits.
 
 See [the desktop release policy](../../docs/studio-desktop-release-policy.md)
-for signing, checksum, and update-feed requirements.
+for signing, checksum, and platform-coverage requirements, and
+[the desktop plan](../../docs/studio-desktop-plan.md) for the active roadmap.

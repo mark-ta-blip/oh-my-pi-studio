@@ -13,6 +13,11 @@ contracts, and Windows-first packaged desktop smoke are now the implemented
 baseline. New capability work must start with a separate proposal that preserves
 the safety boundary below.
 
+The active desktop proposal is [Studio Desktop Plan](./studio-desktop-plan.md).
+It owns phases 7 and above for `packages/studio-desktop`, and its Phase 13 is
+the boundary revision required before any capability that cannot be projected
+into the fixed enums described here.
+
 OMP Studio is a local, desktop-first workbench for the OMP coding agent. It is
 not a fork of the OMP runtime and it is not a clone of Hermes Studio. OMP keeps
 ownership of credentials, providers, models, native sessions, tools, and raw
@@ -175,7 +180,7 @@ complexity.
 
 ## Current Slice
 
-There is no active implementation phase. The completed baseline includes:
+Browser-surface phases 0 through 6 are complete. The completed baseline includes:
 
 - a responsive navigation, conversation, inspector, and composer workbench;
 - browser-safe tool cards, approvals, subagents, plan summaries, change review,
@@ -184,5 +189,11 @@ There is no active implementation phase. The completed baseline includes:
 - deterministic desktop assets, a bundled Windows sidecar, and a packaged
   Windows smoke contract in release CI.
 
-The desktop signing and update controls are governed by
+Active work has moved to [Studio Desktop Plan](./studio-desktop-plan.md), which
+owns phases 7 and above. Two client changes remain open in this document's scope:
+splitting hydration and inspector demand out of
+`packages/studio/src/client/app.tsx`, whose tests are already committed and
+currently failing against missing modules.
+
+The desktop signing and distribution controls are governed by
 [`studio-desktop-release-policy.md`](./studio-desktop-release-policy.md).

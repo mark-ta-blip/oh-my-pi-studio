@@ -1,8 +1,13 @@
 # OMP Studio Desktop App Plan
 
-> Status: historical bootstrap plan. The Electron shell described here is now
-> implemented in `packages/studio-desktop/`. The active product and delivery
-> roadmap is [Studio Workbench Plan](./studio-workbench-plan.md).
+> Status: historical bootstrap plan, kept for context only. The Electron shell
+> described here is implemented in `packages/studio-desktop/`, though not the way
+> this document proposed — the shell supervises `omp studio` as a sidecar process
+> instead of embedding the Bun server in the main process.
+>
+> The active desktop roadmap is [Studio Desktop Plan](./studio-desktop-plan.md).
+> The browser-surface roadmap is [Studio Workbench Plan](./studio-workbench-plan.md).
+> Do not use the checklist below to plan work.
 
 ## Mục tiêu
 Biến OMP Studio từ web app (Bun server + React client) thành desktop app sử dụng Electron, tương tự như Hermes Studio.
