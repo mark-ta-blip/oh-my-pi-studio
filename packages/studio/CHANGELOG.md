@@ -21,6 +21,11 @@
 
 - Improved the desktop workbench navigation, session state hierarchy, responsive drawers, CLI-style transcript presentation, and composer interactions.
 - Changed the Studio transcript to render CLI-style GFM responses and keep run context closed until explicitly opened.
+- Changed inspector hydration to fetch only the visible panel's snapshots.
+  Selecting a session no longer loads all eight inspector resources, including
+  the change set, which runs Git on the server.
+- Changed usage-history refreshes to coalesce behind the history panel instead of
+  issuing one request per streamed provider response.
 
 ### Fixed
 

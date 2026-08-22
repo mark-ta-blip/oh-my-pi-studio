@@ -49,7 +49,9 @@ import type { StudioContextPanel } from "./context-panel";
 import type { StudioComposerImageDraft } from "./conversation/composer";
 import { StudioConversationPane } from "./conversation/conversation-pane";
 import { mergeStudioRunHistorySnapshot, upsertStudioRunHistory } from "./history/run-history-state";
+import { UsageHistoryRefreshScheduler } from "./hydration-state";
 import { StudioSessionInspector } from "./inspector/session-inspector";
+import { type StudioInspectorResource, studioInspectorDemand } from "./inspector-demand";
 import { StudioSessionRail } from "./navigation/session-rail";
 import { mergeStudioPlanSummary } from "./plan-state";
 import { isActiveRun, isTerminalRunStatus, mergeStudioSessionSnapshot, reconcileStudioSession } from "./session-state";
@@ -63,6 +65,8 @@ type ConnectionState = StudioConnectionState;
 const STUDIO_MUTATION_TIMEOUT_MS = 30_000;
 /** Reuse an unexpired control lease instead of renewing it, leaving room for the prompt round trip. */
 const STUDIO_CONTROL_LEASE_REUSE_MARGIN_MS = 5_000;
+/** Debounce for usage-history refreshes while a run streams; a terminal run bypasses it. */
+const STUDIO_USAGE_HISTORY_REFRESH_MS = 1_000;
 /**
  * Shared empty collections for unselected or not-yet-loaded sessions. Inline `?? []` fallbacks would
  * allocate a fresh array on every render and defeat the memoized panes during streaming.
@@ -1035,6 +1039,23 @@ export function App(): ReactNode {
 		}
 	}, []);
 
+	// `usage.updated` arrives on every provider response, so refreshing history
+	// per event produced one REST fetch per streamed message for a panel that is
+	// usually closed. Read through a ref because the WebSocket handler outlives
+	// any single render.
+	const inspectorDemandRef = useRef<ReadonlySet<StudioInspectorResource>>(new Set());
+	const usageHistoryRefreshRef = useRef<UsageHistoryRefreshScheduler | undefined>(undefined);
+	if (!usageHistoryRefreshRef.current) {
+		usageHistoryRefreshRef.current = new UsageHistoryRefreshScheduler({
+			clearTimeout: timer => clearTimeout(timer),
+			delayMs: STUDIO_USAGE_HISTORY_REFRESH_MS,
+			isVisible: () => inspectorDemandRef.current.has("usageHistory"),
+			refresh: loadUsageHistory,
+			setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+		});
+	}
+	const usageHistoryRefresh = usageHistoryRefreshRef.current;
+
 	useEffect(() => {
 		let active = true;
 		fetch("/api/v1/bootstrap")
@@ -1141,6 +1162,24 @@ export function App(): ReactNode {
 		persistSelectedSessionId(selectedSessionId);
 	}, [selectedSessionId]);
 
+	// Inspector snapshots are fetched for the visible panel only. Selecting a
+	// session used to hydrate all eight, including the change set, which shells
+	// out to Git on the server for a panel the user may never open.
+	const inspectorDemand = useMemo(
+		() => studioInspectorDemand(contextOpen, contextPanel, bootstrap?.features ?? {}),
+		[bootstrap?.features, contextOpen, contextPanel],
+	);
+
+	useEffect(() => {
+		inspectorDemandRef.current = inspectorDemand;
+	}, [inspectorDemand]);
+
+	// A pending refresh belongs to the session that requested it, so switching
+	// sessions must drop it rather than let it land on the new selection.
+	useEffect(() => {
+		usageHistoryRefresh.cancel();
+	}, [selectedSessionId, usageHistoryRefresh]);
+
 	useEffect(() => {
 		if (!selectedSessionId) {
 			return;
@@ -1149,37 +1188,37 @@ export function App(): ReactNode {
 	}, [loadTranscript, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
-		if (!selectedSessionId || !bootstrap?.features.activityTimeline) return;
+		if (!selectedSessionId || !inspectorDemand.has("activity")) return;
 		void loadActivity(selectedSessionId);
-	}, [bootstrap?.features.activityTimeline, loadActivity, resyncRevision, selectedSessionId]);
+	}, [inspectorDemand, loadActivity, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
-		if (!selectedSessionId || !bootstrap?.features.toolCards) return;
+		if (!selectedSessionId || !inspectorDemand.has("toolDisplays")) return;
 		void loadToolDisplays(selectedSessionId);
-	}, [bootstrap?.features.toolCards, loadToolDisplays, resyncRevision, selectedSessionId]);
+	}, [inspectorDemand, loadToolDisplays, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
-		if (!selectedSessionId || !bootstrap?.features.planSummary) return;
+		if (!selectedSessionId || !inspectorDemand.has("plan")) return;
 		void loadPlanSummary(selectedSessionId);
-	}, [bootstrap?.features.planSummary, loadPlanSummary, resyncRevision, selectedSessionId]);
+	}, [inspectorDemand, loadPlanSummary, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
-		if (!selectedSessionId || !bootstrap?.features.changeReview) return;
+		if (!selectedSessionId || !inspectorDemand.has("changeSet")) return;
 		void loadChangeSet(selectedSessionId);
-	}, [bootstrap?.features.changeReview, loadChangeSet, resyncRevision, selectedSessionId]);
+	}, [inspectorDemand, loadChangeSet, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
-		if (!selectedSessionId || !bootstrap?.features.runHistory) return;
+		if (!selectedSessionId || !inspectorDemand.has("runHistory")) return;
 		void loadRunHistory(selectedSessionId);
-	}, [bootstrap?.features.runHistory, loadRunHistory, resyncRevision, selectedSessionId]);
+	}, [inspectorDemand, loadRunHistory, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
-		if (!selectedSessionId || !bootstrap?.features.usageHistory) return;
+		if (!selectedSessionId || !inspectorDemand.has("usageHistory")) return;
 		void loadUsageHistory(selectedSessionId);
-	}, [bootstrap?.features.usageHistory, loadUsageHistory, resyncRevision, selectedSessionId]);
+	}, [inspectorDemand, loadUsageHistory, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
-		if (!selectedSessionId || !bootstrap?.features.approvalControls) return;
+		if (!selectedSessionId || !inspectorDemand.has("approvals")) return;
 		let active = true;
 		fetch(`/api/v1/sessions/${encodeURIComponent(selectedSessionId)}/approvals`)
 			.then(async response => {
@@ -1196,7 +1235,7 @@ export function App(): ReactNode {
 		return () => {
 			active = false;
 		};
-	}, [bootstrap?.features.approvalControls, resyncRevision, selectedSessionId]);
+	}, [inspectorDemand, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
 		if (!authFlow || providerPending === null || !isActiveAuthFlow(authFlow) || !window.ompStudio) return;
@@ -1211,7 +1250,7 @@ export function App(): ReactNode {
 	}, [authFlow, providerPending]);
 
 	useEffect(() => {
-		if (!selectedSessionId || !bootstrap?.features.subagentVisibility) return;
+		if (!selectedSessionId || !inspectorDemand.has("subagents")) return;
 		let active = true;
 		fetch(`/api/v1/sessions/${encodeURIComponent(selectedSessionId)}/subagents`)
 			.then(async response => {
@@ -1228,7 +1267,7 @@ export function App(): ReactNode {
 		return () => {
 			active = false;
 		};
-	}, [bootstrap?.features.subagentVisibility, resyncRevision, selectedSessionId]);
+	}, [inspectorDemand, resyncRevision, selectedSessionId]);
 
 	useEffect(() => {
 		let disposed = false;
@@ -1353,8 +1392,8 @@ export function App(): ReactNode {
 							void window.ompStudio?.notify(title, body).catch(() => undefined);
 						}
 						if (isTerminalRunStatus(run.status)) {
-							void loadRunHistory(message.studioSessionId);
-							void loadUsageHistory(message.studioSessionId);
+							if (inspectorDemandRef.current.has("runHistory")) void loadRunHistory(message.studioSessionId);
+							usageHistoryRefresh.schedule(message.studioSessionId, "terminal");
 						}
 						setSessions(current =>
 							sortSessions(
@@ -1392,7 +1431,7 @@ export function App(): ReactNode {
 								),
 							),
 						);
-						void loadUsageHistory(message.studioSessionId);
+						usageHistoryRefresh.schedule(message.studioSessionId, "usage");
 						return;
 					}
 					if (parseTranscriptUpdated(message)) {
@@ -1457,7 +1496,7 @@ export function App(): ReactNode {
 			activeSocket = undefined;
 			if (socket) closeSocket(socket);
 		};
-	}, [loadProviders, loadRunHistory, loadUsageHistory]);
+	}, [loadProviders, loadRunHistory, usageHistoryRefresh]);
 
 	const profile = bootstrap?.profile ?? "loading";
 	const providerOnboarding = bootstrap?.features.providerOnboarding === true;
