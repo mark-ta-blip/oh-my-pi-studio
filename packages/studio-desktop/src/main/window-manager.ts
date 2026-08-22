@@ -10,6 +10,11 @@ import {
 	writeWindowState,
 } from "./window-state";
 
+export interface StudioWindowCreateOptions {
+	/** Leave the window hidden so a `--hidden` launch starts in the tray. */
+	hidden?: boolean;
+}
+
 export class WindowManager {
 	#window: BrowserWindow | null = null;
 	#allowClose = false;
@@ -18,7 +23,7 @@ export class WindowManager {
 
 	constructor(readonly paths: DesktopPaths) {}
 
-	async create(serverUrl: string): Promise<BrowserWindow> {
+	async create(serverUrl: string, options: StudioWindowCreateOptions = {}): Promise<BrowserWindow> {
 		const saved = await readWindowState(this.paths.windowStatePath);
 		const state = clampWindowStateToDisplays(
 			saved,
@@ -56,7 +61,7 @@ export class WindowManager {
 			event.preventDefault();
 			window.hide();
 		});
-		window.once("ready-to-show", () => window.show());
+		if (!options.hidden) window.once("ready-to-show", () => window.show());
 		await window.loadURL(serverUrl);
 		return window;
 	}

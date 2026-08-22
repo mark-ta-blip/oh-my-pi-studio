@@ -4,12 +4,32 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Readable } from "node:stream";
+import type { ProcessTreeControl } from "../src/main/process-tree";
 import { openSidecarLogSink } from "../src/main/sidecar-log";
 import { StudioSidecarStartupError, superviseStudioSidecar } from "../src/main/studio-server";
 
 type FakeSidecar = childProcess.ChildProcessByStdio<null, Readable, Readable>;
 
 const READY_URL = "http://127.0.0.1:49213/?token=fixture-access-token";
+
+/**
+ * A process-tree control that records the termination sequence and, optionally,
+ * really ends the child so the supervisor's waits resolve. Platform is forced so
+ * both branches are exercised regardless of the host running the suite.
+ */
+function recordTermination(child: FakeSidecar, options: { obeysGracefulStop: boolean }) {
+	const steps: string[] = [];
+	const control: ProcessTreeControl = {
+		listProcesses: async () => "",
+		platform: "linux",
+		run: async () => true,
+		sendSignal: (_pid, signal) => {
+			steps.push(signal);
+			if (signal === "SIGKILL" || options.obeysGracefulStop) child.kill("SIGKILL");
+		},
+	};
+	return { control, steps };
+}
 
 const children: FakeSidecar[] = [];
 const tempRoots: string[] = [];
@@ -47,6 +67,45 @@ test("resolves the sidecar URL from the ready line and ignores unrelated output"
 
 	expect(server.url).toBe(READY_URL);
 	await server.stop();
+	expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+});
+
+test("asks the sidecar to stop before forcing it, and stops there when it complies", async () => {
+	const child = spawnFakeSidecar(
+		`console.log("OMP Studio available at: ${READY_URL}");
+		 setTimeout(() => undefined, 30000);`,
+	);
+	const termination = recordTermination(child, { obeysGracefulStop: true });
+
+	const server = await superviseStudioSidecar(child, {
+		processTree: termination.control,
+		readyTimeoutMs: 10_000,
+		stopGraceMs: 5_000,
+	});
+	await server.stop();
+
+	// A sidecar that exits on its own request must never be force-killed: the
+	// force pass would cut short its own RPC-child teardown.
+	expect(termination.steps).toEqual(["SIGTERM"]);
+	expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+});
+
+test("forces the whole tree when the sidecar ignores the stop request", async () => {
+	const child = spawnFakeSidecar(
+		`process.on("SIGTERM", () => undefined);
+		 console.log("OMP Studio available at: ${READY_URL}");
+		 setTimeout(() => undefined, 30000);`,
+	);
+	const termination = recordTermination(child, { obeysGracefulStop: false });
+
+	const server = await superviseStudioSidecar(child, {
+		processTree: termination.control,
+		readyTimeoutMs: 10_000,
+		stopGraceMs: 150,
+	});
+	await server.stop();
+
+	expect(termination.steps).toEqual(["SIGTERM", "SIGKILL"]);
 	expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
 });
 

@@ -3,11 +3,24 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import type { Readable } from "node:stream";
 import { type DesktopPaths, resolveDevelopmentServerScript } from "./paths";
+import {
+	createProcessTreeControl,
+	forceKillTree,
+	type ProcessTreeControl,
+	requestGracefulTreeStop,
+} from "./process-tree";
 import { openSidecarLogSink, type StudioSidecarLogSink } from "./sidecar-log";
 
 const READY_LINE = /^OMP Studio available at: (https?:\/\/127\.0\.0\.1:\d+\/\?token=[^\s]+)$/;
 const STUDIO_SERVER_READY_TIMEOUT_MS = 30_000;
-const STUDIO_SERVER_STOP_GRACE_MS = 2_000;
+/**
+ * How long a sidecar that accepted a graceful stop may take to unwind. It has to
+ * close its RPC transports and finish its own session bookkeeping, which is more
+ * than a process teardown.
+ */
+const STUDIO_SERVER_GRACEFUL_STOP_MS = 5_000;
+/** How long to confirm the tree is gone after the force pass. */
+const STUDIO_SERVER_FORCE_STOP_MS = 2_000;
 const STUDIO_BOOTSTRAP_API_VERSION = 1;
 /** Enough stderr to identify a startup failure without pasting a whole log into a dialog. */
 const STUDIO_SERVER_STDERR_TAIL_LINES = 20;
@@ -41,12 +54,18 @@ export interface StudioServerLaunchOptions {
 	readyTimeoutMs?: number;
 	signal?: AbortSignal;
 	smoke?: boolean;
+	/** Injected in tests so the termination contract is verifiable off-platform. */
+	processTree?: ProcessTreeControl;
 }
 
 export interface StudioSidecarSupervisionOptions {
 	readyTimeoutMs?: number;
 	signal?: AbortSignal;
 	logSink?: StudioSidecarLogSink;
+	/** Injected in tests so the termination contract is verifiable off-platform. */
+	processTree?: ProcessTreeControl;
+	/** How long a sidecar that accepted a graceful stop may take to exit. */
+	stopGraceMs?: number;
 }
 
 type StudioSidecar = childProcess.ChildProcessByStdio<null, Readable, Readable>;
@@ -172,20 +191,31 @@ async function waitForSidecarExit(child: StudioSidecar, timeoutMs: number): Prom
 	return await promise;
 }
 
-async function stopSidecar(child: StudioSidecar): Promise<void> {
+/**
+ * Stop a sidecar and everything it spawned: ask first, force second.
+ *
+ * The force pass has to be tree-wide. A sidecar with an active Studio session has
+ * its own `omp --mode rpc-ui` children, and terminating only the root strands
+ * them — on Windows unconditionally, since there is no signal for the sidecar to
+ * handle.
+ */
+async function stopSidecar(child: StudioSidecar, control: ProcessTreeControl, gracefulStopMs: number): Promise<void> {
 	if (hasExited(child)) return;
-	try {
-		child.kill();
-	} catch {
-		// The sidecar may have exited between the state check and the signal.
+	const pid = child.pid;
+	if (pid === undefined) {
+		// No pid means the spawn never produced a process to signal.
+		try {
+			child.kill();
+		} catch {
+			// Nothing to stop.
+		}
+		return;
 	}
-	if (await waitForSidecarExit(child, STUDIO_SERVER_STOP_GRACE_MS)) return;
-	try {
-		child.kill("SIGKILL");
-	} catch {
-		// The sidecar may have exited during the grace period.
-	}
-	await waitForSidecarExit(child, STUDIO_SERVER_STOP_GRACE_MS);
+
+	const accepted = await requestGracefulTreeStop(pid, control);
+	if (accepted && (await waitForSidecarExit(child, gracefulStopMs))) return;
+	await forceKillTree(pid, control);
+	await waitForSidecarExit(child, STUDIO_SERVER_FORCE_STOP_MS);
 }
 
 /**
@@ -227,6 +257,7 @@ export async function startStudioServer(options: StudioServerLaunchOptions): Pro
 		readyTimeoutMs: options.readyTimeoutMs,
 		signal: options.signal,
 		logSink,
+		...(options.processTree ? { processTree: options.processTree } : {}),
 	});
 }
 
@@ -241,6 +272,8 @@ export async function superviseStudioSidecar(
 	options: StudioSidecarSupervisionOptions = {},
 ): Promise<StudioServerProcess> {
 	const logSink = options.logSink;
+	const processTree = options.processTree ?? createProcessTreeControl();
+	const stopGraceMs = options.stopGraceMs ?? STUDIO_SERVER_GRACEFUL_STOP_MS;
 	const stdoutLines = readline.createInterface({ input: child.stdout });
 	const stderrLines = readline.createInterface({ input: child.stderr });
 	const stderrTail: string[] = [];
@@ -299,14 +332,14 @@ export async function superviseStudioSidecar(
 			url,
 			async stop(): Promise<void> {
 				stdoutLines.close();
-				await stopSidecar(child);
+				await stopSidecar(child, processTree, stopGraceMs);
 				stderrLines.close();
 				await logSink?.close();
 			},
 		};
 	} catch (error) {
 		stdoutLines.close();
-		await stopSidecar(child);
+		await stopSidecar(child, processTree, stopGraceMs);
 		// Snapshot the tail only once stderr has ended: these lines are the whole
 		// diagnostic the startup dialog and log have to offer.
 		await drainSidecarStderr(child);
