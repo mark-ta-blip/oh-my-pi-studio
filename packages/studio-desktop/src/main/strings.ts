@@ -15,6 +15,7 @@ const EN = {
 	"failure.title": "OMP Studio could not start",
 	"ipc.senderRejected": "OMP Studio desktop controls are only available to the OMP Studio window.",
 	"ipc.urlRequired": "OMP Studio can only open a URL.",
+	"ipc.windowActionRequired": "OMP Studio received an unknown window control action.",
 	"ipc.windowNotReady": "OMP Studio window is not ready.",
 	"preload.detail": "Restart OMP Studio. If the issue persists, reinstall the app.",
 	"preload.message": "OMP Studio could not initialize its desktop integration.",

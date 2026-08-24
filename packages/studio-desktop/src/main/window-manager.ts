@@ -1,18 +1,27 @@
 import * as path from "node:path";
-import { BrowserWindow, dialog, screen, session, shell } from "electron";
+import { BrowserWindow, dialog, screen, shell } from "electron";
 import { resolveExternalHttpUrl } from "./external-url";
 import type { DesktopPaths } from "./paths";
 import type { StudioStartupState } from "./startup-state";
 import { t } from "./strings";
 import {
+	resolveWindowChromeOptions,
+	resolveWindowChromePlatform,
+	type WindowChromeState,
+	type WindowControlAction,
+	windowControlsAreDrawnInWindow,
+} from "./window-chrome";
+import {
 	clampWindowStateToDisplays,
 	MIN_WINDOW_HEIGHT,
 	MIN_WINDOW_WIDTH,
 	readWindowState,
+	toWindowBounds,
 	writeWindowState,
 } from "./window-state";
 
 const STUDIO_STARTUP_STATE_CHANNEL = "omp-studio:startup-state";
+const STUDIO_WINDOW_STATE_CHANNEL = "omp-studio:window-state-change";
 
 export interface StudioWindowCreateOptions {
 	/** Leave the window hidden so a `--hidden` launch starts in the tray. */
@@ -25,7 +34,6 @@ export class WindowManager {
 	#closeToQuit = false;
 	#saveTimer: NodeJS.Timeout | undefined;
 	#studioOrigin: string | undefined;
-	#cspInstalled = false;
 
 	constructor(readonly paths: DesktopPaths) {}
 
@@ -44,8 +52,13 @@ export class WindowManager {
 		);
 		const preloadPath = path.join(this.paths.packageRoot, "dist", "preload", "index.cjs");
 		const window = new BrowserWindow({
-			...state,
+			...toWindowBounds(state),
+			...resolveWindowChromeOptions(process.platform),
 			show: false,
+			// Fullscreen is a constructor option; maximize is not, so it is applied
+			// below. Both happen before the window is shown, so a restored window
+			// never visibly resizes itself on launch.
+			fullscreen: state.fullScreen === true,
 			minWidth: MIN_WINDOW_WIDTH,
 			minHeight: MIN_WINDOW_HEIGHT,
 			webPreferences: {
@@ -56,6 +69,7 @@ export class WindowManager {
 			},
 		});
 		this.#window = window;
+		if (state.maximized === true && state.fullScreen !== true) window.maximize();
 		window.webContents.once("preload-error", () => {
 			void dialog.showMessageBox(window, {
 				type: "error",
@@ -67,6 +81,17 @@ export class WindowManager {
 		this.#installNavigationPolicy(window);
 		window.on("move", () => this.#scheduleSave());
 		window.on("resize", () => this.#scheduleSave());
+		// The renderer draws the title bar, so it has to be told what the window did
+		// whenever the change came from anywhere but its own control buttons: a snap
+		// gesture, a double-click on the drag region, or the OS keyboard shortcuts.
+		const onChromeChange = (): void => {
+			this.#publishWindowState();
+			this.#scheduleSave();
+		};
+		window.on("maximize", onChromeChange);
+		window.on("unmaximize", onChromeChange);
+		window.on("enter-full-screen", onChromeChange);
+		window.on("leave-full-screen", onChromeChange);
 		// Minimize stays a real minimize: hiding it too leaves the taskbar and the
 		// window both empty, so the tray would be the only way back.
 		window.on("close", event => {
@@ -91,12 +116,24 @@ export class WindowManager {
 		window.webContents.send(STUDIO_STARTUP_STATE_CHANNEL, state);
 	}
 
-	/** Replace the splash with the Studio client and lock navigation to its origin. */
+	/**
+	 * Replace the splash with the Studio client and lock navigation to its origin.
+	 *
+	 * No Content-Security-Policy is injected here. The shell used to override the
+	 * server's header with a widened copy — `'unsafe-inline'` styles, `blob:` images,
+	 * cross-port `http://127.0.0.1:*` — and dropping `base-uri` and
+	 * `frame-ancestors` with it. The client needs none of that: its stylesheet is a
+	 * served file, it has no inline `<style>` and no `style` attributes in markup,
+	 * and it loads no blob images. Letting the server's header stand keeps the
+	 * desktop policy identical to the browser one, so a policy change is made in one
+	 * place and cannot silently apply to only one surface. The splash document is
+	 * `file://`, which never reaches a response-header hook, so it carries its own
+	 * stricter policy in a meta tag.
+	 */
 	async loadStudio(serverUrl: string): Promise<void> {
 		const window = this.#window;
 		if (!window || window.isDestroyed()) throw new Error(t("ipc.windowNotReady"));
 		const origin = new URL(serverUrl).origin;
-		this.#installContentSecurityPolicy(origin);
 		this.#studioOrigin = origin;
 		try {
 			await window.loadURL(serverUrl);
@@ -105,6 +142,46 @@ export class WindowManager {
 			// the window, or the splash could no longer report the failure.
 			this.#studioOrigin = undefined;
 			throw error;
+		}
+	}
+
+	/** What the renderer needs to draw the title bar for this window. */
+	get chromeState(): WindowChromeState {
+		const window = this.#window;
+		const live = window !== null && !window.isDestroyed();
+		return {
+			controlsInWindow: windowControlsAreDrawnInWindow(process.platform),
+			fullScreen: live && window.isFullScreen(),
+			maximized: live && window.isMaximized(),
+			platform: resolveWindowChromePlatform(process.platform),
+		};
+	}
+
+	/**
+	 * Run a window control the renderer asked for.
+	 *
+	 * `close` deliberately goes through `close()` rather than `destroy()`, so the
+	 * rendered close button behaves exactly like the OS one: hidden to the tray when
+	 * a tray exists, quitting when it does not.
+	 */
+	applyWindowControl(action: WindowControlAction): void {
+		const window = this.#window;
+		if (!window || window.isDestroyed()) throw new Error(t("ipc.windowNotReady"));
+		switch (action) {
+			case "minimize":
+				window.minimize();
+				return;
+			case "toggle-maximize":
+				// Leaving fullscreen first: a fullscreen window reports as maximized on
+				// some platforms, so toggling would otherwise be a no-op the user cannot
+				// escape without the keyboard.
+				if (window.isFullScreen()) window.setFullScreen(false);
+				else if (window.isMaximized()) window.unmaximize();
+				else window.maximize();
+				return;
+			case "close":
+				window.close();
+				return;
 		}
 	}
 
@@ -146,8 +223,24 @@ export class WindowManager {
 	}
 
 	async save(): Promise<void> {
-		if (!this.#window) return;
-		await writeWindowState(this.paths.windowStatePath, this.#window.getBounds());
+		const window = this.#window;
+		if (!window || window.isDestroyed()) return;
+		// Normal bounds, not current bounds: a window saved while maximized would
+		// otherwise restore to the display-filling size with nothing left to
+		// unmaximize to.
+		const maximized = window.isMaximized();
+		const fullScreen = window.isFullScreen();
+		await writeWindowState(this.paths.windowStatePath, {
+			...window.getNormalBounds(),
+			...(maximized ? { maximized: true } : {}),
+			...(fullScreen ? { fullScreen: true } : {}),
+		});
+	}
+
+	#publishWindowState(): void {
+		const window = this.#window;
+		if (!window || window.isDestroyed()) return;
+		window.webContents.send(STUDIO_WINDOW_STATE_CHANNEL, this.chromeState);
 	}
 
 	#scheduleSave(): void {
@@ -174,29 +267,6 @@ export class WindowManager {
 			} catch {}
 			event.preventDefault();
 			void this.openExternal(navigationUrl).catch(() => undefined);
-		});
-	}
-
-	#installContentSecurityPolicy(origin: string): void {
-		if (this.#cspInstalled) return;
-		this.#cspInstalled = true;
-		// Widened from the server's own header only by `'unsafe-inline'` for styles,
-		// which the Studio client still needs. The splash document carries its own
-		// stricter policy in a meta tag, because file:// responses never reach here.
-		session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-			if (details.url.startsWith(origin)) {
-				callback({
-					responseHeaders: {
-						...details.responseHeaders,
-						"Content-Security-Policy": [
-							"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-								"img-src 'self' data: blob:; connect-src 'self' ws://127.0.0.1:* http://127.0.0.1:*;",
-						],
-					},
-				});
-				return;
-			}
-			callback({ responseHeaders: details.responseHeaders });
 		});
 	}
 }

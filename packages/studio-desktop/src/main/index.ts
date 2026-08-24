@@ -20,6 +20,7 @@ import {
 import { t } from "./strings";
 import { type StudioServerProcess, smokeTestStudioSidecar, startStudioServer } from "./studio-server";
 import { TrayManager } from "./tray-manager";
+import { parseWindowControlAction } from "./window-chrome";
 import { WindowManager } from "./window-manager";
 
 const { hidden: startHidden, quitExisting, smokeTest } = parseStudioDesktopArgs(process.argv);
@@ -83,6 +84,20 @@ if (!hasLock) {
 			requireStudioSender(event);
 			if (typeof title !== "string" || typeof body !== "string") return;
 			new Notification({ title, body }).show();
+		});
+		// The window is frameless, so the title bar the client renders is the only
+		// chrome there is. These two channels are what make it a real title bar.
+		ipcMain.handle("omp-studio:window-state", event => {
+			requireStudioSender(event);
+			if (!windowManager) throw new Error(t("ipc.windowNotReady"));
+			return windowManager.chromeState;
+		});
+		ipcMain.handle("omp-studio:window-control", (event, action: unknown) => {
+			requireStudioSender(event);
+			const control = parseWindowControlAction(action);
+			if (control === undefined) throw new TypeError(t("ipc.windowActionRequired"));
+			if (!windowManager) throw new Error(t("ipc.windowNotReady"));
+			windowManager.applyWindowControl(control);
 		});
 		ipcMain.handle("omp-studio:startup-state", event => {
 			requireSplashSender(event);

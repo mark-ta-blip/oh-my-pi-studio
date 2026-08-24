@@ -3855,3 +3855,71 @@ textarea {
 		max-width: 108px;
 	}
 }
+
+/* Frameless desktop window chrome.
+   `studio-titlebar-chrome` is added by the title bar only when the Electron main
+   process reports a frameless window, so the browser-served client keeps the
+   title bar it has always had and none of the rules below can reach it. */
+.studio-titlebar-chrome {
+	/* With no OS title bar this element is the window's drag handle. Windows and
+	   macOS still draw their own caption buttons; the titlebar-area variables
+	   report the space those occupy, and the padding keeps the client's controls
+	   out from under them. The fallbacks apply on a plainly frameless window,
+	   where nothing is reserved. */
+	padding-left: env(titlebar-area-x, 0px);
+	padding-right: calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw));
+	-webkit-app-region: drag;
+}
+
+/* The macOS traffic lights sit on the left. The fallback approximates the
+   `hiddenInset` inset, so the app mark is never covered even if the environment
+   variables are unavailable. */
+.studio-titlebar-chrome.studio-titlebar-darwin {
+	padding-left: env(titlebar-area-x, 78px);
+}
+
+/* Every control has to opt out explicitly: a drag region swallows clicks on its
+   children unless they say otherwise. */
+.studio-titlebar-chrome a,
+.studio-titlebar-chrome button,
+.studio-titlebar-chrome input,
+.studio-titlebar-chrome select,
+.studio-titlebar-chrome .studio-window-controls {
+	-webkit-app-region: no-drag;
+}
+
+.studio-window-controls {
+	display: flex;
+	align-items: center;
+	gap: 0.1rem;
+	margin-left: 0.3rem;
+}
+
+.studio-desktop-shell .studio-titlebar-actions .studio-window-control {
+	width: 38px;
+	min-width: 38px;
+	height: 34px;
+	min-height: 34px;
+	align-items: center;
+	justify-content: center;
+	padding: 0;
+	border: 0 !important;
+	border-radius: 4px;
+	background: transparent !important;
+	color: #dcebe6;
+}
+
+.studio-desktop-shell .studio-titlebar-actions .studio-window-control:hover:not(:disabled) {
+	border-color: transparent !important;
+	background: #284446 !important;
+}
+
+.studio-desktop-shell .studio-titlebar-actions .studio-window-control-close:hover:not(:disabled) {
+	background: var(--studio-alert) !important;
+	color: #fff;
+}
+
+/* Caption buttons do not nudge on press the way the app's buttons do. */
+.studio-desktop-shell .studio-titlebar-actions .studio-window-control:active:not(:disabled) {
+	transform: none;
+}

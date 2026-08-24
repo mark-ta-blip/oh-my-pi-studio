@@ -25,16 +25,17 @@ Two decisions are fixed for this plan and constrain every phase below:
 ## What Exists Today
 
 Verified against the tree at the time of writing; `bun test` in
-`packages/studio-desktop` is 42 pass / 0 fail and `tsgo --noEmit` is clean.
+`packages/studio-desktop` is 106 pass / 0 fail and `tsgo --noEmit` is clean.
 
 | Area | State |
 | --- | --- |
 | Sidecar lifecycle | `omp studio --no-open --port 0` spawned as a child; ready line parsed and constrained to `127.0.0.1`; 30s timeout; abort on shutdown |
 | Startup diagnostics | Bounded stderr tail (20 lines / 400 chars), rotating log under `userData/logs`, error dialog carrying both |
-| Window | Framed `BrowserWindow`, `sandbox: true`, `contextIsolation: true`, geometry persisted and clamped to attached displays |
-| Navigation policy | Off-origin `will-navigate` and `window.open` deflected to the system browser; CSP injected via `onHeadersReceived` |
+| Window | Frameless `BrowserWindow` with native caption buttons on Windows and macOS, `sandbox: true`, `contextIsolation: true`, geometry, maximized, and fullscreen persisted and clamped to attached displays |
+| Window chrome | Client-rendered title bar: drag region, OS-reserved caption area kept clear, rendered controls only where the OS draws none |
+| Navigation policy | Off-origin `will-navigate` and `window.open` deflected to the system browser; the server's CSP header applies unmodified |
 | Tray | Show / Hide / Quit, with a fallback that maps close to quit when no tray could be created |
-| Preload surface | Three channels: `openExternal`, `selectWorkspace`, `notify` |
+| Preload surface | Six channels: `openExternal`, `selectWorkspace`, `notify`, `getWindowState`, `windowControl`, `onWindowStateChange` |
 | Packaging | `asar`, sidecar staged to `resources/omp-server/`, NSIS target, procedurally generated icons |
 | Release verification | `--smoke-test` starts the packaged sidecar, completes the token-to-cookie exchange, reads `/api/v1/bootstrap`, stops, exits |
 
@@ -49,8 +50,8 @@ Verified against the tree at the time of writing; `bun test` in
 | Startup feedback | Splash window with staged progress and byte counters | Blank until the sidecar is ready | Phase 8 |
 | Startup failure recovery | In-window retry with a source choice | Error dialog then `app.exit(1)` | Phase 8 |
 | Main-process localization | 589-line string table for dialogs, tray, splash | English literals inline | Phase 8 |
-| Window chrome | Frameless with a rendered titlebar; `hiddenInset` on macOS | OS frame | Phase 9 |
-| Window controls | IPC minimize / toggle-maximize / close plus state events | None | Phase 9 |
+| Window chrome | Frameless with a rendered titlebar; `hiddenInset` on macOS | Frameless with a rendered titlebar, native caption buttons kept | Phase 9 (done) |
+| Window controls | IPC minimize / toggle-maximize / close plus state events | IPC minimize / toggle-maximize / close plus state events | Phase 9 (done) |
 | Tray menu | Show/Hide toggle, updates, login reset, open-at-login, quit | Show, Hide, Quit | Phase 10 |
 | Notifications | Click focuses the window and routes to a validated path | Fire and forget | Phase 10 |
 | Text context menu | Copy / paste / select-all on right click | None | Phase 10 |
@@ -197,26 +198,68 @@ The smoke test still opens no window.
 
 ### Phase 9. Native window chrome
 
-Scope:
+Status: complete.
 
-- Frameless main window: `frame: false` with `titleBarOverlay` on Windows,
-  `titleBarStyle: "hiddenInset"` on macOS, plain frameless on Linux.
-- Extend `packages/studio/src/client/shell/titlebar.tsx` into the real window
-  chrome: drag region via `-webkit-app-region`, explicit no-drag on every
-  control, and minimize / maximize / close buttons that render only when
-  `window.ompStudio` is present.
-- IPC: `windowControl(action)` and `getWindowState()`, plus a main-to-renderer
-  `window-state-change` event for maximize / unmaximize / restore.
-- Persist and restore the maximized and fullscreen flags alongside the bounds
-  already handled by `window-state.ts`, keeping the display-clamp behaviour.
-- Reconcile the desktop CSP with the server's. `window-manager.ts` currently
-  overrides the server header and widens `style-src` with `'unsafe-inline'`.
-  Either the client stops needing inline styles and the override is dropped, or
-  the divergence is documented at the override with its reason.
+Done:
 
-Completion contract: dragging, double-click-to-maximize, snap, and the OS close
-gesture all behave natively on Windows and macOS; the browser-served client is
-unchanged when opened outside the desktop shell.
+- The main window is frameless. `titleBarStyle: "hidden"` with `titleBarOverlay` on
+  Windows, `hiddenInset` with the overlay enabled on macOS, plain `frame: false`
+  on Linux, resolved by platform in `src/main/window-chrome.ts`.
+- Windows and macOS keep their **native** caption buttons rather than rendered
+  imitations. That is what preserves the Windows 11 snap-layout flyout on maximize
+  hover and the macOS traffic lights, neither of which a custom button can offer.
+  The client renders its own three controls only where the OS draws none.
+- `packages/studio/src/client/shell/titlebar.tsx` is the window chrome now: the
+  header is the drag region, every anchor, button, input, and select inside it
+  opts out with `-webkit-app-region: no-drag`, and the caption-button area the OS
+  reserves is kept clear through the `titlebar-area-*` environment variables.
+  Double-click-to-maximize is native where the OS controls are; on a plainly
+  frameless window it is reproduced in the client, ignoring double-clicks that
+  landed on a control.
+- IPC `window-control` and `window-state`, plus a main-to-renderer
+  `window-state-change` event for maximize, unmaximize, and both fullscreen
+  transitions — so a snap gesture or an OS shortcut updates the rendered chrome.
+  `close` goes through `close()`, not `destroy()`, so the rendered button behaves
+  exactly like the OS one: to the tray when a tray exists, quit when it does not.
+- The maximized and fullscreen flags persist beside the bounds, and the saved size
+  is now `getNormalBounds()` rather than `getBounds()`, so unmaximizing after a
+  restart returns to where the user left the window.
+- The desktop CSP override is gone rather than documented. It had widened the
+  server's header with `'unsafe-inline'` styles, `blob:` images, and cross-port
+  `http://127.0.0.1:*`, and dropped `base-uri` and `frame-ancestors` along the
+  way. The client needs none of it, so the server's header — the stricter one — is
+  what applies on both surfaces, and a policy change now happens in one place.
+
+Measured, not assumed, against Electron 33 on Windows 11:
+
+- The chrome window's `getBounds()` equals its `getContentBounds()`, where a framed
+  window of the same size differs by 39px of caption and 8px of border. There is no
+  OS title bar left to draw over.
+- `navigator.windowControlsOverlay` reports visible with a 56px-tall title bar
+  area, matching `TITLEBAR_HEIGHT`. In a 900px window the caption buttons take the
+  rightmost 136px, and the client's padding rule computes to exactly `136px` — the
+  reserved space is right rather than guessed.
+- `-webkit-app-region` resolves to `drag` and `no-drag` from a served stylesheet
+  under `style-src 'self'`, so the drag regions need no CSP widening.
+- `getNormalBounds()` still reported the pre-maximize rectangle while the window
+  was maximized and while it was fullscreen; `getBounds()` reported the maximized
+  `-8,-8 1936x1048`. Persisting current bounds would have saved that overhang as
+  the restore size.
+- A CSSOM style write applies under `style-src 'self'` while the same value set as
+  a `style` attribute is blocked. That is the distinction that makes dropping
+  `'unsafe-inline'` a no-op here: the client's only runtime style write is the
+  composer's textarea height, and its markdown renderer escapes raw HTML, so no
+  style attribute ever reaches the DOM.
+
+Completion contract: the frameless window, the overlay geometry, and the restore
+bounds are measured above. The browser-served client is unchanged — every chrome
+behaviour hangs off classes and elements that appear only when `window.ompStudio`
+answers, and a shell that does not answer leaves the title bar exactly as it was.
+
+Not covered: dragging, snapping, and the OS close gesture are native behaviours of
+the resolved options rather than shell code, and were not driven by hand in a
+window this environment can display. macOS resolves to `hiddenInset` but has not
+run.
 
 ### Phase 10. Operating-system integration
 
@@ -466,5 +509,7 @@ Windows orphan the phase was written for is masked by the sidecar runtime's job
 objects — but the POSIX leak was real, the tree walk removes the dependency on
 undocumented runtime behaviour, and the shell now has a graceful stop that works
 on Windows. Phase 8 is complete too, and turned up a real shutdown defect in
-`packages/studio` on the way. Phase 9 is next.
+`packages/studio` on the way. Phase 9 is complete: the window is frameless, the
+client draws its own title bar, and the desktop stopped keeping a second, weaker
+copy of the browser surface's Content-Security-Policy. Phase 10 is next.
 

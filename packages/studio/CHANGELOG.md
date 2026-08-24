@@ -16,6 +16,10 @@
 - Added the Phase 4 supervised OMP RPC session lifecycle, durable run state, tab-scoped session control, prompt/cancel endpoints, and live event-stream UI.
 - Added Phase 5 tool approval cards, browser-safe subagent and usage summaries, and lease-gated approval decisions.
 - Added Phase 6 reconnect cursors with bounded replay/resync recovery, stale-lease clearing on restart, and a paginated local audit review ledger.
+- Added window chrome to the Studio title bar for the desktop shell: a drag
+  region, an area kept clear for the caption buttons the OS draws, and minimize,
+  maximize, and close buttons where it draws none. The browser-served client is
+  unaffected — none of it renders unless the desktop shell answers for it.
 
 ### Changed
 

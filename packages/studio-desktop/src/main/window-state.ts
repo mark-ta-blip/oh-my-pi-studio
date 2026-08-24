@@ -1,8 +1,25 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-/** Persisted window geometry. Position is optional so Electron can center a fresh window. */
+/**
+ * Persisted window geometry and chrome flags.
+ *
+ * Position is optional so Electron can center a fresh window. The size is always
+ * the *restored* size: a maximized or fullscreen window records the bounds it
+ * would return to, so unmaximizing after a restart lands where the user left it
+ * rather than on the display-filling bounds.
+ */
 export interface WindowState {
+	width: number;
+	height: number;
+	x?: number;
+	y?: number;
+	maximized?: boolean;
+	fullScreen?: boolean;
+}
+
+/** The subset `BrowserWindow` accepts as constructor geometry. */
+export interface WindowBounds {
 	width: number;
 	height: number;
 	x?: number;
@@ -51,6 +68,21 @@ export function parseWindowState(raw: string): WindowState {
 		height: value.height,
 		...(isValidOffset(value.x) ? { x: value.x } : {}),
 		...(isValidOffset(value.y) ? { y: value.y } : {}),
+		// Absent and non-boolean both mean "restore a normal window": a flag that
+		// survives as garbage would open the app in a state the user cannot see the
+		// cause of.
+		...(value.maximized === true ? { maximized: true } : {}),
+		...(value.fullScreen === true ? { fullScreen: true } : {}),
+	};
+}
+
+/** Strip the chrome flags, leaving what `BrowserWindow` takes as geometry. */
+export function toWindowBounds(state: WindowState): WindowBounds {
+	return {
+		width: state.width,
+		height: state.height,
+		...(state.x === undefined ? {} : { x: state.x }),
+		...(state.y === undefined ? {} : { y: state.y }),
 	};
 }
 
@@ -83,11 +115,16 @@ function intersection(a: DisplayArea, b: DisplayArea): DisplayArea | undefined {
  * restored offscreen: visible to Electron, unreachable for the user, and — with
  * close mapped to hide — impossible to recover from. Unreachable positions are
  * dropped so Electron centers the window instead, and the size is capped to the
- * display it lands on.
+ * display it lands on. The chrome flags pass through untouched: maximizing and
+ * fullscreen apply to whichever display the window ends up on.
  */
 export function clampWindowStateToDisplays(state: WindowState, displays: readonly DisplayArea[]): WindowState {
 	if (displays.length === 0) return state;
 	const { x, y } = state;
+	const flags = {
+		...(state.maximized === undefined ? {} : { maximized: state.maximized }),
+		...(state.fullScreen === undefined ? {} : { fullScreen: state.fullScreen }),
+	};
 	const host =
 		x === undefined || y === undefined
 			? undefined
@@ -102,5 +139,5 @@ export function clampWindowStateToDisplays(state: WindowState, displays: readonl
 		width: Math.max(MIN_WINDOW_WIDTH, Math.min(state.width, bounds.width)),
 		height: Math.max(MIN_WINDOW_HEIGHT, Math.min(state.height, bounds.height)),
 	};
-	return host === undefined ? size : { ...size, x, y };
+	return host === undefined ? { ...size, ...flags } : { ...size, x, y, ...flags };
 }

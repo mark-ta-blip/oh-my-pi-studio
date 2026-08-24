@@ -1,9 +1,25 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, type IpcRendererEvent, ipcRenderer } from "electron";
+
+const WINDOW_STATE_CHANGE_CHANNEL = "omp-studio:window-state-change";
 
 const api = {
 	openExternal: (url: string): Promise<void> => ipcRenderer.invoke("omp-studio:open-external", url),
 	selectWorkspace: (): Promise<string | null> => ipcRenderer.invoke("omp-studio:select-workspace"),
 	notify: (title: string, body: string): Promise<void> => ipcRenderer.invoke("omp-studio:notify", title, body),
+	getWindowState: (): Promise<unknown> => ipcRenderer.invoke("omp-studio:window-state"),
+	windowControl: (action: string): Promise<void> => ipcRenderer.invoke("omp-studio:window-control", action),
+	/**
+	 * Subscribe to window state the client did not cause: a snap gesture, a
+	 * double-click on the drag region, or an OS shortcut. Returns the unsubscribe so
+	 * a remounting title bar cannot accumulate listeners.
+	 */
+	onWindowStateChange: (listener: (state: unknown) => void): (() => void) => {
+		const handler = (_event: IpcRendererEvent, state: unknown): void => listener(state);
+		ipcRenderer.on(WINDOW_STATE_CHANGE_CHANNEL, handler);
+		return () => {
+			ipcRenderer.off(WINDOW_STATE_CHANGE_CHANNEL, handler);
+		};
+	},
 };
 
 /**
