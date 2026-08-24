@@ -25,7 +25,7 @@ Two decisions are fixed for this plan and constrain every phase below:
 ## What Exists Today
 
 Verified against the tree at the time of writing; `bun test` in
-`packages/studio-desktop` is 106 pass / 0 fail and `tsgo --noEmit` is clean.
+`packages/studio-desktop` is 183 pass / 0 fail and `tsgo --noEmit` is clean.
 
 | Area | State |
 | --- | --- |
@@ -34,7 +34,8 @@ Verified against the tree at the time of writing; `bun test` in
 | Window | Frameless `BrowserWindow` with native caption buttons on Windows and macOS, `sandbox: true`, `contextIsolation: true`, geometry, maximized, and fullscreen persisted and clamped to attached displays |
 | Window chrome | Client-rendered title bar: drag region, OS-reserved caption area kept clear, rendered controls only where the OS draws none |
 | Navigation policy | Off-origin `will-navigate` and `window.open` deflected to the system browser; the server's CSP header applies unmodified |
-| Tray | Show / Hide / Quit, with a fallback that maps close to quit when no tray could be created |
+| Tray | Show/Hide toggle, open at login, open log folder, quit; rebuilt on visibility change, with a fallback that maps close to quit when no tray could be created |
+| OS integration | Windows AUMID set, no application menu off macOS, right-click text and link menu, notifications that focus the window on click, deny-by-default permission handler |
 | Preload surface | Six channels: `openExternal`, `selectWorkspace`, `notify`, `getWindowState`, `windowControl`, `onWindowStateChange` |
 | Packaging | `asar`, sidecar staged to `resources/omp-server/`, NSIS target, procedurally generated icons |
 | Release verification | `--smoke-test` starts the packaged sidecar, completes the token-to-cookie exchange, reads `/api/v1/bootstrap`, stops, exits |
@@ -52,11 +53,11 @@ Verified against the tree at the time of writing; `bun test` in
 | Main-process localization | 589-line string table for dialogs, tray, splash | English literals inline | Phase 8 |
 | Window chrome | Frameless with a rendered titlebar; `hiddenInset` on macOS | Frameless with a rendered titlebar, native caption buttons kept | Phase 9 (done) |
 | Window controls | IPC minimize / toggle-maximize / close plus state events | IPC minimize / toggle-maximize / close plus state events | Phase 9 (done) |
-| Tray menu | Show/Hide toggle, updates, login reset, open-at-login, quit | Show, Hide, Quit | Phase 10 |
-| Notifications | Click focuses the window and routes to a validated path | Fire and forget | Phase 10 |
-| Text context menu | Copy / paste / select-all on right click | None | Phase 10 |
-| Media permission gate | Handler restricted to trusted renderers; macOS prompt | Default handler | Phase 10 |
-| Open at login | `setLoginItemSettings` with `--hidden` | None | Phase 10 |
+| Tray menu | Show/Hide toggle, updates, login reset, open-at-login, quit | Show/Hide toggle, open-at-login, log folder, quit | Phase 10 (done) |
+| Notifications | Click focuses the window and routes to a validated path | Click shows and focuses the window | Phase 10 (done); route in Phase 14 |
+| Text context menu | Copy / paste / select-all on right click | Cut / copy / paste / select-all / copy link | Phase 10 (done) |
+| Media permission gate | Handler restricted to trusted renderers; macOS prompt | Deny-by-default handler, empty allowlist | Phase 10 (done) |
+| Open at login | `setLoginItemSettings` with `--hidden` | `setLoginItemSettings` with `--hidden` | Phase 10 (done) |
 | Managed CLI shims | `hermes-studio`, `… cli`, `… web`, `…-mcp` on PATH | None | Phase 11 |
 | Runtime storage choice | User-selectable root, version manifest, migrate/repair | Fixed `resources/omp-server` | Phase 11 |
 | Multi-platform release | 5-target matrix with per-platform artifact globs | Windows only | Phase 12 |
@@ -263,24 +264,71 @@ run.
 
 ### Phase 10. Operating-system integration
 
-Scope:
+Status: complete, with one item moved to Phase 14.
 
-- Tray menu: Show/Hide with a label that reflects window visibility, Open at
-  login (checkbox), Open log folder, Quit. Keep the existing no-tray fallback.
-- `app.setAppUserModelId` on Windows so notifications carry app identity;
-  `Menu.setApplicationMenu(null)` off macOS.
-- Notifications: `notify` gains an optional target that must validate against an
-  allowlisted internal route. Clicking focuses the window and navigates there.
-  Hold a reference until close so the notification is not collected early.
-- Text selection context menu (copy / paste / select all / copy link).
-- Permission handler that denies every permission by default and allows only
-  what a named phase has enabled for a renderer this shell created. Phase 17
-  is what opens microphone access; until then the handler denies it.
-- Open at login registers `process.execPath` with `--hidden` from Phase 7.
+Done:
 
-Completion contract: every OS affordance is reachable without the main window
-visible, and a permission request from an unexpected renderer is denied with a
-test that proves it.
+- Tray menu: a single Show/Hide item whose label reflects whether a window is on
+  screen, an Open-at-login checkbox, Open log folder, and Quit. Two separate
+  Show and Hide items meant one of them was always a no-op with nothing in the
+  menu to say which. The menu is rebuilt whenever the window's visibility
+  changes, so it cannot describe a state the window has left. The existing
+  no-tray fallback is unchanged.
+- Open at login registers `process.execPath` with `--hidden` from Phase 7, so a
+  login start goes to the tray instead of taking the foreground on every boot.
+  The checkbox is omitted where it could not work: Linux, where Electron writes
+  no login item at all, and any unpackaged run, where the registered executable
+  would be Electron rather than Studio.
+- `app.setAppUserModelId` on Windows. A notification is attributed to an AUMID,
+  not to a process, so without it a toast is labelled with the Electron
+  executable and cannot be muted or found under OMP Studio. A test compares the
+  constant against `appId` in `electron-builder.yml`, since a mismatch is
+  invisible at runtime and silently drops every toast.
+- `Menu.setApplicationMenu(null)` off macOS. A frameless window that draws its
+  own title bar has no use for a menu bar above it; macOS keeps its menu, which
+  is where that platform's Cmd+C, Cmd+V, and Cmd+Q live.
+- Notifications are no longer fire-and-forget: clicking one shows and focuses the
+  window, restoring it first if it was minimized. Each notification is held until
+  it closes — one collected while still on screen takes its click handler with it.
+  Title and body are now validated and bounded rather than only type-checked:
+  control characters stripped, titles collapsed to one line, and both truncated,
+  because the OS draws them outside any window the shell controls.
+- Right-click menu for text and links: cut, copy, paste, and select-all as roles
+  so they carry the OS's own labels, plus Copy link address. Items appear only
+  when they would do something, and a click that would produce an empty menu
+  shows none. Off macOS there is no application menu, so this is the only route
+  to copy and paste, not a convenience. Link URLs go through the same validator
+  as an external launch: copying a `javascript:` or `file:` URL is the first half
+  of an attack that ends with the user pasting it somewhere that runs it.
+- Permission handler that denies everything. Electron's default allows most
+  requests, so a document in the shell could have reached the microphone or the
+  clipboard read API with no code here having decided. Both the request handler
+  and the check handler are installed — the latter answers
+  `navigator.permissions.query`, which would otherwise report a permission as
+  granted that the request handler is about to refuse. The allowlist is empty and
+  a test asserts it: Phase 17 is what adds `media`, and the test fails if a
+  permission is granted without a phase behind it.
+
+Moved to Phase 14: the notification's *validated target route*. Clicking focuses
+the window, which is the half that was broken. Routing to a path needs paths, and
+the client has no router at all — Phase 14 already owns creating one. Adding an
+allowlist of routes now would validate against a set with exactly one member, the
+app root, and navigating there means reloading the whole client.
+
+Measured, not assumed: `Menu.buildFromTemplate` accepts both resolved templates on
+Electron 33, the four edit roles come back labelled by the OS rather than blank,
+the tray icon loads and `setContextMenu` is accepted, and `getApplicationMenu()`
+reads null after the call. Unit tests cover the tray labels and ordering, the
+context-menu rules, the login-item settings per platform, the notification bounds,
+and the permission denials.
+
+Completion contract: with no window on screen the tray reaches show, open at
+login, the log folder, and quit. A permission request from a renderer this shell
+did not create is denied by `permissions.test.ts`, which asserts it for every
+permission Chromium currently defines plus an unknown one.
+
+Not covered: no automated run clicks a real toast, and the Windows AUMID
+attribution can only be confirmed against an installed build, not a dev run.
 
 ## Track B — Distribution and Runtime Management
 
@@ -376,6 +424,9 @@ Scope:
 - A client route for a single session. The client currently has no router at
   all, so this is a real prerequisite, not a detail: pick hash routing or a
   query parameter, and make session selection survive a reload in both.
+- The notification target Phase 10 deferred: `notify` gains an optional route,
+  validated in the main process against the routes this phase creates, and
+  clicking the notification lands on it rather than only focusing the window.
 - An always-on-top companion window (transparent, frameless, `skipTaskbar`)
   showing live run state for the active session.
 
@@ -511,5 +562,7 @@ undocumented runtime behaviour, and the shell now has a graceful stop that works
 on Windows. Phase 8 is complete too, and turned up a real shutdown defect in
 `packages/studio` on the way. Phase 9 is complete: the window is frameless, the
 client draws its own title bar, and the desktop stopped keeping a second, weaker
-copy of the browser surface's Content-Security-Policy. Phase 10 is next.
+copy of the browser surface's Content-Security-Policy. Phase 10 is complete, which
+finishes Track A — the shell's OS surface is now deny-by-default for permissions
+and every tray affordance works with no window on screen. Phase 11 opens Track B.
 

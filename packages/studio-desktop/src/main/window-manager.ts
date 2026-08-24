@@ -1,7 +1,10 @@
 import * as path from "node:path";
-import { BrowserWindow, dialog, screen, shell } from "electron";
+import { BrowserWindow, clipboard, dialog, Menu, screen, session, shell } from "electron";
+import { resolveStudioContextMenu } from "./context-menu";
 import { resolveExternalHttpUrl } from "./external-url";
+import { isStudioIpcSender } from "./ipc-sender";
 import type { DesktopPaths } from "./paths";
+import { isStudioPermissionAllowed } from "./permissions";
 import type { StudioStartupState } from "./startup-state";
 import { t } from "./strings";
 import {
@@ -34,8 +37,20 @@ export class WindowManager {
 	#closeToQuit = false;
 	#saveTimer: NodeJS.Timeout | undefined;
 	#studioOrigin: string | undefined;
+	#visibilityListener: (() => void) | undefined;
 
 	constructor(readonly paths: DesktopPaths) {}
+
+	/**
+	 * Watch for the window being shown or hidden.
+	 *
+	 * The tray menu names the action it offers, so it has to be rebuilt when the
+	 * window's visibility changes for any reason — including a close that was
+	 * turned into a hide.
+	 */
+	onVisibilityChange(listener: () => void): void {
+		this.#visibilityListener = listener;
+	}
 
 	/**
 	 * Open the window before the sidecar is spawned, showing the splash.
@@ -79,8 +94,12 @@ export class WindowManager {
 			});
 		});
 		this.#installNavigationPolicy(window);
+		this.#installPermissionPolicy();
+		this.#installContextMenu(window);
 		window.on("move", () => this.#scheduleSave());
 		window.on("resize", () => this.#scheduleSave());
+		window.on("show", () => this.#visibilityListener?.());
+		window.on("hide", () => this.#visibilityListener?.());
 		// The renderer draws the title bar, so it has to be told what the window did
 		// whenever the change came from anywhere but its own control buttons: a snap
 		// gesture, a double-click on the drag region, or the OS keyboard shortcuts.
@@ -194,9 +213,20 @@ export class WindowManager {
 		return this.#window;
 	}
 
+	/** Whether a window is on screen, which is what the tray menu's label reflects. */
+	get visible(): boolean {
+		const window = this.#window;
+		return window !== null && !window.isDestroyed() && window.isVisible();
+	}
+
 	show(): void {
-		this.#window?.show();
-		this.#window?.focus();
+		const window = this.#window;
+		if (!window || window.isDestroyed()) return;
+		// A minimized window is still "visible" to Electron, so showing it without
+		// restoring first leaves it in the taskbar and looks like nothing happened.
+		if (window.isMinimized()) window.restore();
+		window.show();
+		window.focus();
 	}
 
 	hide(): void {
@@ -267,6 +297,53 @@ export class WindowManager {
 			} catch {}
 			event.preventDefault();
 			void this.openExternal(navigationUrl).catch(() => undefined);
+		});
+	}
+
+	/**
+	 * Deny every OS permission that no phase has enabled.
+	 *
+	 * Electron's default handler allows most requests, so without this a document in
+	 * the shell could reach the microphone or the clipboard read API on its own say-so.
+	 * Both handlers are needed: the request handler answers `getUserMedia` and
+	 * friends, and the check handler answers `navigator.permissions.query`, which
+	 * would otherwise report a permission as granted that the request handler is
+	 * about to refuse.
+	 */
+	#installPermissionPolicy(): void {
+		session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+			callback(
+				isStudioPermissionAllowed({
+					fromStudioRenderer: isStudioIpcSender(webContents, this.#window),
+					permission,
+				}),
+			);
+		});
+		session.defaultSession.setPermissionCheckHandler((webContents, permission) =>
+			isStudioPermissionAllowed({
+				fromStudioRenderer: webContents !== null && isStudioIpcSender(webContents, this.#window),
+				permission,
+			}),
+		);
+	}
+
+	/**
+	 * Right-click menu for text and links.
+	 *
+	 * The window is frameless and, off macOS, has no application menu, so there is no
+	 * other route to copy and paste. The menu contents are resolved as data, and
+	 * nothing is shown at all when a click would produce an empty menu.
+	 */
+	#installContextMenu(window: BrowserWindow): void {
+		window.webContents.on("context-menu", (_event, params) => {
+			const items = resolveStudioContextMenu(params);
+			if (items.length === 0) return;
+			const template = items.map(item => {
+				if (item.kind === "separator") return { type: "separator" as const };
+				if (item.kind === "role") return { role: item.role };
+				return { label: item.label, click: () => clipboard.writeText(item.url) };
+			});
+			Menu.buildFromTemplate(template).popup({ window });
 		});
 	}
 }

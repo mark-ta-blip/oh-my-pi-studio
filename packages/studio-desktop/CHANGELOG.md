@@ -23,6 +23,14 @@
   minimize, maximize, and close from the client instead. New `windowControl`,
   `getWindowState`, and `onWindowStateChange` channels back it, and the maximized
   and fullscreen states now persist across restarts.
+- Added a right-click menu for text and links — cut, copy, paste, select all, and
+  copy link address. Off macOS the app has no menu bar, so this is the only route
+  to copy and paste.
+- Added Open at login to the tray, registering OMP Studio to start hidden in the
+  tray. Offered only where Electron can register a login item, so not on Linux and
+  not from an unpackaged run.
+- Added Open log folder to the tray menu, and made the Show/Hide entry a single
+  item whose label follows whether a window is on screen.
 
 ### Changed
 
@@ -34,11 +42,22 @@
 - Changed the saved window size to the restored size rather than the current one.
   Quitting from a maximized window used to persist the display-filling bounds, so
   unmaximizing after a restart had nothing smaller to return to.
+- Changed notifications to open the app when clicked. They were fire-and-forget, so
+  a toast about a finished run led nowhere; clicking one now shows and focuses the
+  window, restoring it first if it was minimized.
+- Changed OMP Studio to register its Windows application identity, so notifications
+  are attributed to OMP Studio instead of to the Electron executable.
+- Changed notification content to be bounded and stripped of control characters
+  rather than only type-checked. The OS draws it outside any window the shell
+  controls.
 
 ### Removed
 
 - Removed the unused `electron-updater` dependency. OMP Studio Desktop has no
   update feed and users update by installing a new release.
+- Removed the application menu off macOS, where a frameless window that draws its
+  own title bar has no use for a menu bar. macOS keeps its menu, which is where
+  that platform's Cmd+C, Cmd+V, and Cmd+Q live.
 - Removed the desktop Content-Security-Policy override. It replaced the server's
   header with a copy widened by `'unsafe-inline'` styles, `blob:` images, and
   cross-port `http://127.0.0.1:*`, and dropped `base-uri` and `frame-ancestors`
@@ -60,3 +79,7 @@
 
 - Desktop IPC channels now reject calls from any renderer other than the OMP
   Studio window.
+- OMP Studio now denies every OS permission request. Electron allows most of them
+  by default, so a document inside the shell could previously reach the microphone,
+  geolocation, or the clipboard read API without the shell deciding. Nothing is
+  granted yet; a permission will be added only by the feature that needs it.

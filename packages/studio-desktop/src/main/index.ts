@@ -5,11 +5,14 @@ import {
 	dialog,
 	type IpcMainInvokeEvent,
 	ipcMain,
+	Menu,
 	Notification,
 	type OpenDialogOptions,
 } from "electron";
+import { APP_USER_MODEL_ID, loginItemsAreSupported, resolveLoginItemSettings } from "./app-identity";
 import { isStudioQuitRequest, parseStudioDesktopArgs } from "./instance-args";
 import { isStudioIpcSender } from "./ipc-sender";
+import { parseNotificationContent } from "./notification-content";
 import { createDesktopPaths, resolveTrayIconPath } from "./paths";
 import {
 	describeError,
@@ -38,6 +41,36 @@ if (!hasLock) {
 	let startupState: StudioStartupState = { kind: "progress", stage: "locating" };
 	let startupInFlight: Promise<void> | undefined;
 	let shutdownStarted = false;
+	/**
+	 * Notifications still on screen.
+	 *
+	 * A `Notification` that is garbage collected while displayed takes its click
+	 * handler with it, so activating it does nothing. Holding a reference until it
+	 * closes is what makes clicking reliable.
+	 */
+	const liveNotifications = new Set<Notification>();
+
+	/**
+	 * Whether OMP Studio is registered to start at login.
+	 *
+	 * Only offered from a packaged app: an unpackaged run would register the Electron
+	 * binary with no project path, so login would start something that is not Studio.
+	 */
+	function loginItemsAvailable(): boolean {
+		return app.isPackaged && loginItemsAreSupported(process.platform);
+	}
+
+	function readOpenAtLogin(): boolean {
+		if (!loginItemsAvailable()) return false;
+		const probe = resolveLoginItemSettings(process.platform, process.execPath, true);
+		return app.getLoginItemSettings({ path: probe.path, args: probe.args }).openAtLogin;
+	}
+
+	function setOpenAtLogin(enabled: boolean): void {
+		if (!loginItemsAvailable()) return;
+		app.setLoginItemSettings(resolveLoginItemSettings(process.platform, process.execPath, enabled));
+		trayManager?.refresh();
+	}
 
 	function publishStartupState(state: StudioStartupState): void {
 		startupState = state;
@@ -80,10 +113,21 @@ if (!hasLock) {
 			const result = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
 			return result.canceled ? null : (result.filePaths[0] ?? null);
 		});
-		ipcMain.handle("omp-studio:notify", (event, title: string, body: string) => {
+		ipcMain.handle("omp-studio:notify", (event, title: unknown, body: unknown) => {
 			requireStudioSender(event);
-			if (typeof title !== "string" || typeof body !== "string") return;
-			new Notification({ title, body }).show();
+			const content = parseNotificationContent(title, body);
+			if (!content || !Notification.isSupported()) return;
+			const notification = new Notification({ title: content.title, body: content.body });
+			liveNotifications.add(notification);
+			const forget = (): void => {
+				liveNotifications.delete(notification);
+			};
+			// Clicking a notification about a finished run has to reach the window it
+			// is about, including when that window is hidden in the tray or minimized.
+			notification.on("click", () => windowManager?.show());
+			notification.on("close", forget);
+			notification.on("failed", forget);
+			notification.show();
 		});
 		// The window is frameless, so the title bar the client renders is the only
 		// chrome there is. These two channels are what make it a real title bar.
@@ -235,14 +279,32 @@ if (!hasLock) {
 				}
 				return;
 			}
+			// Windows attributes notifications to an AUMID rather than to a process, and
+			// off macOS there is no use for an application menu above a frameless window
+			// that draws its own title bar. Both are set before the window exists, so
+			// there is no menu bar to flash and no toast without an identity.
+			if (process.platform === "win32") app.setAppUserModelId(APP_USER_MODEL_ID);
+			if (process.platform !== "darwin") Menu.setApplicationMenu(null);
 			windowManager = new WindowManager(paths);
 			installIpc();
 			await windowManager.createShell({ hidden: startHidden });
-			trayManager = new TrayManager(
-				windowManager,
-				() => void app.quit(),
-				resolveTrayIconPath(paths, app.isPackaged),
-			);
+			const studioWindow = windowManager;
+			trayManager = new TrayManager({
+				iconPath: resolveTrayIconPath(paths, app.isPackaged),
+				state: () => ({
+					loginItemsSupported: loginItemsAvailable(),
+					openAtLogin: readOpenAtLogin(),
+					windowVisible: studioWindow.visible,
+				}),
+				actions: {
+					hide: () => studioWindow.hide(),
+					openLogFolder: () => studioWindow.openLogFolder(),
+					quit: () => void app.quit(),
+					setOpenAtLogin,
+					show: () => studioWindow.show(),
+				},
+			});
+			windowManager.onVisibilityChange(() => trayManager?.refresh());
 			if (!trayManager.available) {
 				// No tray means no way to reopen a hidden window, so close has to
 				// quit instead. See the window-all-closed handler above. A --hidden
