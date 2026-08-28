@@ -419,6 +419,133 @@ export interface StudioAuditListResponse {
 	nextBeforeId?: number;
 }
 
+/** Phase 15: Terminal session metadata (PTY owned by Studio server, bytes never cross boundary) */
+export interface StudioTerminalSession {
+	id: string;
+	studioSessionId: string;
+	workspaceId: string;
+	title: string;
+	status: "active" | "closed" | "error";
+	createdAtMs: number;
+	cols: number;
+	rows: number;
+}
+
+/** Phase 15: Terminal output chunk — size-capped, ephemeral streaming */
+export interface StudioTerminalOutput {
+	terminalId: string;
+	studioSessionId: string;
+	sequence: number;
+	data: string;
+	truncated: boolean;
+}
+
+/** Phase 15: Terminal resize — client→server only */
+export interface StudioTerminalResize {
+	terminalId: string;
+	studioSessionId: string;
+	cols: number;
+	rows: number;
+}
+
+/** Phase 16: Browser tab metadata — no cookies, storage, or raw page content */
+export interface StudioBrowserTab {
+	id: string;
+	studioSessionId: string;
+	profileId: string;
+	title: string;
+	url: string;
+	status: "loading" | "active" | "crashed" | "closed";
+	agentGranted: boolean;
+	createdAtMs: number;
+}
+
+/** Phase 16: Browser navigation — every URL audited; agent commands via IPC-only */
+export interface StudioBrowserNavigation {
+	tabId: string;
+	studioSessionId: string;
+	url: string;
+	transitionType: "user" | "agent" | "reload" | "back" | "forward";
+	timestampMs: number;
+}
+
+/** Phase 16: Browser screenshot — bounded artifact with size cap (≤512 KiB) */
+export interface StudioBrowserScreenshot {
+	tabId: string;
+	studioSessionId: string;
+	mimeType: "image/png" | "image/jpeg" | "image/webp";
+	data: string; // base64
+	sizeBytes: number;
+	capturedAtMs: number;
+}
+
+/** Phase 16: Browser agent grant — per-tab, immediate revocation, no cookie/storage access */
+export interface StudioBrowserGrant {
+	tabId: string;
+	studioSessionId: string;
+	grantedTo: "agent" | "user";
+	grantedAtMs: number;
+	revokedAtMs?: number;
+	revokedBy?: "user" | "navigate" | "profile-switch" | "data-clear";
+}
+
+/** Phase 17: Voice turn — text only, follows transcript projection */
+export interface StudioVoiceTurn {
+	id: string;
+	studioSessionId: string;
+	runId: string;
+	role: "user" | "assistant";
+	text: string;
+	status: "streaming" | "completed" | "failed" | "interrupted";
+	createdAtMs: number;
+}
+
+/** Phase 17: Voice audio buffer — ephemeral, desktop-only, discarded after STT unless explicit save */
+export interface StudioVoiceAudio {
+	studioSessionId: string;
+	sequence: number;
+	mimeType: string; // audio/*
+	data: string; // base64
+	durationMs: number;
+	isFinal: boolean;
+}
+
+/** Phase 18: Workflow graph — authored in desktop shell, executed against real runs */
+export interface StudioWorkflowGraph {
+	id: string;
+	studioSessionId: string;
+	name: string;
+	nodes: StudioWorkflowNode[];
+	edges: StudioWorkflowEdge[];
+	status: "idle" | "running" | "completed" | "failed" | "cancelled";
+	createdAtMs: number;
+	updatedAtMs: number;
+}
+
+/** Phase 18: Workflow node — per-node state observable in inspector */
+export interface StudioWorkflowNode {
+	id: string;
+	graphId: string;
+	type: "prompt" | "tool" | "approval" | "subagent" | "merge";
+	label: string;
+	status: "idle" | "running" | "completed" | "failed" | "cancelled";
+	position: { x: number; y: number };
+	inputs: Record<string, unknown>;
+	outputs: Record<string, unknown>;
+	startedAtMs?: number;
+	updatedAtMs: number;
+}
+
+/** Phase 18: Workflow edge — semantics projected, not raw DSL */
+export interface StudioWorkflowEdge {
+	id: string;
+	graphId: string;
+	source: string;
+	target: string;
+	type: "sequence" | "parallel" | "conditional";
+	condition?: string;
+}
+
 export interface StudioSessionCreateRequest {
 	workspaceId: string;
 	provider: string;
@@ -552,7 +679,19 @@ export type StudioEventType =
 	| "approval.resolved"
 	| "subagent.state"
 	| "usage.updated"
-	| "auth.progress";
+	| "auth.progress"
+	| "terminal.session"
+	| "terminal.output"
+	| "terminal.resize"
+	| "browser.tab"
+	| "browser.navigation"
+	| "browser.screenshot"
+	| "browser.grant"
+	| "voice.turn"
+	| "voice.audio"
+	| "workflow.graph"
+	| "workflow.node"
+	| "workflow.edge";
 
 export interface StudioEventEnvelope<TData = unknown> {
 	version: typeof STUDIO_API_VERSION;

@@ -95,6 +95,35 @@ path. The completed tool-card, plan, change-review, and history slices continue
 that rule: every field is typed, bounded, and projected on the server before it
 is persisted or sent to the browser.
 
+**Phase 13 extension — new data classes admitted through the boundary:**
+
+| Data Class | Wire Type | Transport | Gate | Persistence | Rationale |
+|---|---|---|---|---|---|
+| Terminal session metadata | `StudioTerminalSession` | REST + WS `terminal.session` | `OMP_STUDIO_DESKTOP` env + dedicated cookie scope | Durable | User-opened terminal is a first-class session surface; PTY bytes never cross |
+| Terminal output chunk | `StudioTerminalOutput` | WS `terminal.output` (ephemeral) | `OMP_STUDIO_DESKTOP` env + dedicated cookie scope | Ephemeral (streaming only, not persisted) | Raw PTY byte stream required for terminal rendering; bounded by chunk size cap |
+| Terminal resize | `StudioTerminalResize` | WS `terminal.resize` (client→server) | `OMP_STUDIO_DESKTOP` env + dedicated cookie scope | Ephemeral | User-driven resize must reach the PTY owner (Studio server) |
+| Browser tab metadata | `StudioBrowserTab` | REST + WS `browser.tab` | `OMP_STUDIO_DESKTOP` env + IPC-only channel for agent commands | Durable | Tab lifecycle visible to user; agent navigation commands never reach browser |
+| Browser navigation | `StudioBrowserNavigation` | WS `browser.navigation` | `OMP_STUDIO_DESKTOP` env + IPC-only channel for agent commands | Durable (audit only) | Every URL audited; screenshot is bounded artifact, not raw page content |
+| Browser screenshot | `StudioBrowserScreenshot` | REST `GET /api/v1/browser/tabs/:id/screenshot` | `OMP_STUDIO_DESKTOP` env + size-capped response (≤512 KiB) | Ephemeral (not persisted) | Bounded artifact with explicit size cap; agent never receives cookies/storage |
+| Browser agent grant | `StudioBrowserGrant` | WS `browser.grant` | `OMP_STUDIO_DESKTOP` env + IPC-only channel | Durable | Per-tab grant/revocation visible; take-over is immediate |
+| Voice turn (transcript) | `StudioVoiceTurn` | REST + WS `voice.turn` | `OMP_STUDIO_DESKTOP` env + dedicated cookie scope | Durable | Transcript is text — follows existing transcript projection |
+| Voice audio buffer | `StudioVoiceAudio` | WS `voice.audio` (ephemeral, desktop-only) | `OMP_STUDIO_DESKTOP` env + dedicated cookie scope + IPC-only | Ephemeral (discarded after STT unless explicit save) | Audio never persists by default; renderer capture → server STT → text |
+| Workflow graph | `StudioWorkflowGraph` | REST + WS `workflow.graph` | `OMP_STUDIO_DESKTOP` env + dedicated cookie scope | Durable | Graph authored in desktop shell; per-node state projected to inspector |
+| Workflow node | `StudioWorkflowNode` | REST (embedded in graph) | `OMP_STUDIO_DESKTOP` env + dedicated cookie scope | Durable | Per-node state observable in existing inspector |
+| Workflow edge | `StudioWorkflowEdge` | REST (embedded in graph) | `OMP_STUDIO_DESKTOP` env + dedicated cookie scope | Durable | Edge semantics projected, not raw DSL |
+
+**Categorical exclusions — never admitted, no exception:**
+
+| Category | Rationale |
+|---|---|
+| Provider secrets / credential material (API keys, OAuth tokens, passwords, certificate private keys) | Credentials belong exclusively to OMP runtime; Studio brokers UI steps only |
+| OMP native session paths / internal file references | Session identity is opaque `studioSessionId`; native paths never cross |
+| Raw tool arguments, tool output, native tool names | Already excluded; tool cards use fixed `kind` enum + bounded metadata |
+| Native provider payloads (raw LLM request/response bodies) | Provider protocol is OMP-internal; Studio projects only bounded summaries |
+| Arbitrary filesystem paths (absolute or project-escaping) | Only project-relative paths in change review; workspace root resolved server-side |
+| Cookies, localStorage, sessionStorage from browser profiles | Agent never receives profile storage; profile switch revokes all grants |
+| Unbounded blobs (full page HTML, raw audio, full terminal scrollback) | Every admitted class has a size cap or chunked streaming contract |
+
 ## Presentation Contract Roadmap
 
 ### Activity Timeline
@@ -131,6 +160,43 @@ server resolves a registered workspace ID, uses the central coding-agent Git
 helper, and returns only validated project-relative files and bounded diff data.
 Studio does not spawn Git directly or expose a general filesystem API.
 
+### Terminal (Phase 15)
+
+`StudioTerminalSession` represents a user-opened terminal bound to a workspace.
+It is created, streamed, resized, and destroyed through the Studio server.
+The PTY byte stream (`StudioTerminalOutput`) flows over a capped WebSocket
+channel; the server enforces a per-chunk size limit and a session-wide byte
+budget. Resize (`StudioTerminalResize`) is a client→server WS message. Killing
+the sidecar kills its PTYs. Every terminal event appears in the audit ledger
+at per-session granularity with `detail: { terminalId, workspaceId, action }`.
+
+### Browser (Phase 16)
+
+`StudioBrowserTab` represents a tab in a named profile (separate `Session`
+partition). Navigation (`StudioBrowserNavigation`) emits the URL to the audit
+ledger; the agent drives navigation via an IPC-only channel that never reaches
+the browser client. Screenshots (`StudioBrowserScreenshot`) are bounded artifacts
+with a hard size cap (≤512 KiB), requested via REST. Agent grants
+(`StudioBrowserGrant`) are per-tab, revoked immediately on user take-over,
+navigate, profile switch, or data clear. The agent never receives cookies or
+storage from any profile.
+
+### Voice (Phase 17)
+
+`StudioVoiceTurn` is the transcript projection of a spoken turn — text only,
+following the existing transcript pipeline. `StudioVoiceAudio` is an ephemeral
+desktop-only WebSocket stream from renderer microphone capture to server STT;
+the audio buffer is discarded after transcription unless the user explicitly
+saves it. Denying microphone permission degrades to text with a clear reason.
+
+### Workflow Canvas (Phase 18)
+
+`StudioWorkflowGraph` / `StudioWorkflowNode` / `StudioWorkflowEdge` form a
+node graph authored in the desktop shell. The graph is persisted and executed
+against real Studio runs. Per-node state is observable in the existing inspector
+via the same projection pipeline. This phase amends the workbench plan's
+non-goal list (workflow canvases were explicitly out of scope).
+
 ## Delivery Phases
 
 | Phase | Scope | Completion contract |
@@ -142,8 +208,9 @@ Studio does not spawn Git directly or expose a general filesystem API.
 | 4. Change review | Change-set API, Git summary, changed-file list, diff preview | Users can review project changes before the next instruction |
 | 5. Recovery and history | Session search, run history, interrupted recovery, usage/activity views | Restart and event resync never create ghost state or auto-replay work |
 | 6. Desktop release | Platform assets, packaging CI, signing/update policy, native smoke coverage | Windows-first packaged Studio starts and shuts down its matched OMP sidecar |
+| 13. Presentation boundary revision | **This phase** — admits new data classes for Track C with gates, exclusions, redaction test updates, audit granularity | Updated safety-boundary section, data-ownership table, redaction test suite encoding the new line. Reviewed and merged before Phase 14 opens. |
 
-Phases 0 through 3 are the initial workbench release. Workflow canvases,
+Phases 0 through 6 are the initial workbench release. Workflow canvases,
 embedded terminal sessions, direct editing, and multi-agent rooms remain out
 of scope until the workbench contracts have proven stable.
 
@@ -177,6 +244,8 @@ complexity.
   Studio SQLite indefinitely.
 - Desktop release work must use the existing sidecar smoke contract and test a
   packaged platform-matched OMP executable.
+- **Redaction regression tests are updated in the same change as any boundary
+  revision, never after it.**
 
 ## Current Slice
 
