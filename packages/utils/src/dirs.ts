@@ -4,6 +4,12 @@
  * Uses PI_CONFIG_DIR (default ".omp") for the config root and
  * PI_CODING_AGENT_DIR to override the agent directory.
  *
+ * OMP_CONFIG_ROOT overrides the config root with an absolute path (e.g. the
+ * OMP Studio desktop shell points the sidecar at <stateRoot>/omp). It wins
+ * over PI_CONFIG_DIR, is ignored when empty or not absolute, and does not
+ * touch HOME — git/ssh and other home-anchored lookups keep working for
+ * processes omp spawns.
+ *
  * On Linux, if XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME environment
  * variables are set, paths are redirected to XDG-compliant locations under
  * $XDG_*_HOME/omp/. This requires running `omp config migrate` first to
@@ -106,7 +112,15 @@ function readProfileFromEnvSafe(): string | undefined {
 	}
 }
 
+/**
+ * Base config root (~/.omp, or the PI_CONFIG_DIR name under home, or the
+ * absolute OMP_CONFIG_ROOT override when it is set and absolute). Every
+ * profile root, the Studio directory, the install id, and the global daemon
+ * runtime dir derive from this.
+ */
 function getBaseConfigRoot(): string {
+	const override = process.env.OMP_CONFIG_ROOT?.trim();
+	if (override && path.isAbsolute(override)) return path.resolve(override);
 	return path.join(os.homedir(), getConfigDirName());
 }
 

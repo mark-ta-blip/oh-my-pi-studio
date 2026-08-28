@@ -4,11 +4,6 @@
   "workspaces": {
     "": {
       "name": "omp",
-      "dependencies": {
-        "sherpa-onnx": "1.13.2",
-        "sherpa-onnx-darwin-arm64": "1.13.3",
-        "sherpa-onnx-node": "1.13.2",
-      },
       "devDependencies": {
         "@biomejs/biome": "catalog:",
         "@types/bun": "catalog:",
@@ -1626,8 +1621,6 @@
     "shebang-command": ["shebang-command@2.0.0", "", { "dependencies": { "shebang-regex": "^3.0.0" } }, "sha512-kHxr2zZpYtdmrN1qDjrrX/Z1rR1kG8Dx+gkpK1G4eXmvXswmcE1hTWBWYUzlraYw1/yZp6YuDY77YtvbN0dmDA=="],
 
     "shebang-regex": ["shebang-regex@3.0.0", "", {}, "sha512-7++dFhtcx3353uBaq8DDR4NuxBetBzC7ZQOhmTQInHEd6bSrXdiEyzCvG07Z44UYdLShWUyXt5M/yhz8ekcb1A=="],
-
-    "sherpa-onnx": ["sherpa-onnx@1.13.2", "", {}, "sha512-hheOLl4JlOzERco73u+1Q/LaNDdFChDe4r3+IlMYIO3wggBZrReHDSxWwRUIW+YLw3eLslyiXw/hfb75aOylEA=="],
 
     "sherpa-onnx-darwin-arm64": ["sherpa-onnx-darwin-arm64@1.13.3", "", { "os": "darwin", "cpu": "arm64" }, "sha512-9x86Cbf+BDFONdtCPM3cnjvtAW0ER8tMaHK5pVfz+SHPt8GeuwRXaiR/BzcByFBUyxCgmceO09/WMZOCi44P/g=="],
 

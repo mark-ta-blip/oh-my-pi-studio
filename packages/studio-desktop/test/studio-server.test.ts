@@ -4,9 +4,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Readable } from "node:stream";
+import { createDesktopPaths } from "../src/main/paths";
 import type { ProcessTreeControl } from "../src/main/process-tree";
 import { openSidecarLogSink } from "../src/main/sidecar-log";
-import { StudioSidecarStartupError, superviseStudioSidecar } from "../src/main/studio-server";
+import { StudioSidecarStartupError, studioServerEnvironment, superviseStudioSidecar } from "../src/main/studio-server";
 
 type FakeSidecar = childProcess.ChildProcessByStdio<null, Readable, Readable>;
 
@@ -269,4 +270,20 @@ test("appends to a sidecar log that is still under its size cap", async () => {
 	await logSink.close();
 
 	expect(await fs.readFile(logPath, "utf8")).toBe("previous run\ncurrent run\n");
+});
+
+test("pins the sidecar environment contract", () => {
+	const paths = createDesktopPaths("/state", "/default", "/resources", "/pkg", undefined);
+	const base = { paths, packaged: true };
+
+	const plain = studioServerEnvironment(base);
+	expect(plain.OMP_STUDIO_DESKTOP).toBe("1");
+	expect(plain.OMP_STUDIO_DESKTOP_SMOKE).toBeUndefined();
+	expect(plain.OMP_CONFIG_ROOT).toBeUndefined();
+
+	const smoke = studioServerEnvironment({ ...base, smoke: true });
+	expect(smoke.OMP_STUDIO_DESKTOP_SMOKE).toBe("1");
+
+	const relocated = studioServerEnvironment({ ...base, configRoot: "/state/omp" });
+	expect(relocated.OMP_CONFIG_ROOT).toBe("/state/omp");
 });

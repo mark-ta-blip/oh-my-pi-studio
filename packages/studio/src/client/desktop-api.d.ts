@@ -5,6 +5,11 @@ interface OmpStudioDesktopApi {
 	openExternal(url: string): Promise<void>;
 	selectWorkspace(): Promise<string | null>;
 	windowControl(action: string): Promise<void>;
+	getDesktopRuntime(): Promise<unknown>;
+	relocateState(): Promise<unknown>;
+	resetStateRoot(): Promise<unknown>;
+	repairSidecar(): Promise<unknown>;
+	installShims(): Promise<unknown>;
 }
 
 interface Window {

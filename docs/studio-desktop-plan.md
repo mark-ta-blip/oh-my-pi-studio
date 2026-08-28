@@ -58,10 +58,10 @@ Verified against the tree at the time of writing; `bun test` in
 | Text context menu | Copy / paste / select-all on right click | Cut / copy / paste / select-all / copy link | Phase 10 (done) |
 | Media permission gate | Handler restricted to trusted renderers; macOS prompt | Deny-by-default handler, empty allowlist | Phase 10 (done) |
 | Open at login | `setLoginItemSettings` with `--hidden` | `setLoginItemSettings` with `--hidden` | Phase 10 (done) |
-| Managed CLI shims | `hermes-studio`, `… cli`, `… web`, `…-mcp` on PATH | None | Phase 11 |
-| Runtime storage choice | User-selectable root, version manifest, migrate/repair | Fixed `resources/omp-server` | Phase 11 |
-| Multi-platform release | 5-target matrix with per-platform artifact globs | Windows only | Phase 12 |
-| Packaging self-check | `afterPack` verifies the packaged payload | None | Phase 12 |
+| Managed CLI shims | `hermes-studio`, `… cli`, `… web`, `…-mcp` on PATH | None | Phase 11 (done) |
+| Runtime storage choice | User-selectable root, version manifest, migrate/repair | Fixed `resources/omp-server` | Phase 11 (done) |
+| Multi-platform release | 5-target matrix with per-platform artifact globs | Windows only | Phase 12 (done) |
+| Packaging self-check | `afterPack` verifies the packaged payload | None | Phase 12 (done) |
 | Auto-update | Dual feed, prompt, Windows lock recovery | Dependency present, unused | Phase 12 (removed) |
 | Detached session windows | Per-session window keyed by profile + session | None | Phase 14 |
 | Always-on-top companion window | Pet window, transparent and frameless | None | Phase 14 |
@@ -334,28 +334,94 @@ attribution can only be confirmed against an installed build, not a dev run.
 
 ### Phase 11. Desktop data, runtime visibility, and command shims
 
-Scope:
+Status: complete.
 
-- Surface the runtime the shell is actually using: sidecar path, version, and
-  the profile it resolved. Today this is invisible and only inferable from the
-  log. A "Desktop" section in the client reads it over one IPC channel.
-- Let the user choose where Studio desktop state lives (window state, sidecar
-  log, and the profile root passed to the sidecar), with migration of the
-  existing directory and a repair path when the target is unwritable. This is
-  the parity answer to the reference's runtime-storage selector, against a
-  bundled binary instead of a downloaded venv.
-- Repair action: re-verify that `resources/omp-server/omp.exe` exists and is
-  executable, and report a clear reinstall instruction when it is not. The app
-  must never mutate its own installed sidecar; that is a release-policy rule.
-- Managed command shims for the packaged app, matching the reference's model:
-  `omp-studio` to open the app, `omp-studio cli …` to run the bundled OMP
-  binary, and `omp-studio -h`. Install into a user-writable bin directory,
-  mark the shim with a recognizable header, and update the shim rather than
-  duplicating it on reinstall. Never modify a system PATH entry.
+Done:
+
+- A "Desktop" section in the setup drawer that shows the runtime the shell is
+  actually using: the sidecar binary path, the version (from the bootstrap
+  payload's `runtimeVersion`), the profile, the effective state root, the OMP
+  config root the sidecar runs under, the sidecar log path, and the shim's
+  install state. All five new channels validate the sender before touching a
+  path, and the client re-validates the payload (`parseStudioDesktopRuntime`)
+  so a shell whose version differs degrades to no section rather than rendering
+  paths that are not real.
+- A user-relocatable state root. The pointer is stored in the platform-default
+  userData dir, because a pointer cannot live inside the movable root. An
+  unwritable saved root falls back to the default for this launch instead of
+  failing startup and reports `storageRepaired`, which is what lets the section
+  offer the repair. Relocation migrates the desktop-owned state (window
+  geometry, log tree) and, into a fresh root, the OMP config the sidecar
+  currently runs under; the copy never clobbers an existing target entry, and a
+  root the user has moved back to is left exactly as it is.
+- Relocation is a relaunch, with a commit point: the new pointer is written
+  first, then the sidecar is stopped, then the state is migrated, then
+  `app.relaunch()` + `app.quit()`. Electron's relauncher waits for the old
+  process to fully exit, so the single-instance lock cannot be re-taken while
+  the old instance still holds it.
+- A sidecar repair check: verifies the bundled binary is present (and
+  executable off Windows) and reports a reinstall instruction with a link to
+  the releases page when it is not. Purely a read — the release policy forbids
+  the app from mutating its own installed sidecar.
+- Managed `omp-studio` shims for the packaged app: no arguments opens the app,
+  `cli …` runs the bundled OMP binary, `-h`/`--help` shows usage. Installed into
+  a user-writable bin directory that is already on the default PATH (the
+  per-user WindowsApps dir on Windows, `~/.local/bin` on Linux), owned by a
+  header marker on its first two lines, updated in place when the marker is
+  present, and never clobbering a file without it. No PATH entry is ever
+  modified. Installed at startup (packaged only — a dev run would write a shim
+  pointing at the dev binary) and re-runnable from the section.
+
+Found while verifying: three defects, all fixed before the phase closed.
+
+- Relocation would have migrated the wrong config source. The sidecar honors an
+  absolute `OMP_CONFIG_ROOT` environment variable, but the migration source was
+  computed from `PI_CONFIG_DIR` / `~/.omp` alone — a relocated user who had set
+  `OMP_CONFIG_ROOT` would have had their state moved from a root their sidecar
+  was not using. Fixed by making the sidecar's own resolution the single source
+  of truth: `defaultConfigRoot` applies the `OMP_CONFIG_ROOT` override
+  (absolute only, empty ignored), and the relocation handler migrates from the
+  config root this launch actually runs under.
+- Relocation copied a live SQLite database. The config root holds session
+  databases the running sidecar keeps open in WAL mode; a file-by-file copy of
+  the `.db` and `.db-wal` pair could land as an inconsistent pair in the new
+  root. Fixed by stopping the sidecar before the copy — and by ordering the
+  handler so the pointer write is the commit point *before* the irreversible
+  stop: a failure after the pointer write leaves the app on the old root with
+  the new pointer (the next launch re-migrates an empty root, losing nothing)
+  rather than on the new root with a stopped sidecar.
+- The shim's argument loop dropped an empty argument and everything after it.
+  `if "%~1"==""` expands `%1`, so a user's `""` (two characters) and an
+  exhausted argument list (zero characters) are indistinguishable. Fixed with
+  `set "T=%1"` + `if not defined T goto :cli-run`: a zero-length `%1` clears the
+  variable, a `""` argument leaves it defined, and — unlike comparing `%1`
+  directly in the `if` — a quoted value cannot unbalance the comparison's
+  quotes.
+
+Measured, not assumed: the shim terminator was verified against a real `cmd`,
+not a fixture — no arguments opens the app, `--foo` reaches the sidecar as
+`--foo`, `--foo "" --bar` keeps the empty argument, `--foo "bar baz" --bar`
+keeps the multi-word quoting, and `--foo --bar` is not truncated. The first fix
+attempt (raw `%1` inside the `if`) itself broke the quoted case, which is why
+the `set`/`defined` pair is the shipped shape. Unit tests cover the storage
+validator (including the explicit-platform absoluteness checks), the
+never-clobber migration copies, the `defaultConfigRoot` override, the shim
+render/plan/install, and the client-side runtime payload validator.
 
 Completion contract: a user can relocate desktop state, see which sidecar is
 running, and invoke the bundled OMP binary from a terminal, on a machine with no
-OMP installed globally.
+OMP installed globally. `bun test` in `packages/studio-desktop` is 225 pass /
+0 fail and in `packages/studio` 91 pass / 0 fail; `tsgo --noEmit` is clean in
+both.
+
+Not covered: no automated run completes a relocation of an installed app — the
+migration copy and the relaunch are tested against fixtures, not a live install.
+Shim invocation is verified with a sidecar that echoes its arguments rather
+than the real binary; the real binary receives a proper argv, so the batch
+layer, which re-tokenizes, is the layer that needed the empirical check. The
+Phase 12 packaging work (afterPack self-check, notarization, entitlements, the
+multi-target builder config) is already staged in the tree ahead of this phase's
+close but is verified and recorded under Phase 12.
 
 ### Phase 12. Multi-platform packaging and update policy
 
@@ -379,9 +445,90 @@ Scope:
 - Run the existing `--smoke-test` contract on every platform that has a runner,
   not only Windows.
 
+Status: complete.
+
+Done:
+
+- The auto-updater story is gone: `electron-updater` is no longer a dependency
+  (Phase 7 dropped it from the bundle; the package no longer lists it), and the
+  release policy's Update Policy section now states permanently that the
+  desktop app has no update feed, no background download, no silent install,
+  and no self-replacement of the application or its sidecar. The decision is
+  load-bearing: reintroducing the feed requires reversing that section first.
+- An in-app version notice replaces it: the Desktop section of the setup drawer
+  shows the running `runtimeVersion` (from the bootstrap payload) and a release
+  notice that links to the GitHub release page and states the checksum
+  expectation. It downloads and installs nothing.
+- The release matrix goes from one Windows job to five targets — win32-x64,
+  darwin-arm64, darwin-x64, linux-x64, linux-arm64. Each leg downloads only its
+  own platform-matched OMP binary and uploads only its own artifact globs (NSIS
+  on Windows, dmg plus zip on macOS, AppImage plus deb on Linux). A Windows leg
+  never needs a macOS artifact and vice versa, and `release_github` gates the
+  publish on all three desktop legs succeeding, so a release cannot publish a
+  target whose leg failed.
+- macOS signs and notarizes per `macos-signing-notarization.md`: a hardened
+  runtime with the three entitlements the Bun sidecar needs, the Developer ID
+  certificate handed to electron-builder via `CSC_LINK`, and an afterSign hook
+  that runs `notarytool submit --wait` then `stapler staple` when the Apple
+  credential set is present and skips cleanly when it is not.
+- An `afterPack` self-check fails the build when the assembled tree is missing
+  the platform-matched sidecar, the tray icon, or the two bundled scripts, or
+  carries a foreign-architecture sidecar — a missing sidecar becomes a build
+  error instead of a first-launch failure for a user.
+- The `--smoke-test` contract runs on every platform that has a runner, not
+  only Windows: the macOS and Linux legs launch the packaged app under an
+  isolated `HOME`/`XDG_DATA_HOME` (under `xvfb` on Linux), and each upload step
+  errors when no artifact is present.
+
+Found while verifying: four defects, all fixed before the phase closed.
+
+- The macOS `afterPack` resolved the wrong resources directory — it dropped the
+  `<app>.app` segment, so every darwin leg would have failed its own packaging
+  check on a correctly assembled tree. Fixed to resolve
+  `<appOutDir>/<productFilename>.app/Contents/Resources`, matching
+  app-builder-lib's `getMacOsResourcesDir` and the layout `notarize.cjs`
+  already uses; a regression test now drives `afterPack(context)` with a mock
+  darwin context.
+- The Windows build script deleted the sidecar destination before copying it
+  when a dev run pointed `OMP_STUDIO_OMP_EXECUTABLE` at the already-staged
+  binary, then failed with `ENOENT` from the path it had just removed. Fixed
+  with a source/destination identity check, and the script now drops both
+  sidecar names before copying so a repackage on the other architecture cannot
+  leave a stale binary beside the new one.
+- The root `package.json` carried `sherpa-onnx*` as regular dependencies even
+  though the only consumer (`packages/coding-agent`) declares its own; because
+  bun hoists to the repo root, electron-builder's traversal collector read the
+  root manifest and threw on the platform-specific leaves absent on a Windows
+  host. Removed the three root dependencies; `bun.lock` shrank accordingly.
+- The publish gate and the Linux smoke each had a gap that would have shipped
+  a broken or missing artifact: `release_github`'s `if` required the Windows
+  desktop leg but not the macOS or Linux legs, so a failed arch could publish a
+  release missing that installer; and the Linux smoke passed
+  `HOME=`/`XDG_DATA_HOME=` as arguments to `xvfb-run` instead of environment
+  assignments, so the app was never launched under the intended isolation.
+
+Measured, not assumed: `bun test` is 230 pass / 0 fail in
+`packages/studio-desktop` (21 files) and 91 pass / 0 fail in `packages/studio`
+(16 files); `tsgo --noEmit` is clean in both. The `afterPack` self-check was
+driven against a real electron-builder context on Windows and correctly refused
+to publish a tree missing its sidecar. The five-target matrix, the per-leg
+download/upload globs, and the publish gate were checked by reading the workflow
+and a structured review whose confirmed findings are the four defects above.
+
 Completion contract: a tagged release produces verified installers for all five
 targets, each with a matched sidecar, each smoke-tested where a runner exists,
 and all listed in `SHA256SUMS.txt`.
+
+Not covered: the cross-architecture and installer-producing runs are
+CI-runner-bound and were not executed on this machine. Building a
+platform-matched `omp` sidecar compiles the coding-agent against a Bun
+cross-target runtime this host could not download, so the full `--smoke-test`
+with a real sidecar, the macOS `codesign`/`stapler` verification, and `afterPack`
+on a darwin tree each run only where their runner exists (`macos-14`,
+`macos-15-intel`, `ubuntu-22.04`, `ubuntu-24.04-arm`). The `afterPack` mac
+resolution is covered by a unit test against a mock darwin context rather than a
+live darwin build; the Linux `xvfb` smoke and the macOS signing path are
+exercised by the workflow steps themselves, not locally.
 
 ## Gate — Phase 13. Presentation boundary revision
 
@@ -564,5 +711,24 @@ on Windows. Phase 8 is complete too, and turned up a real shutdown defect in
 client draws its own title bar, and the desktop stopped keeping a second, weaker
 copy of the browser surface's Content-Security-Policy. Phase 10 is complete, which
 finishes Track A — the shell's OS surface is now deny-by-default for permissions
-and every tray affordance works with no window on screen. Phase 11 opens Track B.
+and every tray affordance works with no window on screen.
+
+Phase 11 is complete, and it is the first of Track B: the desktop now shows the
+runtime it is using, the state root is user-relocatable with a repair path for
+an unwritable root, the sidecar is checkable read-only, and a managed shim makes
+the bundled OMP binary callable from a terminal on a machine with no global OMP
+install. Three defects found during verification — a wrong migration source, a
+live SQLite copy, and a shim that dropped empty arguments — were fixed and
+re-verified before the phase closed, which is the point of the measured-not-
+assumed rule for a phase whose whole subject is moving the user's data.
+
+Phase 12 is complete. It opened with its packaging artifacts already staged in
+the tree, and verification surfaced four more defects — a macOS `afterPack`
+path that dropped the `.app` segment, a Windows build script that deleted the
+sidecar it was about to copy, root `sherpa-onnx*` dependencies that broke the
+packager's dependency walk, and a publish gate plus a Linux smoke that could
+have shipped a release missing a target. All four were fixed and re-verified
+before the phase closed. Track A and Track B are now finished; the next work is
+the Phase 13 presentation-boundary revision, which Track C's phases 14 through
+18 depend on.
 

@@ -64,6 +64,8 @@ export interface StudioServerLaunchOptions {
 	readyTimeoutMs?: number;
 	signal?: AbortSignal;
 	smoke?: boolean;
+	/** The OMP config root the sidecar runs under (sets OMP_CONFIG_ROOT). Absent = the sidecar's default. */
+	configRoot?: string;
 	/** Injected in tests so the termination contract is verifiable off-platform. */
 	processTree?: ProcessTreeControl;
 }
@@ -84,11 +86,17 @@ function serverExecutable(paths: DesktopPaths): string {
 	return path.join(paths.serverResourceDir, process.platform === "win32" ? "omp.exe" : "omp");
 }
 
-function studioServerEnvironment(options: StudioServerLaunchOptions): NodeJS.ProcessEnv {
+/**
+ * The environment a supervised sidecar runs in. Exported so tests can pin the
+ * contract: the desktop marker is always set, the smoke marker only for smoke,
+ * and OMP_CONFIG_ROOT only when a relocated config root was chosen.
+ */
+export function studioServerEnvironment(options: StudioServerLaunchOptions): NodeJS.ProcessEnv {
 	return {
 		...process.env,
 		OMP_STUDIO_DESKTOP: "1",
 		...(options.smoke ? { OMP_STUDIO_DESKTOP_SMOKE: "1" } : {}),
+		...(options.configRoot ? { OMP_CONFIG_ROOT: options.configRoot } : {}),
 	};
 }
 

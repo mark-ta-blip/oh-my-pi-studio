@@ -603,6 +603,10 @@ textarea {
 	color: #a6452c;
 }
 
+.studio-inline-notice {
+	color: #3d6b4f;
+}
+
 .studio-message p {
 	margin: 0;
 	color: #263336;
@@ -737,7 +741,8 @@ textarea {
 }
 
 .studio-inline-error,
-.studio-app-error {
+.studio-app-error,
+.studio-inline-notice {
 	margin: 0;
 	font-size: 0.76rem;
 	line-height: 1.4;
@@ -1564,6 +1569,7 @@ textarea {
 }
 
 .studio-drawer-section .studio-inline-error,
+.studio-drawer-section .studio-inline-notice,
 .studio-session-requirement {
 	margin-top: 0.65rem;
 }
@@ -1657,6 +1663,62 @@ textarea {
 .studio-desktop-shell .studio-provider-state-authenticated,
 .studio-desktop-shell .studio-provider-state-keyless {
 	color: #25705e;
+}
+
+.studio-desktop-shell .studio-desktop-runtime {
+	display: grid;
+	grid-template-columns: max-content minmax(0, 1fr);
+	gap: 0.3rem 0.72rem;
+	margin: 0 0 0.72rem;
+}
+
+.studio-desktop-shell .studio-desktop-runtime dt {
+	color: var(--studio-muted);
+	font-size: 0.66rem;
+	font-weight: 660;
+	letter-spacing: 0.03em;
+	text-transform: uppercase;
+}
+
+.studio-desktop-shell .studio-desktop-runtime dd {
+	overflow: hidden;
+	margin: 0;
+	font-size: 0.74rem;
+	font-variant-numeric: tabular-nums;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.studio-desktop-shell .studio-desktop-runtime-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.4rem;
+	margin-bottom: 0.72rem;
+}
+
+.studio-desktop-shell .studio-desktop-runtime-actions button {
+	padding: 0 0.6rem;
+	border-color: #b7d4ce;
+	background: #f2faf7;
+	color: #166b60;
+	font-size: 0.72rem;
+}
+
+.studio-desktop-shell .studio-desktop-release-notice {
+	padding-top: 0.1rem;
+}
+
+.studio-desktop-shell .studio-desktop-release-notice p {
+	margin: 0;
+	color: var(--studio-muted);
+	font-size: 0.7rem;
+	line-height: 1.45;
+}
+
+.studio-desktop-shell .studio-desktop-release-notice a {
+	color: #2a645e;
+	font-weight: 620;
+	text-underline-offset: 2px;
 }
 
 .studio-desktop-shell .studio-provider-row > button,

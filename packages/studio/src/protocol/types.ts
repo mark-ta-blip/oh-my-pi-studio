@@ -23,6 +23,8 @@ export interface StudioBootstrap {
 	apiVersion: typeof STUDIO_API_VERSION;
 	mode: "local-single-user";
 	profile: string;
+	/** The OMP runtime version the running sidecar reports about itself. */
+	runtimeVersion: string;
 	features: StudioFeatures;
 }
 

@@ -55,6 +55,7 @@ import { type StudioInspectorResource, studioInspectorDemand } from "./inspector
 import { StudioSessionRail } from "./navigation/session-rail";
 import { mergeStudioPlanSummary } from "./plan-state";
 import { isActiveRun, isTerminalRunStatus, mergeStudioSessionSnapshot, reconcileStudioSession } from "./session-state";
+import { useStudioDesktopRuntime } from "./shell/desktop-runtime";
 import { type StudioConnectionState, StudioTitlebar } from "./shell/titlebar";
 import { getStudioThinkingPicker, getStudioThinkingVariantModel } from "./thinking-variants";
 import { mergeStudioToolDisplaySnapshot, upsertStudioToolDisplay } from "./tool-display-state";
@@ -1675,6 +1676,101 @@ export function App(): ReactNode {
 		}
 	}, [registerWorkspacePath, workspacePending, workspacePickerPending]);
 
+	/** Relocation and reset both end in a relaunch, so nothing else can race them. */
+	const [desktopSectionOpen, setDesktopSectionOpen] = useState(false);
+	const [desktopRelaunching, setDesktopRelaunching] = useState(false);
+	const [desktopActionError, setDesktopActionError] = useState<string | null>(null);
+	const [desktopActionNotice, setDesktopActionNotice] = useState<string | null>(null);
+	const [desktopRelocatePending, setDesktopRelocatePending] = useState(false);
+	const [desktopResetPending, setDesktopResetPending] = useState(false);
+	const [desktopRepairPending, setDesktopRepairPending] = useState(false);
+	const [desktopShimPending, setDesktopShimPending] = useState(false);
+	const desktopRuntime = useStudioDesktopRuntime();
+
+	const openDesktopReleases = useCallback((): void => {
+		const desktopApi = window.ompStudio;
+		if (!desktopApi) return;
+		void desktopApi.openExternal("https://github.com/can1357/oh-my-pi/releases").catch(() => undefined);
+	}, []);
+
+	const relocateDesktopState = useCallback(async (): Promise<void> => {
+		const desktopApi = window.ompStudio;
+		if (!desktopApi || desktopRelocatePending) return;
+		setDesktopActionError(null);
+		setDesktopActionNotice(null);
+		setDesktopRelocatePending(true);
+		try {
+			const result = await desktopApi.relocateState();
+			if (result && typeof result === "object" && (result as { status?: unknown }).status === "relaunching") {
+				setDesktopRelaunching(true);
+			}
+		} catch (reason) {
+			setDesktopActionError(reason instanceof Error ? reason.message : "Relocation failed.");
+		} finally {
+			setDesktopRelocatePending(false);
+		}
+	}, [desktopRelocatePending]);
+
+	const resetDesktopState = useCallback(async (): Promise<void> => {
+		const desktopApi = window.ompStudio;
+		if (!desktopApi || desktopResetPending) return;
+		setDesktopActionError(null);
+		setDesktopActionNotice(null);
+		setDesktopResetPending(true);
+		try {
+			const result = await desktopApi.resetStateRoot();
+			if (result && typeof result === "object" && (result as { status?: unknown }).status === "relaunching") {
+				setDesktopRelaunching(true);
+			}
+		} catch (reason) {
+			setDesktopActionError(reason instanceof Error ? reason.message : "Reset failed.");
+		} finally {
+			setDesktopResetPending(false);
+		}
+	}, [desktopResetPending]);
+
+	const repairSidecar = useCallback(async (): Promise<void> => {
+		const desktopApi = window.ompStudio;
+		if (!desktopApi || desktopRepairPending) return;
+		setDesktopActionError(null);
+		setDesktopActionNotice(null);
+		setDesktopRepairPending(true);
+		try {
+			const result = await desktopApi.repairSidecar();
+			if (!result || typeof result !== "object" || (result as { ok?: unknown }).ok !== true) {
+				const message =
+					result && typeof result === "object" && typeof (result as { message?: unknown }).message === "string"
+						? (result as { message: string }).message
+						: "The bundled OMP runtime is missing.";
+				setDesktopActionError(message);
+			} else {
+				const message = (result as { message?: unknown }).message;
+				setDesktopActionNotice(
+					typeof message === "string" ? message : "The bundled OMP runtime is in place and executable.",
+				);
+			}
+		} catch (reason) {
+			setDesktopActionError(reason instanceof Error ? reason.message : "Repair check failed.");
+		} finally {
+			setDesktopRepairPending(false);
+		}
+	}, [desktopRepairPending]);
+
+	const installShims = useCallback(async (): Promise<void> => {
+		const desktopApi = window.ompStudio;
+		if (!desktopApi || desktopShimPending) return;
+		setDesktopActionError(null);
+		setDesktopActionNotice(null);
+		setDesktopShimPending(true);
+		try {
+			await desktopApi.installShims();
+		} catch (reason) {
+			setDesktopActionError(reason instanceof Error ? reason.message : "Shim installation failed.");
+		} finally {
+			setDesktopShimPending(false);
+		}
+	}, [desktopShimPending]);
+
 	const removeWorkspace = async (workspaceId: string): Promise<void> => {
 		if (workspacePending) return;
 		const workspace = workspaces.find(current => current.id === workspaceId);
@@ -2943,6 +3039,137 @@ export function App(): ReactNode {
 								)
 							) : null}
 						</section>
+
+						{window.ompStudio && (
+							<section aria-labelledby="studio-desktop-heading" className="studio-drawer-section">
+								<div className="studio-drawer-section-heading">
+									<div>
+										<span>04</span>
+										<h3 id="studio-desktop-heading">Desktop</h3>
+									</div>
+									<div className="studio-drawer-section-heading-actions">
+										<span>{bootstrap?.runtimeVersion ?? "checking"}</span>
+										<button
+											aria-expanded={desktopSectionOpen}
+											aria-label={desktopSectionOpen ? "Hide desktop details" : "Show desktop details"}
+											className="studio-drawer-disclosure"
+											onClick={() => setDesktopSectionOpen(current => !current)}
+											title={desktopSectionOpen ? "Hide desktop details" : "Show desktop details"}
+											type="button"
+										>
+											<ChevronDown
+												aria-hidden="true"
+												className={desktopSectionOpen ? "studio-drawer-disclosure-open" : undefined}
+												size={15}
+												strokeWidth={1.8}
+											/>
+										</button>
+									</div>
+								</div>
+								{desktopSectionOpen ? (
+									<>
+										{desktopRelaunching && (
+											<p className="studio-session-requirement" role="status">
+												Omp Studio is restarting to pick up the change.
+											</p>
+										)}
+										{!desktopRuntime ? (
+											<p className="studio-drawer-empty">Desktop details are still loading.</p>
+										) : (
+											<>
+												{desktopRuntime.storageRepaired && (
+													<p className="studio-session-requirement" role="status">
+														The saved state directory is not writable, so this launch uses the default
+														location. Reset the state root to recover.
+													</p>
+												)}
+												{desktopActionError && <p className="studio-inline-error">{desktopActionError}</p>}
+												{desktopActionNotice && (
+													<p className="studio-inline-notice" role="status">
+														{desktopActionNotice}
+													</p>
+												)}
+												<dl className="studio-desktop-runtime">
+													<dt>Profile</dt>
+													<dd>{profile}</dd>
+													<dt>Sidecar</dt>
+													<dd title={desktopRuntime.sidecarPath}>{desktopRuntime.sidecarPath}</dd>
+													<dt>Storage</dt>
+													<dd title={desktopRuntime.storageRoot}>{desktopRuntime.storageRoot}</dd>
+													<dt>Config</dt>
+													<dd title={desktopRuntime.configRoot ?? undefined}>
+														{desktopRuntime.configRoot ?? "~/.omp (default)"}
+													</dd>
+													<dt>Log</dt>
+													<dd title={desktopRuntime.logPath}>{desktopRuntime.logPath}</dd>
+													<dt>Command shim</dt>
+													<dd title={desktopRuntime.shimDir ?? undefined}>
+														{desktopRuntime.shimConflict
+															? "A non-managed file occupies the shim name."
+															: desktopRuntime.shimInstalled
+																? `${desktopRuntime.shimDir ?? ""}${
+																		desktopRuntime.shimOnDefaultPath
+																			? " (on PATH)"
+																			: " — add this folder to your PATH to run omp-studio"
+																	}`
+																: "Not installed"}
+													</dd>
+												</dl>
+												<div className="studio-desktop-runtime-actions">
+													<button
+														disabled={desktopRelaunching || desktopRelocatePending}
+														onClick={() => void relocateDesktopState()}
+														title="Move the desktop state (window, log, and OMP config) to another folder"
+														type="button"
+													>
+														{desktopRelocatePending ? "Relocating" : "Relocate state"}
+													</button>
+													<button
+														disabled={desktopRelaunching || desktopResetPending}
+														onClick={() => void resetDesktopState()}
+														title="Return to the default state location"
+														type="button"
+													>
+														{desktopResetPending ? "Resetting" : "Reset state root"}
+													</button>
+													<button
+														disabled={desktopRepairPending}
+														onClick={() => void repairSidecar()}
+														title="Check that the bundled OMP runtime is intact"
+														type="button"
+													>
+														{desktopRepairPending ? "Checking" : "Check sidecar"}
+													</button>
+													<button
+														disabled={desktopShimPending}
+														onClick={() => void installShims()}
+														title="Write the omp-studio launcher command"
+														type="button"
+													>
+														{desktopShimPending ? "Installing" : "Install command shims"}
+													</button>
+												</div>
+											</>
+										)}
+										<div className="studio-desktop-release-notice">
+											<p>
+												Verify your installer against SHA256SUMS.txt on the{" "}
+												<a
+													href="https://github.com/can1357/oh-my-pi/releases"
+													onClick={event => {
+														event.preventDefault();
+														openDesktopReleases();
+													}}
+												>
+													release page
+												</a>
+												.
+											</p>
+										</div>
+									</>
+								) : null}
+							</section>
+						)}
 					</aside>
 				</div>
 			)}

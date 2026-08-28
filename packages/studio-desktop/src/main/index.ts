@@ -10,10 +10,26 @@ import {
 	type OpenDialogOptions,
 } from "electron";
 import { APP_USER_MODEL_ID, loginItemsAreSupported, resolveLoginItemSettings } from "./app-identity";
+import { installCommandShims, type ShimInstallStatus } from "./command-shim";
+import { resolveDesktopRuntimeInfo } from "./desktop-runtime";
+import {
+	clearDesktopStorageSettings,
+	defaultConfigRoot,
+	desktopStorageSettingsFileName,
+	hasMigratedConfig,
+	hasMigratedState,
+	migrateConfigRoot,
+	migrateDesktopState,
+	probeWritableDir,
+	readDesktopStorageSettings,
+	resolveEffectiveStorage,
+	writeDesktopStorageSettings,
+} from "./desktop-storage";
 import { isStudioQuitRequest, parseStudioDesktopArgs } from "./instance-args";
 import { isStudioIpcSender } from "./ipc-sender";
 import { parseNotificationContent } from "./notification-content";
 import { createDesktopPaths, resolveTrayIconPath } from "./paths";
+import { verifySidecarBinary } from "./sidecar-repair";
 import {
 	describeError,
 	formatStudioStartupFailure,
@@ -33,6 +49,10 @@ if (!hasLock) {
 } else {
 	const packageRoot = path.resolve(import.meta.dirname, "..", "..");
 	let desktopPaths: ReturnType<typeof createDesktopPaths> | undefined;
+	/** True when a saved state root was unwritable and the launch fell back to the default. */
+	let storageRepaired = false;
+	/** The last shim installation result, refreshed by the Desktop section's button. */
+	let shimStatus: ShimInstallStatus = { dir: null, onDefaultPath: false, installed: false, conflict: false };
 	let windowManager: WindowManager | undefined;
 	let trayManager: TrayManager | undefined;
 	let studioServer: StudioServerProcess | undefined;
@@ -113,6 +133,104 @@ if (!hasLock) {
 			const result = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
 			return result.canceled ? null : (result.filePaths[0] ?? null);
 		});
+		// Relocation moves the state root (window geometry, sidecar log, and the
+		// OMP config the sidecar runs under). The chosen path comes from
+		// Electron's own dialog — never from the renderer — so the channel cannot
+		// be pointed at an arbitrary location. The OMP config the sidecar
+		// currently uses is copied into the new root, so the move carries the
+		// user's providers and sessions with it. Relaunch picks the new root up.
+		ipcMain.handle("omp-studio:relocate-state", async event => {
+			requireStudioSender(event);
+			const options = {
+				properties: ["openDirectory", "createDirectory"],
+				title: t("storage.pickerTitle"),
+			} satisfies OpenDialogOptions;
+			const window = windowManager?.window;
+			const result = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
+			if (result.canceled || !result.filePaths[0]) return { status: "canceled" };
+			const stateRoot = result.filePaths[0];
+			if (!(await probeWritableDir(stateRoot))) return { status: "unwritable" };
+			const paths = desktopPaths;
+			if (!paths) return { status: "unwritable" };
+			// Persist the new pointer first — it is the only step here that can
+			// throw, and the commit point. If the sidecar stop or a migration below
+			// then fails, the app keeps running on the old root (its saved pointer
+			// is the new one, but the next launch's whenReady re-migrates an empty
+			// root, so nothing is lost) rather than running with a stopped sidecar
+			// and the pointer not yet written.
+			await writeDesktopStorageSettings(paths.storageSettingsPath, { stateRoot });
+			// The config root holds SQLite databases the running sidecar keeps
+			// open in WAL mode, so the copy happens after the sidecar is down:
+			// a file-by-file copy of live .db and .db-wal files could land as an
+			// inconsistent pair in the new root. Stopping first is what makes the
+			// copy a consistent snapshot. The relaunch below restarts it.
+			const previous = studioServer;
+			studioServer = undefined;
+			await previous?.stop().catch(() => undefined);
+			// A brand-new root gets the current state; a root the user returned
+			// to already has its own and is left as-is.
+			if (!(await hasMigratedState(stateRoot))) {
+				await migrateDesktopState(paths.stateRoot, stateRoot);
+			}
+			// The new root's config dir is derived from it, so it is never
+			// "migrated" from the state root itself; the source is the config
+			// root the sidecar runs under right now (the user's ~/.omp when this
+			// launch has no explicit relocation).
+			const currentConfigRoot = paths.configRoot ?? defaultConfigRoot(process.env);
+			if (!(await hasMigratedConfig(path.join(stateRoot, "omp")))) {
+				await migrateConfigRoot(currentConfigRoot, stateRoot);
+			}
+			app.relaunch();
+			app.quit();
+			return { status: "relaunching" };
+		});
+		// Drops the saved root so the next launch uses the default state dir.
+		// Also the repair for an unwritable saved root.
+		ipcMain.handle("omp-studio:reset-state-root", async event => {
+			requireStudioSender(event);
+			const paths = desktopPaths;
+			if (!paths) return { status: "unready" };
+			await clearDesktopStorageSettings(paths.storageSettingsPath);
+			app.relaunch();
+			app.quit();
+			return { status: "relaunching" };
+		});
+		// Shell-owned runtime facts for the Desktop section: the sidecar binary,
+		// the state root, the config root. Nothing that the boundary protects
+		// (session paths, provider secrets, tool payloads) crosses this channel.
+		ipcMain.handle("omp-studio:desktop-runtime", event => {
+			requireStudioSender(event);
+			const paths = desktopPaths;
+			if (!paths) return null;
+			return resolveDesktopRuntimeInfo(paths, app.isPackaged, process.platform, shimStatus, storageRepaired);
+		});
+		// Verifies the bundled sidecar is present (and executable off Windows).
+		// Read-only: the app never repairs the installed sidecar itself; the
+		// remedy for a missing binary is a reinstall.
+		ipcMain.handle("omp-studio:repair-sidecar", async event => {
+			requireStudioSender(event);
+			const paths = desktopPaths;
+			if (!paths) return { ok: false, message: t("repair.reinstall") };
+			const result = await verifySidecarBinary(paths.serverResourceDir, process.platform);
+			return result.ok ? { ok: true, message: t("repair.ok") } : { ok: false, message: t("repair.reinstall") };
+		});
+		// Re-runs the managed shim installation on demand and reports whether
+		// the target directory is on the default PATH. Packaged-only, like the
+		// startup install: a dev run would write a shim pointing at the dev
+		// binary, which would outlive the session it was written for.
+		ipcMain.handle("omp-studio:install-shims", async event => {
+			requireStudioSender(event);
+			const paths = desktopPaths;
+			if (!paths) return { installed: false };
+			if (!app.isPackaged) return shimStatus;
+			shimStatus = await installCommandShims({
+				platform: process.platform,
+				env: process.env,
+				appExecPath: process.execPath,
+				sidecarPath: path.join(paths.serverResourceDir, process.platform === "win32" ? "omp.exe" : "omp"),
+			});
+			return shimStatus;
+		});
 		ipcMain.handle("omp-studio:notify", (event, title: unknown, body: unknown) => {
 			requireStudioSender(event);
 			const content = parseNotificationContent(title, body);
@@ -185,6 +303,7 @@ if (!hasLock) {
 				paths,
 				packaged: app.isPackaged,
 				command: app.isPackaged ? undefined : process.env.OMP_STUDIO_OMP_EXECUTABLE,
+				configRoot: paths.configRoot,
 				signal: studioServerStartupAbort.signal,
 			});
 			try {
@@ -264,7 +383,39 @@ if (!hasLock) {
 				app.exit(0);
 				return;
 			}
-			const paths = createDesktopPaths(app.getPath("userData"), process.resourcesPath, packageRoot);
+			// The state root is user-relocatable. The pointer to it lives in the
+			// platform-default userData dir (it cannot live inside the movable root),
+			// and an unwritable saved root falls back to the default for this launch
+			// instead of failing startup: the Desktop section then offers a repair.
+			const defaultUserDataDir = app.getPath("userData");
+			const storageSettings = await readDesktopStorageSettings(
+				path.join(defaultUserDataDir, desktopStorageSettingsFileName()),
+			);
+			const storageWritable = storageSettings ? await probeWritableDir(storageSettings.stateRoot) : false;
+			const storage = resolveEffectiveStorage(defaultUserDataDir, storageSettings, storageWritable);
+			storageRepaired = storage.repaired;
+			if (
+				storageSettings &&
+				storage.userDataDir !== defaultUserDataDir &&
+				!(await hasMigratedState(storage.userDataDir))
+			) {
+				// A relocated root with no state of its own yet gets the default's
+				// window geometry and log tree, so a move never starts blank.
+				await migrateDesktopState(defaultUserDataDir, storage.userDataDir);
+			}
+			// Only an explicit relocation moves the sidecar's OMP config root;
+			// otherwise it keeps the user's existing ~/.omp config and sessions.
+			const configRoot =
+				storageSettings && storage.userDataDir === storageSettings.stateRoot
+					? path.join(storage.userDataDir, "omp")
+					: undefined;
+			const paths = createDesktopPaths(
+				storage.userDataDir,
+				defaultUserDataDir,
+				process.resourcesPath,
+				packageRoot,
+				configRoot,
+			);
 			desktopPaths = paths;
 			if (smokeTest) {
 				try {
@@ -272,6 +423,7 @@ if (!hasLock) {
 						paths,
 						packaged: app.isPackaged,
 						command: app.isPackaged ? undefined : process.env.OMP_STUDIO_OMP_EXECUTABLE,
+						configRoot: paths.configRoot,
 					});
 					app.exit(0);
 				} catch (error) {
@@ -314,6 +466,21 @@ if (!hasLock) {
 				);
 				windowManager.enableCloseToQuit();
 				windowManager.show();
+			}
+			// A packaged app can manage its own launcher command; a dev run would
+			// write a shim pointing at the dev binary, which would outlive the
+			// session it was written for. Best-effort: startup never depends on it.
+			if (app.isPackaged) {
+				try {
+					shimStatus = await installCommandShims({
+						platform: process.platform,
+						env: process.env,
+						appExecPath: process.execPath,
+						sidecarPath: path.join(paths.serverResourceDir, process.platform === "win32" ? "omp.exe" : "omp"),
+					});
+				} catch (error) {
+					process.stderr.write(`OMP Studio shim install failed: ${describeError(error)}\n`);
+				}
 			}
 			await startStudio();
 		})

@@ -257,6 +257,7 @@ describe("Studio local access boundary", () => {
 		expect(bootstrapPayload).toMatchObject({
 			apiVersion: 1,
 			mode: "local-single-user",
+			runtimeVersion: expect.any(String),
 			features: {
 				localAccess: true,
 				webSocketEvents: true,

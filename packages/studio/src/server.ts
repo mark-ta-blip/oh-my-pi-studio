@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
+import { getActiveProfile, VERSION } from "@oh-my-pi/pi-utils/dirs";
 import { decodeEmbeddedArchive, extractEmbeddedArchive } from "@oh-my-pi/pi-utils/embedded-archive";
 import { isEnoent } from "@oh-my-pi/pi-utils/fs-error";
 import * as logger from "@oh-my-pi/pi-utils/logger";
@@ -170,6 +170,7 @@ function getBootstrap(
 		apiVersion: STUDIO_API_VERSION,
 		mode: "local-single-user",
 		profile,
+		runtimeVersion: VERSION,
 		features,
 	};
 }

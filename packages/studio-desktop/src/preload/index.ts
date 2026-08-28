@@ -8,6 +8,11 @@ const api = {
 	notify: (title: string, body: string): Promise<void> => ipcRenderer.invoke("omp-studio:notify", title, body),
 	getWindowState: (): Promise<unknown> => ipcRenderer.invoke("omp-studio:window-state"),
 	windowControl: (action: string): Promise<void> => ipcRenderer.invoke("omp-studio:window-control", action),
+	getDesktopRuntime: (): Promise<unknown> => ipcRenderer.invoke("omp-studio:desktop-runtime"),
+	relocateState: (): Promise<unknown> => ipcRenderer.invoke("omp-studio:relocate-state"),
+	resetStateRoot: (): Promise<unknown> => ipcRenderer.invoke("omp-studio:reset-state-root"),
+	repairSidecar: (): Promise<unknown> => ipcRenderer.invoke("omp-studio:repair-sidecar"),
+	installShims: (): Promise<unknown> => ipcRenderer.invoke("omp-studio:install-shims"),
 	/**
 	 * Subscribe to window state the client did not cause: a snap gesture, a
 	 * double-click on the drag region, or an OS shortcut. Returns the unsubscribe so

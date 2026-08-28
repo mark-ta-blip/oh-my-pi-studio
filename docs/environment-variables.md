@@ -475,6 +475,7 @@ These affect where coding-agent stores data and which process-local settings ove
 | `OMP_PROFILE`                                       | Canonical named profile selector; wins over `PI_PROFILE` even when explicitly empty                                        |
 | `PI_PROFILE`                                        | Legacy profile selector used only when `OMP_PROFILE` is undefined                                                          |
 | `PI_CONFIG_DIR`                                     | Config root dirname under home (default `.omp`)                                                                            |
+| `OMP_CONFIG_ROOT`                                   | Absolute config-root override (e.g. `C:\omp-state\omp`); wins over `PI_CONFIG_DIR`, ignored when empty or not absolute; HOME is untouched |
 | `PI_CODING_AGENT_DIR`                               | Full agent-directory override for the default profile only; named profiles ignore it                                       |
 | `PI_CODING_AGENT_SESSION_DIR`                       | Initial session-directory override consumed by launch argument parsing                                                     |
 | `PI_CONFIG_FILES`                                   | Platform path-list of settings overlays (`:` on Unix, `;` on Windows); loaded in order before explicit `--config` overlays |

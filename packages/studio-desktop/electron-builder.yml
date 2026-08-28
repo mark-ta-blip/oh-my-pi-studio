@@ -18,12 +18,24 @@ extraResources:
       - omp.exe
   - from: resources/tray-icon.png
     to: tray-icon.png
+# afterPack fails the build when a packaged tree is missing the sidecar, the
+# tray icon, or the bundled scripts; afterSign notarizes the macOS bundle when
+# the Apple credentials are present and skips cleanly when they are not.
+afterPack: ./scripts/after-pack.cjs
+afterSign: ./scripts/notarize.cjs
 win:
   icon: resources/icon.ico
   target:
     - nsis
 mac:
   icon: resources/icon.icns
+  # Hardened runtime plus the three entitlements the bundled Bun sidecar needs:
+  # it executes JIT, allocates executable memory, and loads native
+  # pi_natives.*.node modules that are not signed by Apple.
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: resources/entitlements.mac.plist
+  entitlementsInherit: resources/entitlements.mac.plist
   target:
     - dmg
     - zip
