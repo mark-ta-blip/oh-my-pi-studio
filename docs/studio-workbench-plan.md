@@ -208,7 +208,7 @@ non-goal list (workflow canvases were explicitly out of scope).
 | 4. Change review | Change-set API, Git summary, changed-file list, diff preview | Users can review project changes before the next instruction |
 | 5. Recovery and history | Session search, run history, interrupted recovery, usage/activity views | Restart and event resync never create ghost state or auto-replay work |
 | 6. Desktop release | Platform assets, packaging CI, signing/update policy, native smoke coverage | Windows-first packaged Studio starts and shuts down its matched OMP sidecar |
-| 13. Presentation boundary revision | **This phase** — admits new data classes for Track C with gates, exclusions, redaction test updates, audit granularity | Updated safety-boundary section, data-ownership table, redaction test suite encoding the new line. Reviewed and merged before Phase 14 opens. |
+| 13. Presentation boundary revision | **This phase** — admits new data classes for Track C with gates, exclusions, redaction test updates, audit granularity | Updated safety-boundary section, data-ownership table, redaction test suite encoding the new line. Reviewed and merged before Phase 14 opens. ✅ **Complete** |
 
 Phases 0 through 6 are the initial workbench release. Workflow canvases,
 embedded terminal sessions, direct editing, and multi-agent rooms remain out
